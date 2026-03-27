@@ -24,7 +24,9 @@ video_summary/ Python implementation of the pipeline
 
 ## Requirements
 
+- `git`
 - Python 3.12+
+- `uv`
 - `ffmpeg`
 - local environment capable of running `faster-whisper`
 
@@ -40,7 +42,7 @@ python3 -m video_summary run \
 
 `--prompt-file /absolute/path/to/project_prompt.md` 도 사용할 수 있습니다.
 
-`run` is the default one-shot entrypoint. It scans raw clips, runs local ASR, generates candidates, builds the final timeline, and renders the final video.
+`run` is the default one-shot CLI entrypoint. When Codex is using the bundled skill, Codex should normally drive `plan` and `render` itself after inspecting the generated artifacts.
 
 If you want more control, you can still run `plan` and `render` separately.
 
@@ -65,6 +67,24 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 ```
 
 After either install method, restart Codex to pick up the skill.
+
+## Skill Prerequisites
+
+Before using the installed skill on a local machine, make sure these are available:
+
+- `git`
+- Python 3.12+
+- `uv`
+- `ffmpeg`
+
+If the skill is installed by itself, bootstrap the repository and environment once:
+
+```bash
+~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
+  https://github.com/<owner>/<repo>.git
+```
+
+After bootstrap, Codex can run the workflow directly against that repository.
 
 ## Notes
 
