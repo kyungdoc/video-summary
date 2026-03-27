@@ -9,12 +9,20 @@ Use this skill when the goal is simple: give the system a natural-language editi
 
 ## Core Workflow
 
-1. Read the workflow docs in `workflow/`.
-2. Accept a free-form editing prompt as the primary user input.
-3. Codex runs the local commands for scan, ASR, candidate packaging, timeline generation, and render.
-4. Codex inspects the generated candidate artifacts and uses the editing prompt to decide which cues belong in the final timeline.
-5. Treat generated planning artifacts as internal implementation details unless debugging is necessary.
-6. Preserve day-based episode structure and chronological order inside each day by default.
+1. If `~/.codex/skills/video-summary/video-summary.env` is missing, or the repo at `$VIDEO_SUMMARY_REPO` does not exist, run:
+
+```bash
+bash ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
+  https://github.com/kyungdoc/video-summary.git
+```
+
+2. Read `~/.codex/skills/video-summary/video-summary.env` and use `$VIDEO_SUMMARY_REPO` as the working repository.
+3. Read the workflow docs in `workflow/`.
+4. Accept a free-form editing prompt as the primary user input.
+5. Codex runs the local commands for scan, ASR, candidate packaging, timeline generation, and render.
+6. Codex inspects the generated candidate artifacts and uses the editing prompt to decide which cues belong in the final timeline.
+7. Treat generated planning artifacts as internal implementation details unless debugging is necessary.
+8. Preserve day-based episode structure and chronological order inside each day by default.
 
 ## Read These First
 
@@ -32,11 +40,11 @@ Use this skill when the goal is simple: give the system a natural-language editi
 - `uv`
 - `ffmpeg`
 
-When the skill is installed by itself, bootstrap the backing repository and local environment once:
+When the skill is installed by itself, Codex should bootstrap the backing repository automatically on first use. The manual fallback is:
 
 ```bash
-~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
-  https://github.com/<owner>/<repo>.git
+bash ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
+  https://github.com/kyungdoc/video-summary.git
 ```
 
 ## Default UX
@@ -45,7 +53,7 @@ When the skill is installed by itself, bootstrap the backing repository and loca
 - Do not split the experience into separate “plan skill” and “render skill” steps unless the user explicitly asks for that level of control.
 - Default to one-shot execution from prompt to final output.
 - Treat generated planning artifacts as internal implementation details unless debugging is necessary.
-- Codex should drive the pipeline itself: bootstrap if needed, run `plan`, inspect candidate artifacts, build the final timeline, then run `render`.
+- Codex should drive the pipeline itself: bootstrap automatically if needed, run `plan`, inspect candidate artifacts, build the final timeline, then run `render`.
 
 ## Codex Execution Loop
 
