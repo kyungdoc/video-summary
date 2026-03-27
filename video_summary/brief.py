@@ -62,7 +62,7 @@ DEFAULT_BRIEF: Dict[str, object] = {
     },
     "render": {
         "preview_presets": DEFAULT_PREVIEW_PRESETS,
-        "selected_preset": "",
+        "selected_preset": "warm_family_vlog",
         "final_render_mode": "chunked_direct_mp4",
         "final_feedback": [],
     },
@@ -164,7 +164,8 @@ def ensure_prompt_backed_brief(
     if base_metadata_path is not None:
         brief = load_project_metadata(build_dir, project_name, metadata_path=base_metadata_path)
     else:
-        brief = build_project_metadata(project_name, timezone_name=timezone_name)
+        metadata_path = ensure_project_metadata(build_dir, project_name, timezone_name=timezone_name)
+        brief = load_project_metadata(build_dir, project_name, metadata_path=metadata_path)
     write_project_prompt(build_dir, prompt_text)
     merged = apply_prompt_to_brief(brief, prompt_text, project_name, timezone_name=timezone_name)
     metadata_path = build_dir / METADATA_FILENAME
@@ -511,7 +512,10 @@ def brief_preview_preset_ids(brief: Dict[str, object]) -> List[str]:
 def brief_selected_preset(brief: Dict[str, object]) -> str:
     render = brief.get("render", {}) if isinstance(brief, dict) else {}
     value = str(render.get("selected_preset", "")).strip() if isinstance(render, dict) else ""
-    return value
+    if value:
+        return value
+    preview_presets = brief_preview_preset_ids(brief)
+    return preview_presets[0] if preview_presets else ""
 
 
 def brief_final_render_mode(brief: Dict[str, object]) -> str:

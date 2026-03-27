@@ -253,7 +253,7 @@ LOOK_PRESET_ALIASES = {
 }
 
 
-DEFAULT_PREVIEW_PRESETS = ["warm_family_vlog", "bright_resort"]
+DEFAULT_PREVIEW_PRESETS = ["warm_family_vlog"]
 
 
 def resolve_preset_id(preset_id: str) -> str:
