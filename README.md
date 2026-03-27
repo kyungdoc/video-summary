@@ -42,6 +42,11 @@ python3 -m video_summary run \
 
 `--prompt-file /absolute/path/to/project_prompt.md` 도 사용할 수 있습니다.
 
+When `--source-dir` is provided, Codex-friendly outputs are written next to the source media instead of inside the repo:
+
+- internal build/cache files: `SOURCE_PARENT/.video-summary/<project>/...`
+- final exports: `SOURCE_PARENT/exports/<project>/...`
+
 `run` is the default one-shot CLI entrypoint. When Codex is using the bundled skill, Codex should normally drive `plan` and `render` itself after inspecting the generated artifacts.
 
 If you want more control, you can still run `plan` and `render` separately.

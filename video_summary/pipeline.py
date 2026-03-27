@@ -41,6 +41,8 @@ from .taxonomy import ensure_project_taxonomy
 
 
 WORK_ROOT = Path("work")
+INTERNAL_WORK_ROOT_NAME = ".video-summary"
+EXPORT_ROOT_NAME = "exports"
 DEFAULT_DAY_START_HOUR = 4
 DEFAULT_SPEECH_LOCALE = "ko-KR"
 
@@ -66,7 +68,7 @@ def _delete_intermediate_files(paths: List[Path]) -> List[str]:
     return deleted
 
 
-def _project_paths(album_name: str) -> Dict[str, Path]:
+def _legacy_project_paths(album_name: str) -> Dict[str, Path]:
     slug = slugify(album_name)
     return {
         "root": WORK_ROOT,
@@ -75,6 +77,41 @@ def _project_paths(album_name: str) -> Dict[str, Path]:
         "assets": WORK_ROOT / "assets" / slug,
         "output": WORK_ROOT / "output" / slug,
     }
+
+
+def _project_paths(
+    album_name: str,
+    source_dir: str | Path | None = None,
+    settings: Dict[str, object] | None = None,
+) -> Dict[str, Path]:
+    slug = slugify(album_name)
+    resolved = settings or {}
+    explicit_paths = {
+        "root": resolved.get("root_dir"),
+        "raw": resolved.get("source_dir"),
+        "build": resolved.get("build_dir"),
+        "assets": resolved.get("assets_dir"),
+        "output": resolved.get("output_dir"),
+    }
+    if all(explicit_paths.values()):
+        return {key: Path(str(value)).expanduser().resolve() for key, value in explicit_paths.items()}
+
+    if source_dir is not None:
+        resolved_source = Path(source_dir).expanduser().resolve()
+        parent_dir = resolved_source.parent
+        work_root = parent_dir / INTERNAL_WORK_ROOT_NAME
+        return {
+            "root": work_root,
+            "raw": resolved_source,
+            "build": work_root / "build" / slug,
+            "assets": work_root / "assets" / slug,
+            "output": parent_dir / EXPORT_ROOT_NAME / slug,
+        }
+
+    if resolved.get("source_dir"):
+        return _project_paths(album_name, source_dir=str(resolved["source_dir"]))
+
+    return {key: path.resolve() for key, path in _legacy_project_paths(album_name).items()}
 
 
 def _project_manifest_path(build_dir: Path) -> Path:
@@ -107,16 +144,26 @@ def configure_project(
     prompt_text: str | None = None,
     prompt_path: str | Path | None = None,
 ) -> Dict[str, object]:
-    paths = _project_paths(project_name)
-    manifest = _load_project_manifest(paths["build"])
+    legacy_paths = _legacy_project_paths(project_name)
+    manifest = _load_project_manifest(legacy_paths["build"])
 
+    resolved_source: Path | None = None
     if source_dir is not None:
         resolved_source = Path(source_dir).expanduser().resolve()
         if not resolved_source.exists():
             raise FileNotFoundError(f"Source directory does not exist: {resolved_source}")
         manifest["source_dir"] = str(resolved_source)
-    elif "source_dir" not in manifest:
-        manifest["source_dir"] = str(paths["raw"].resolve())
+    elif "source_dir" in manifest:
+        resolved_source = Path(str(manifest["source_dir"])).expanduser().resolve()
+    else:
+        resolved_source = legacy_paths["raw"].resolve()
+        manifest["source_dir"] = str(resolved_source)
+
+    paths = _project_paths(project_name, source_dir=resolved_source, settings=manifest)
+    manifest["root_dir"] = str(paths["root"].resolve())
+    manifest["build_dir"] = str(paths["build"].resolve())
+    manifest["assets_dir"] = str(paths["assets"].resolve())
+    manifest["output_dir"] = str(paths["output"].resolve())
 
     resolved_prompt_text = ""
     if prompt_path is not None:
@@ -194,20 +241,23 @@ def configure_project(
     manifest["slug"] = slugify(project_name)
     manifest["taxonomy_path"] = str(ensure_project_taxonomy(paths["build"], project_name))
     _write_json(_project_manifest_path(paths["build"]), manifest)
+    if paths["build"] != legacy_paths["build"].resolve():
+        _write_json(_project_manifest_path(legacy_paths["build"]), manifest)
     return manifest
 
 
 def _project_source_dir(project_name: str, settings: Dict[str, object] | None = None) -> Path:
-    resolved = settings or _load_project_manifest(_project_paths(project_name)["build"])
-    return Path(str(resolved.get("source_dir") or _project_paths(project_name)["raw"])).expanduser().resolve()
+    resolved = settings or _load_project_manifest(_legacy_project_paths(project_name)["build"])
+    paths = _project_paths(project_name, settings=resolved)
+    return Path(str(resolved.get("source_dir") or paths["raw"])).expanduser().resolve()
 
 
 def _project_metadata_path(project_name: str, settings: Dict[str, object] | None = None) -> Path:
-    resolved = settings or _load_project_manifest(_project_paths(project_name)["build"])
+    resolved = settings or _load_project_manifest(_legacy_project_paths(project_name)["build"])
     brief_value = resolved.get("metadata_path") or resolved.get("brief_path")
     if brief_value:
         return Path(str(brief_value)).expanduser().resolve()
-    paths = _project_paths(project_name)
+    paths = _project_paths(project_name, settings=resolved)
     return ensure_project_metadata(
         paths["build"],
         project_name,
@@ -216,7 +266,8 @@ def _project_metadata_path(project_name: str, settings: Dict[str, object] | None
 
 
 def _require_project_prompt(project_name: str) -> str:
-    build_dir = _project_paths(project_name)["build"]
+    settings = _load_project_manifest(_legacy_project_paths(project_name)["build"])
+    build_dir = _project_paths(project_name, settings=settings)["build"]
     prompt_text = load_project_prompt(build_dir)
     if not prompt_text.strip():
         raise ValueError("A prompt is required. Run `plan` or `run` with `--prompt` or `--prompt-file` first.")
@@ -293,7 +344,7 @@ def scan_project(
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
     )
-    paths = _project_paths(project_name)
+    paths = _project_paths(project_name, settings=settings)
     raw_dir = _project_source_dir(project_name, settings)
     brief = load_project_metadata(paths["build"], project_name, metadata_path=_project_metadata_path(project_name, settings))
     clips = scan_media_directory(
@@ -316,11 +367,11 @@ def scan_project(
 
 
 def _load_project_clips(project_name: str, settings: Dict[str, object] | None = None) -> List[ClipInfo]:
-    paths = _project_paths(project_name)
+    resolved = settings or _load_project_manifest(_legacy_project_paths(project_name)["build"]) or configure_project(project_name)
+    paths = _project_paths(project_name, settings=resolved)
     manifest_path = paths["build"] / "clip_manifest.json"
     if not manifest_path.exists():
-        scan_project(project_name)
-    resolved = settings or _load_project_manifest(paths["build"]) or configure_project(project_name)
+        scan_project(project_name, source_dir=str(resolved.get("source_dir")) if resolved.get("source_dir") else None)
     brief = load_project_metadata(paths["build"], project_name, metadata_path=_project_metadata_path(project_name, resolved))
     return scan_media_directory(
         _project_source_dir(project_name, resolved),
@@ -350,7 +401,7 @@ def plan_project(
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
     )
-    paths = _project_paths(project_name)
+    paths = _project_paths(project_name, settings=settings)
     prompt_text_value = _require_project_prompt(project_name)
     brief = load_project_metadata(paths["build"], project_name, metadata_path=_project_metadata_path(project_name, settings))
     clips = _load_project_clips(project_name, settings)
@@ -382,11 +433,12 @@ def plan_project(
 
 
 def _render_project_outputs(project_name: str, draft: bool = False) -> Dict[str, str]:
-    paths = _project_paths(project_name)
+    settings = _load_project_manifest(_legacy_project_paths(project_name)["build"]) or configure_project(project_name)
+    paths = _project_paths(project_name, settings=settings)
     build_dir = paths["build"]
     output_dir = paths["output"]
     output_dir.mkdir(parents=True, exist_ok=True)
-    brief = load_project_metadata(build_dir, project_name, metadata_path=_project_metadata_path(project_name))
+    brief = load_project_metadata(build_dir, project_name, metadata_path=_project_metadata_path(project_name, settings))
     look_docs = _write_preset_docs(build_dir, brief)
     validate_segment_selection(build_dir)
 

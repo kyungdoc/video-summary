@@ -13,8 +13,9 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("scan", "plan", "render", "run"):
         command = subparsers.add_parser(name, help=f"{name.title()} the trip project")
         command.add_argument("--project", required=True, help="Project name")
-        if name in {"scan", "plan", "run"}:
+        if name in {"scan", "plan", "render", "run"}:
             command.add_argument("--source-dir", help="Folder containing original clips")
+        if name in {"scan", "plan", "run"}:
             command.add_argument("--prompt", help="Free-form editing prompt for the project")
             command.add_argument("--prompt-file", help="Path to a text or markdown file containing the editing prompt")
             command.add_argument(
@@ -77,7 +78,13 @@ def main() -> None:
             )
         )
     elif args.command == "render":
-        print(json.dumps(render_project(project, draft=args.draft), ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                render_project(project, draft=args.draft, source_dir=args.source_dir),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     elif args.command == "run":
         print(
             json.dumps(
