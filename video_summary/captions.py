@@ -17,12 +17,6 @@ DEFAULT_CAPTION_MODEL = "medium"
 _MODEL_CACHE: Dict[Tuple[str, str, str], object] = {}
 
 
-def _provider_name() -> str:
-    if importlib.util.find_spec("faster_whisper") is not None:
-        return "faster-whisper"
-    return "sidecar-only"
-
-
 def _taxonomy_with_brief(taxonomy: Dict[str, object], brief: Dict[str, object]) -> Dict[str, object]:
     merged = json.loads(json.dumps(taxonomy, ensure_ascii=False))
     prompt_terms = list(merged.get("prompt_terms", [])) + brief_prompt_terms(brief)
@@ -44,42 +38,8 @@ def _cache_key(clip_path: Path, cache_signature: str) -> str:
     return f"{clip_path.stem}-{digest}"
 
 
-def _sidecar_candidates(clip_path: Path) -> List[Path]:
-    return [
-        Path(f"{clip_path}.captions.json"),
-        clip_path.with_suffix(".captions.json"),
-    ]
-
-
 def _normalize_caption_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\n", " ")).strip(" -")
-
-
-def _load_caption_json(path: Path) -> List[Dict[str, object]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    cues = data.get("captions") or data.get("cues") if isinstance(data, dict) else data
-    if not isinstance(cues, list):
-        return []
-    normalized = []
-    for cue in cues:
-        if not isinstance(cue, dict):
-            continue
-        text = _normalize_caption_text(str(cue.get("text", "")))
-        if not text:
-            continue
-        try:
-            start = float(cue.get("start", 0.0))
-            end = float(cue.get("end", start))
-        except (TypeError, ValueError):
-            continue
-        normalized.append(
-            {
-                "start": round(max(0.0, start), 3),
-                "end": round(max(start, end), 3),
-                "text": text,
-            }
-        )
-    return normalized
 
 
 def _extract_audio(clip_path: Path, audio_path: Path) -> Path:
@@ -150,6 +110,10 @@ def _apply_taxonomy(text: str, taxonomy: Dict[str, object]) -> str:
 
 
 def _faster_whisper_model(model_size: str):
+    if importlib.util.find_spec("faster_whisper") is None:
+        raise RuntimeError(
+            "faster-whisper is required for transcript generation. Install dependencies with `uv sync` first."
+        )
     from faster_whisper import WhisperModel
 
     key = ("faster-whisper", model_size, "cpu-int8")
@@ -198,12 +162,6 @@ def _load_or_generate_clip_transcript(
     model_size: str,
     taxonomy: Dict[str, object],
 ) -> Tuple[List[Dict[str, object]], str]:
-    for sidecar_path in _sidecar_candidates(clip_path):
-        if sidecar_path.exists():
-            transcript = _load_caption_json(sidecar_path)
-            corrected = [{**cue, "text": _apply_taxonomy(str(cue["text"]), taxonomy)} for cue in transcript]
-            return corrected, "sidecar"
-
     cache_signature = f"{model_size}:{speech_locale}:{taxonomy_signature(taxonomy)}"
     cache_path = cache_dir / f"{_cache_key(clip_path, cache_signature)}.json"
     if cache_path.exists():
@@ -212,10 +170,7 @@ def _load_or_generate_clip_transcript(
         if transcript:
             return transcript, str(cached.get("provider", "cache"))
 
-    provider = _provider_name()
-    if provider != "faster-whisper":
-        return [], provider
-
+    provider = "faster-whisper"
     audio_path = cache_dir / f"{_cache_key(clip_path, cache_signature)}.wav"
     extracted_audio = _extract_audio(clip_path, audio_path)
     transcript = _transcribe_with_faster_whisper(
@@ -270,6 +225,8 @@ def transcribe_project_clips(
             model_size=model_size,
             taxonomy=taxonomy,
         )
+        if not transcript:
+            raise ValueError(f"Transcript generation failed for clip: {clip_path}")
         providers.add(provider)
         update_clip_result(
             build_dir,
@@ -288,7 +245,7 @@ def transcribe_project_clips(
         {
             "project": project_name,
             "speech_locale": speech_locale,
-            "provider": ", ".join(sorted(providers)) if providers else _provider_name(),
+            "provider": ", ".join(sorted(providers)) if providers else "faster-whisper",
             "clips": [
                 {
                     "clip_path": item.get("clip_path"),
@@ -300,7 +257,7 @@ def transcribe_project_clips(
         },
     )
     summary = {
-        "provider": ", ".join(sorted(providers)) if providers else _provider_name(),
+        "provider": ", ".join(sorted(providers)) if providers else "faster-whisper",
         "speech_locale": speech_locale,
         "taxonomy_path": str((build_dir / "taxonomy.json").resolve()),
         "taxonomy_signature": taxonomy_signature(taxonomy),
