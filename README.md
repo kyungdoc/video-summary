@@ -47,7 +47,16 @@ When `--source-dir` is provided, Codex-friendly outputs are written under the cu
 - internal build/cache files: `WORKSPACE_ROOT/.video-summary/<project>/...`
 - final exports: `WORKSPACE_ROOT/exports/<project>/...`
 
-If you want a specific output root, pass `--project-dir`:
+Most users do not need `--project-dir`:
+
+```bash
+python3 -m video_summary run \
+  --project "Sample-Trip" \
+  --source-dir "/absolute/path/to/trip1/raw" \
+  --prompt "..."
+```
+
+If you want a specific output root, pass `--project-dir` explicitly:
 
 ```bash
 python3 -m video_summary run \
@@ -62,6 +71,12 @@ By default, the bundled skill sets `WORKSPACE_ROOT` to the user's current workin
 `run` is the default one-shot CLI entrypoint. When Codex is using the bundled skill, Codex should normally drive `plan` and `render` itself after inspecting the generated artifacts.
 
 If you want more control, you can still run `plan` and `render` separately.
+
+CLI usage and Codex skill usage are not identical:
+
+- The CLI still generates transcripts, segment candidates, and planning artifacts.
+- But candidate inspection and prompt-aware final selection are designed for the Codex skill loop, where Codex reads those artifacts and decides what should make it into the final timeline.
+- If you use the CLI directly, do not assume a human-like automatic review pass over the candidate bundle unless Codex is actually driving that run.
 
 ## Skill Installation
 
@@ -78,7 +93,7 @@ rsync -a /path/to/repo/codex-skill/ ~/.codex/skills/video-summary/
 
 ```bash
 python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo <owner>/<repo> \
+  --repo kyungdoc/video-summary \
   --path codex-skill \
   --name video-summary
 ```
@@ -98,7 +113,7 @@ If the skill is installed by itself, bootstrap the repository and environment on
 
 ```bash
 ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
-  https://github.com/<owner>/<repo>.git
+  https://github.com/kyungdoc/video-summary.git
 ```
 
 After bootstrap, Codex can run the workflow directly against that repository.
