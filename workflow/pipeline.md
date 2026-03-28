@@ -26,6 +26,11 @@ There is intentionally no heuristic fallback timeline generation.
 1. Install dependencies with `uv sync`
 2. Run `python3 -m video_summary run --source-dir ... --prompt "..."`
 
+Path handling rules:
+
+- Use `--project-dir` when you want artifacts under a specific root.
+- Otherwise, artifacts go under the current workspace root.
+
 The pipeline is designed to work without manual editing of internal artifacts.
 
 ## Advanced Loop

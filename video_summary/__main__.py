@@ -15,6 +15,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--project", required=True, help="Project name")
         if name in {"scan", "plan", "render", "run"}:
             command.add_argument("--source-dir", help="Folder containing original clips")
+            command.add_argument(
+                "--project-dir",
+                help="Folder that should own build artifacts and exports; defaults to an inferred trip root",
+            )
         if name in {"scan", "plan", "run"}:
             command.add_argument("--prompt", help="Free-form editing prompt for the project")
             command.add_argument("--prompt-file", help="Path to a text or markdown file containing the editing prompt")
@@ -51,6 +55,7 @@ def main() -> None:
                 scan_project(
                     project,
                     source_dir=args.source_dir,
+                    project_dir=args.project_dir,
                     prompt_text=args.prompt,
                     prompt_path=args.prompt_file,
                     timezone_name=args.timezone,
@@ -67,6 +72,7 @@ def main() -> None:
                 plan_project(
                     project,
                     source_dir=args.source_dir,
+                    project_dir=args.project_dir,
                     prompt_text=args.prompt,
                     prompt_path=args.prompt_file,
                     timezone_name=args.timezone,
@@ -80,7 +86,7 @@ def main() -> None:
     elif args.command == "render":
         print(
             json.dumps(
-                render_project(project, draft=args.draft, source_dir=args.source_dir),
+                render_project(project, draft=args.draft, source_dir=args.source_dir, project_dir=args.project_dir),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -91,6 +97,7 @@ def main() -> None:
                 run_project_pipeline(
                     project,
                     source_dir=args.source_dir,
+                    project_dir=args.project_dir,
                     prompt_text=args.prompt,
                     prompt_path=args.prompt_file,
                     timezone_name=args.timezone,

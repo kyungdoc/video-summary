@@ -42,10 +42,22 @@ python3 -m video_summary run \
 
 `--prompt-file /absolute/path/to/project_prompt.md` 도 사용할 수 있습니다.
 
-When `--source-dir` is provided, Codex-friendly outputs are written next to the source media instead of inside the repo:
+When `--source-dir` is provided, Codex-friendly outputs are written under the current workspace root instead of next to the source media:
 
-- internal build/cache files: `SOURCE_PARENT/.video-summary/<project>/...`
-- final exports: `SOURCE_PARENT/exports/<project>/...`
+- internal build/cache files: `WORKSPACE_ROOT/.video-summary/<project>/...`
+- final exports: `WORKSPACE_ROOT/exports/<project>/...`
+
+If you want a specific output root, pass `--project-dir`:
+
+```bash
+python3 -m video_summary run \
+  --project "Sample-Trip" \
+  --source-dir "/absolute/path/to/trip1/raw" \
+  --project-dir "/absolute/path/to/trip1" \
+  --prompt "..."
+```
+
+By default, the bundled skill sets `WORKSPACE_ROOT` to the user's current working directory when Codex starts the run, so remote or external source folders do not affect where artifacts are stored.
 
 `run` is the default one-shot CLI entrypoint. When Codex is using the bundled skill, Codex should normally drive `plan` and `render` itself after inspecting the generated artifacts.
 

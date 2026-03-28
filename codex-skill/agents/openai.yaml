@@ -1,7 +1,7 @@
 interface:
   display_name: "Video Summary"
   short_description: "Turn raw travel clips into one final edited video."
-  default_prompt: "Use $video-summary to turn raw travel clips plus a natural-language editing prompt into one finished video."
+  default_prompt: "Use $video-summary to turn the user's travel clips and editing prompt into one finished video. Infer the clip path from the user's message or current workspace when possible."
 
 policy:
   allow_implicit_invocation: true

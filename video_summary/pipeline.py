@@ -79,14 +79,24 @@ def _legacy_project_paths(album_name: str) -> Dict[str, Path]:
     }
 
 
+def _default_project_dir() -> Path:
+    configured = Path.cwd()
+    env_value = __import__("os").environ.get("VIDEO_SUMMARY_PROJECT_DIR")
+    if env_value:
+        configured = Path(env_value).expanduser()
+    return configured.resolve()
+
+
 def _project_paths(
     album_name: str,
     source_dir: str | Path | None = None,
+    project_dir: str | Path | None = None,
     settings: Dict[str, object] | None = None,
 ) -> Dict[str, Path]:
     slug = slugify(album_name)
     resolved = settings or {}
     explicit_paths = {
+        "project": resolved.get("project_dir"),
         "root": resolved.get("root_dir"),
         "raw": resolved.get("source_dir"),
         "build": resolved.get("build_dir"),
@@ -98,20 +108,27 @@ def _project_paths(
 
     if source_dir is not None:
         resolved_source = Path(source_dir).expanduser().resolve()
-        parent_dir = resolved_source.parent
-        work_root = parent_dir / INTERNAL_WORK_ROOT_NAME
+        resolved_project = Path(project_dir).expanduser().resolve() if project_dir is not None else _default_project_dir()
+        work_root = resolved_project / INTERNAL_WORK_ROOT_NAME
         return {
+            "project": resolved_project,
             "root": work_root,
             "raw": resolved_source,
             "build": work_root / "build" / slug,
             "assets": work_root / "assets" / slug,
-            "output": parent_dir / EXPORT_ROOT_NAME / slug,
+            "output": resolved_project / EXPORT_ROOT_NAME / slug,
         }
 
     if resolved.get("source_dir"):
-        return _project_paths(album_name, source_dir=str(resolved["source_dir"]))
+        return _project_paths(
+            album_name,
+            source_dir=str(resolved["source_dir"]),
+            project_dir=str(resolved["project_dir"]) if resolved.get("project_dir") else None,
+        )
 
-    return {key: path.resolve() for key, path in _legacy_project_paths(album_name).items()}
+    legacy = {key: path.resolve() for key, path in _legacy_project_paths(album_name).items()}
+    legacy["project"] = legacy["raw"]
+    return legacy
 
 
 def _project_manifest_path(build_dir: Path) -> Path:
@@ -137,6 +154,7 @@ def _default_timezone_name() -> str:
 def configure_project(
     project_name: str,
     source_dir: str | Path | None = None,
+    project_dir: str | Path | None = None,
     timezone_name: str | None = None,
     day_start_hour: int | None = None,
     speech_locale: str | None = None,
@@ -159,7 +177,22 @@ def configure_project(
         resolved_source = legacy_paths["raw"].resolve()
         manifest["source_dir"] = str(resolved_source)
 
-    paths = _project_paths(project_name, source_dir=resolved_source, settings=manifest)
+    resolved_project_dir: Path | None = None
+    if project_dir is not None:
+        resolved_project_dir = Path(project_dir).expanduser().resolve()
+        if not resolved_project_dir.exists():
+            raise FileNotFoundError(f"Project directory does not exist: {resolved_project_dir}")
+        if not resolved_project_dir.is_dir():
+            raise NotADirectoryError(f"Project directory is not a directory: {resolved_project_dir}")
+        manifest["project_dir"] = str(resolved_project_dir)
+    elif "project_dir" in manifest:
+        resolved_project_dir = Path(str(manifest["project_dir"])).expanduser().resolve()
+    else:
+        resolved_project_dir = _default_project_dir()
+        manifest["project_dir"] = str(resolved_project_dir)
+
+    paths = _project_paths(project_name, source_dir=resolved_source, project_dir=resolved_project_dir, settings=manifest)
+    manifest["project_dir"] = str(paths["project"].resolve())
     manifest["root_dir"] = str(paths["root"].resolve())
     manifest["build_dir"] = str(paths["build"].resolve())
     manifest["assets_dir"] = str(paths["assets"].resolve())
@@ -327,6 +360,7 @@ def _write_preset_docs(build_dir: Path, brief: Dict[str, object]) -> Dict[str, s
 def scan_project(
     project_name: str,
     source_dir: str | Path | None = None,
+    project_dir: str | Path | None = None,
     metadata_path: str | Path | None = None,
     prompt_text: str | None = None,
     prompt_path: str | Path | None = None,
@@ -337,6 +371,7 @@ def scan_project(
     settings = configure_project(
         project_name,
         source_dir=source_dir,
+        project_dir=project_dir,
         metadata_path=metadata_path,
         prompt_text=prompt_text,
         prompt_path=prompt_path,
@@ -384,6 +419,7 @@ def _load_project_clips(project_name: str, settings: Dict[str, object] | None = 
 def plan_project(
     project_name: str,
     source_dir: str | Path | None = None,
+    project_dir: str | Path | None = None,
     metadata_path: str | Path | None = None,
     prompt_text: str | None = None,
     prompt_path: str | Path | None = None,
@@ -394,6 +430,7 @@ def plan_project(
     settings = configure_project(
         project_name,
         source_dir=source_dir,
+        project_dir=project_dir,
         metadata_path=metadata_path,
         prompt_text=prompt_text,
         prompt_path=prompt_path,
@@ -553,6 +590,7 @@ def render_project(
     project_name: str,
     draft: bool = False,
     source_dir: str | Path | None = None,
+    project_dir: str | Path | None = None,
     metadata_path: str | Path | None = None,
     prompt_text: str | None = None,
     prompt_path: str | Path | None = None,
@@ -563,6 +601,7 @@ def render_project(
     configure_project(
         project_name,
         source_dir=source_dir,
+        project_dir=project_dir,
         metadata_path=metadata_path,
         prompt_text=prompt_text,
         prompt_path=prompt_path,
@@ -576,6 +615,7 @@ def render_project(
 def run_project_pipeline(
     project_name: str,
     source_dir: str | Path | None = None,
+    project_dir: str | Path | None = None,
     metadata_path: str | Path | None = None,
     prompt_text: str | None = None,
     prompt_path: str | Path | None = None,
@@ -587,6 +627,7 @@ def run_project_pipeline(
     settings = configure_project(
         project_name,
         source_dir=source_dir,
+        project_dir=project_dir,
         metadata_path=metadata_path,
         prompt_text=prompt_text,
         prompt_path=prompt_path,
@@ -598,6 +639,7 @@ def run_project_pipeline(
     clip_manifest = scan_project(
         project_name,
         source_dir=source_dir,
+        project_dir=project_dir,
         metadata_path=metadata_path,
         prompt_text=prompt_text,
         prompt_path=prompt_path,
@@ -608,6 +650,7 @@ def run_project_pipeline(
     plans = plan_project(
         project_name,
         source_dir=source_dir,
+        project_dir=project_dir,
         metadata_path=metadata_path,
         prompt_text=prompt_text,
         prompt_path=prompt_path,
@@ -619,6 +662,7 @@ def run_project_pipeline(
         project_name,
         draft=draft,
         source_dir=source_dir,
+        project_dir=project_dir,
         metadata_path=metadata_path,
         prompt_text=prompt_text,
         prompt_path=prompt_path,
