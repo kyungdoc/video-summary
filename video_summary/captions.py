@@ -166,8 +166,8 @@ def _load_or_generate_clip_transcript(
     cache_path = cache_dir / f"{_cache_key(clip_path, cache_signature)}.json"
     if cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        transcript = list(cached.get("transcript", []))
-        if transcript:
+        if "transcript" in cached:
+            transcript = list(cached.get("transcript", []))
             return transcript, str(cached.get("provider", "cache"))
 
     provider = "faster-whisper"
@@ -216,6 +216,7 @@ def transcribe_project_clips(
     transcripts_path = build_dir / "transcripts.json"
 
     providers: set[str] = set()
+    empty_transcript_count = 0
     normalized_paths = sorted({str(Path(path).resolve()) for path in clip_paths if str(path).strip()})
     for clip_path in normalized_paths:
         transcript, provider = _load_or_generate_clip_transcript(
@@ -225,9 +226,9 @@ def transcribe_project_clips(
             model_size=model_size,
             taxonomy=taxonomy,
         )
-        if not transcript:
-            raise ValueError(f"Transcript generation failed for clip: {clip_path}")
         providers.add(provider)
+        if not transcript:
+            empty_transcript_count += 1
         update_clip_result(
             build_dir,
             clip_path,
@@ -235,6 +236,7 @@ def transcribe_project_clips(
                 "provider": provider,
                 "speech_locale": speech_locale,
                 "taxonomy_signature": taxonomy_signature(taxonomy),
+                "transcript_status": "empty" if not transcript else "ok",
                 "transcript": transcript,
             },
         )
@@ -263,6 +265,8 @@ def transcribe_project_clips(
         "taxonomy_signature": taxonomy_signature(taxonomy),
         "transcripts_path": str(transcripts_path.resolve()),
         "clip_count": len(normalized_paths),
+        "transcribed_clip_count": len(normalized_paths) - empty_transcript_count,
+        "empty_transcript_count": empty_transcript_count,
     }
     (build_dir / "transcripts_report.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
