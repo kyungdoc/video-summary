@@ -21,17 +21,17 @@ Codex should resolve paths from the user's prompt and workspace context before r
 
 ## Core Workflow
 
-1. If `~/.codex/skills/video-summary/video-summary.env` is missing, or the repo at `$VIDEO_SUMMARY_REPO` does not exist, run:
+1. If the skill-local `video-summary.env` file is missing, or the repo at `$VIDEO_SUMMARY_REPO` does not exist, run the bundled bootstrap script from this skill's `scripts/` directory:
 
 ```bash
-bash ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
+bash /absolute/path/to/this-skill/scripts/bootstrap-video-summary.sh \
   https://github.com/kyungdoc/video-summary.git
 ```
 
-2. Read `~/.codex/skills/video-summary/video-summary.env` and resolve `$VIDEO_SUMMARY_REPO`.
+2. Read the generated `video-summary.env` file from this skill directory and resolve `$VIDEO_SUMMARY_REPO`.
 3. Treat `$VIDEO_SUMMARY_REPO` as the only execution repository for all pipeline commands.
 4. Treat the user's current project directory only as a source of inputs such as raw clips and prompt files.
-5. Read the workflow docs in `workflow/` from inside `$VIDEO_SUMMARY_REPO`.
+5. Read the workflow docs from inside `$VIDEO_SUMMARY_REPO`, starting with `workflow/pipeline.md`.
 6. Accept a free-form editing prompt as the primary user input.
 7. Codex runs the local commands for scan, ASR, candidate packaging, timeline generation, and render.
 8. Codex inspects the generated candidate artifacts and uses the editing prompt to decide which cues belong in the final timeline.
@@ -42,14 +42,14 @@ bash ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
 
 - Never run `python3 -m video_summary ...` from the user's raw-media project folder.
 - Never assume the current working directory is the workflow repository.
-- Always source `~/.codex/skills/video-summary/video-summary.env` and run commands from `$VIDEO_SUMMARY_REPO`.
+- Always source the skill-local `video-summary.env` file and run commands from `$VIDEO_SUMMARY_REPO`.
 - Always convert the resolved user path into a concrete `--source-dir`.
 - By default, store `.video-summary/` and `exports/` under the user's current workspace root.
 - Only pass `--project-dir` when the user explicitly wants a different output root.
 - Prefer the wrapper script below so the repository path and `uv` environment stay consistent:
 
 ```bash
-bash ~/.codex/skills/video-summary/scripts/run-video-summary.sh run \
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh run \
   --project "sample-trip" \
   --source-dir "/absolute/path/to/raw-clips" \
   --prompt "여행 브이로그를 따뜻하고 여유롭게 편집해줘."
@@ -59,12 +59,13 @@ This wrapper keeps outputs under the caller's workspace root even when the sourc
 
 ## Read These First
 
-- [workflow/pipeline.md](../workflow/pipeline.md)
+- [references/workflow.md](./references/workflow.md)
+- After bootstrap, read `$VIDEO_SUMMARY_REPO/workflow/pipeline.md`.
 
 ## Installation
 
-- Manual install: copy this folder to `~/.codex/skills/video-summary`
-- GitHub install: use the skill installer with `--path codex-skill --name video-summary`
+- Install this folder as the `video-summary` skill in the user's Codex skills directory so the bundled scripts and `video-summary.env` stay colocated.
+- If the skill is installed outside the default location, resolve the script path relative to this skill directory instead of assuming `~/.codex/skills/video-summary`.
 
 ## Local Prerequisites
 
@@ -76,7 +77,7 @@ This wrapper keeps outputs under the caller's workspace root even when the sourc
 When the skill is installed by itself, Codex should bootstrap the backing repository automatically on first use. The manual fallback is:
 
 ```bash
-bash ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
+bash /absolute/path/to/this-skill/scripts/bootstrap-video-summary.sh \
   https://github.com/kyungdoc/video-summary.git
 ```
 
@@ -94,7 +95,7 @@ bash ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
 ## Codex Execution Loop
 
 ```bash
-bash ~/.codex/skills/video-summary/scripts/run-video-summary.sh run \
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh run \
   --project "sample-trip" \
   --source-dir "/absolute/path/to/raw-clips" \
   --prompt "여행 브이로그를 따뜻하고 여유롭게 편집해줘. 날짜 순서를 지키고 전체 러닝타임은 40분 정도로."
@@ -103,12 +104,12 @@ bash ~/.codex/skills/video-summary/scripts/run-video-summary.sh run \
 When the user wants more control or debugging, use:
 
 ```bash
-bash ~/.codex/skills/video-summary/scripts/run-video-summary.sh plan \
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh plan \
   --project "sample-trip" \
   --source-dir "/absolute/path/to/raw-clips" \
   --prompt "여행 브이로그를 따뜻하고 여유롭게 편집해줘."
 
-bash ~/.codex/skills/video-summary/scripts/run-video-summary.sh render \
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh render \
   --project "sample-trip" \
   --source-dir "/absolute/path/to/raw-clips"
 ```

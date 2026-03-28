@@ -1,15 +1,16 @@
 # Workflow Reference
 
-Before running the workflow, make sure the skill has been bootstrapped. If
-`~/.codex/skills/video-summary/video-summary.env` is missing, run:
+Before running the workflow, make sure the skill has been bootstrapped. If the
+skill-local `video-summary.env` file is missing, run the bundled bootstrap
+script from this skill's `scripts/` directory:
 
 ```bash
-bash ~/.codex/skills/video-summary/scripts/bootstrap-video-summary.sh \
+bash /absolute/path/to/this-skill/scripts/bootstrap-video-summary.sh \
   https://github.com/kyungdoc/video-summary.git
 ```
 
-Then read `~/.codex/skills/video-summary/video-summary.env` and use
-`$VIDEO_SUMMARY_REPO` as the working repository for all pipeline commands.
+Then read the generated `video-summary.env` file from this skill directory and
+use `$VIDEO_SUMMARY_REPO` as the working repository for all pipeline commands.
 Do not run the pipeline from the user's raw-media project folder; pass that
 folder through `--source-dir` instead.
 
@@ -22,7 +23,7 @@ Resolve user input in this order:
 Prefer the wrapper script so the repository and `uv` environment are fixed:
 
 ```bash
-bash ~/.codex/skills/video-summary/scripts/run-video-summary.sh run \
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh run \
   --project "sample-trip" \
   --source-dir "/absolute/path/to/raw-clips" \
   --prompt "여행 브이로그를 따뜻하고 여유롭게 편집해줘."
@@ -40,6 +41,6 @@ This skill wraps the repository workflow:
 - final timeline generation
 - final render
 
-The canonical docs live in:
+After bootstrap, the canonical workflow docs live in:
 
 - `workflow/pipeline.md`
