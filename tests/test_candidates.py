@@ -7,11 +7,50 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from video_summary.candidates import build_segment_candidates
+from video_summary.candidates import _auto_select_day, build_segment_candidates
 from video_summary.models import ClipInfo
 
 
 class CandidatesTests(unittest.TestCase):
+    def test_auto_select_day_does_not_drop_all_low_priority_followups(self) -> None:
+        entries = [
+            {
+                "candidate_id": "seg-001",
+                "clip_path": "/tmp/a.mp4",
+                "start": 0.0,
+                "end": 4.0,
+                "duration": 4.0,
+                "source_time": "2026-03-20T10:00:00",
+                "analysis": {"event_type": "moment", "summary": "first"},
+            },
+            {
+                "candidate_id": "seg-002",
+                "clip_path": "/tmp/a.mp4",
+                "start": 5.0,
+                "end": 9.0,
+                "duration": 4.0,
+                "source_time": "2026-03-20T10:00:05",
+                "analysis": {"event_type": "meal", "summary": "second"},
+            },
+            {
+                "candidate_id": "seg-003",
+                "clip_path": "/tmp/a.mp4",
+                "start": 10.0,
+                "end": 14.0,
+                "duration": 4.0,
+                "source_time": "2026-03-20T10:00:10",
+                "analysis": {"event_type": "reaction", "summary": "third"},
+            },
+        ]
+
+        with patch(
+            "video_summary.candidates._candidate_priority",
+            side_effect=[0.53, 0.52, 0.51],
+        ):
+            selected = _auto_select_day(entries, brief={}, budget_seconds=20.0, day_index=1, total_days=1)
+
+        self.assertEqual(len(selected), 3)
+
     def test_build_segment_candidates_writes_cue_analysis_and_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

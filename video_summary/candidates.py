@@ -374,10 +374,6 @@ def _auto_select_day(
         duration = float(entry.get("duration", 0.0))
         analysis = entry.get("analysis", {}) if isinstance(entry.get("analysis"), dict) else {}
         event_type = str(analysis.get("event_type", "moment")).strip() or "moment"
-        balance_penalty = 0.12 * event_counts.get(event_type, 0)
-        priority = _candidate_priority(entry, brief, day_index, total_days) - balance_penalty
-        if chosen_ids and priority < 0.55:
-            continue
         if chosen_ids and used + duration > budget_seconds * 1.18:
             continue
         chosen_ids.append(str(entry["candidate_id"]))
