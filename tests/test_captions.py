@@ -6,11 +6,52 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from video_summary.captions import _cache_key, _load_or_generate_clip_transcript, transcribe_project_clips
+from video_summary.captions import (
+    _cache_key,
+    _cohere_processor_inputs,
+    _load_or_generate_clip_transcript,
+    _read_pcm16_mono,
+    transcribe_project_clips,
+)
 from video_summary.clip_results import load_clip_result
 
 
 class CaptionsTests(unittest.TestCase):
+    def test_read_pcm16_mono_requires_numpy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sample.wav"
+            import wave
+
+            with wave.open(str(path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00")
+
+            with patch("video_summary.captions.importlib.util.find_spec", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "numpy is required"):
+                    _read_pcm16_mono(path)
+
+    def test_cohere_processor_inputs_prefers_transcription_request(self) -> None:
+        class FakeProcessor:
+            def __init__(self) -> None:
+                self.called = None
+
+            def apply_transcription_request(self, **kwargs):
+                self.called = ("apply", kwargs)
+                return {"ok": True}
+
+            def __call__(self, **kwargs):
+                self.called = ("call", kwargs)
+                return {"fallback": True}
+
+        processor = FakeProcessor()
+        payload = _cohere_processor_inputs(processor, [0.0] * 8, "hello")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(processor.called[0], "apply")
+        self.assertEqual(processor.called[1]["sampling_rate"], 16000)
+
     def test_load_or_generate_clip_transcript_reuses_empty_cached_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

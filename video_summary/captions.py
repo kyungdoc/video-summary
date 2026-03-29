@@ -7,7 +7,7 @@ import re
 import subprocess
 import wave
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 from .brief import brief_people_terms, brief_prompt_terms, brief_replacement_rules, load_project_metadata
 from .clip_results import load_all_clip_results, update_clip_result
@@ -114,15 +114,43 @@ def _speech_language_code(speech_locale: str) -> str:
     return speech_locale.split("-", 1)[0].lower().strip() or "en"
 
 
-def _read_pcm16_mono(audio_path: Path) -> List[float]:
+def _numpy_module() -> Any:
+    if importlib.util.find_spec("numpy") is None:
+        raise RuntimeError("numpy is required for Cohere transcription audio normalization. Install dependencies with `uv sync` first.")
+    import numpy as np
+
+    return np
+
+
+def _read_pcm16_mono(audio_path: Path):
+    np = _numpy_module()
     with wave.open(str(audio_path), "rb") as wav_file:
         sample_width = wav_file.getsampwidth()
         if sample_width != 2:
             raise RuntimeError(f"Expected 16-bit PCM WAV for transcription input, got sample width {sample_width}.")
         frame_count = wav_file.getnframes()
         raw = wav_file.readframes(frame_count)
-    samples = memoryview(raw).cast("h")
-    return [max(-1.0, min(1.0, float(value) / 32768.0)) for value in samples]
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    samples /= 32768.0
+    return np.clip(samples, -1.0, 1.0)
+
+
+def _cohere_processor_inputs(processor: object, audio: object, prompt: str | None):
+    if hasattr(processor, "apply_transcription_request"):
+        kwargs = {"audio": audio}
+        if prompt:
+            kwargs["prompt"] = prompt
+        return processor.apply_transcription_request(
+            **kwargs,
+            sampling_rate=16000,
+            return_tensors="pt",
+        )
+    return processor(
+        audio=audio,
+        sampling_rate=16000,
+        return_tensors="pt",
+        prompt=prompt or None,
+    )
 
 
 def _cohere_transformers_components(model_id: str):
@@ -163,15 +191,14 @@ def _transcribe_with_cohere_transformers(
     language = _speech_language_code(speech_locale)
     prompt = _taxonomy_prompt(taxonomy)
 
-    inputs = processor(
-        audio=audio,
-        sampling_rate=16000,
-        return_tensors="pt",
-        language=language,
-        prompt=prompt or None,
-    )
+    inputs = _cohere_processor_inputs(processor, audio, prompt or None)
     audio_chunk_index = inputs.get("audio_chunk_index")
-    inputs = {key: value.to(device=device, dtype=dtype) if hasattr(value, "to") else value for key, value in inputs.items()}
+    inputs = {
+        key: value.to(device=device, dtype=dtype) if hasattr(value, "to") and key != "input_ids" else (
+            value.to(device=device) if hasattr(value, "to") else value
+        )
+        for key, value in inputs.items()
+    }
 
     outputs = model.generate(**inputs, max_new_tokens=256)
     decoded = processor.decode(
