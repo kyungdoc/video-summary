@@ -135,11 +135,12 @@ def _read_pcm16_mono(audio_path: Path):
     return np.clip(samples, -1.0, 1.0)
 
 
-def _cohere_processor_inputs(processor: object, audio: object, prompt: str | None):
+def _cohere_processor_inputs(processor: object, audio: object, prompt: str | None, language: str):
     if hasattr(processor, "apply_transcription_request"):
         kwargs = {"audio": audio}
         if prompt:
             kwargs["prompt"] = prompt
+        kwargs["language"] = language
         return processor.apply_transcription_request(
             **kwargs,
             sampling_rate=16000,
@@ -149,6 +150,7 @@ def _cohere_processor_inputs(processor: object, audio: object, prompt: str | Non
         audio=audio,
         sampling_rate=16000,
         return_tensors="pt",
+        language=language,
         prompt=prompt or None,
     )
 
@@ -191,7 +193,7 @@ def _transcribe_with_cohere_transformers(
     language = _speech_language_code(speech_locale)
     prompt = _taxonomy_prompt(taxonomy)
 
-    inputs = _cohere_processor_inputs(processor, audio, prompt or None)
+    inputs = _cohere_processor_inputs(processor, audio, prompt or None, language)
     audio_chunk_index = inputs.get("audio_chunk_index")
     inputs = {
         key: value.to(device=device, dtype=dtype) if hasattr(value, "to") and key != "input_ids" else (

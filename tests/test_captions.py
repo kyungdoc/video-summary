@@ -46,11 +46,12 @@ class CaptionsTests(unittest.TestCase):
                 return {"fallback": True}
 
         processor = FakeProcessor()
-        payload = _cohere_processor_inputs(processor, [0.0] * 8, "hello")
+        payload = _cohere_processor_inputs(processor, [0.0] * 8, "hello", "ko")
 
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(processor.called[0], "apply")
         self.assertEqual(processor.called[1]["sampling_rate"], 16000)
+        self.assertEqual(processor.called[1]["language"], "ko")
 
     def test_load_or_generate_clip_transcript_reuses_empty_cached_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
