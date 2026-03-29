@@ -35,18 +35,6 @@ def build_parser() -> argparse.ArgumentParser:
                 "--speech-locale",
                 help="Speech locale for local ASR transcription, for example ko-KR",
             )
-            command.add_argument(
-                "--transcription-provider",
-                help="ASR provider, for example cohere-transformers, openai-compatible, or faster-whisper",
-            )
-            command.add_argument(
-                "--transcription-model",
-                help="ASR model name or id, for example CohereLabs/cohere-transcribe-03-2026",
-            )
-            command.add_argument(
-                "--transcription-base-url",
-                help="Base URL for OpenAI-compatible transcription servers",
-            )
         if name in {"render", "run"}:
             command.add_argument(
                 "--draft",
@@ -73,9 +61,6 @@ def main() -> None:
                     timezone_name=args.timezone,
                     day_start_hour=args.day_start_hour,
                     speech_locale=args.speech_locale,
-                    transcription_provider=args.transcription_provider,
-                    transcription_model=args.transcription_model,
-                    transcription_base_url=args.transcription_base_url,
                 ),
                 ensure_ascii=False,
                 indent=2,
@@ -93,9 +78,6 @@ def main() -> None:
                     timezone_name=args.timezone,
                     day_start_hour=args.day_start_hour,
                     speech_locale=args.speech_locale,
-                    transcription_provider=args.transcription_provider,
-                    transcription_model=args.transcription_model,
-                    transcription_base_url=args.transcription_base_url,
                 ),
                 ensure_ascii=False,
                 indent=2,
@@ -121,9 +103,6 @@ def main() -> None:
                     timezone_name=args.timezone,
                     day_start_hour=args.day_start_hour,
                     speech_locale=args.speech_locale,
-                    transcription_provider=args.transcription_provider,
-                    transcription_model=args.transcription_model,
-                    transcription_base_url=args.transcription_base_url,
                     draft=args.draft,
                 ),
                 ensure_ascii=False,

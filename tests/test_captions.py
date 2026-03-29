@@ -21,19 +21,18 @@ class CaptionsTests(unittest.TestCase):
             taxonomy = {"context": "", "terms": [], "prompt_terms": [], "replacement_rules": []}
 
             with patch("video_summary.captions.taxonomy_signature", return_value="sig"):
-                cache_path = cache_dir / f"{_cache_key(clip_path, 'faster-whisper:medium:ko-KR::sig')}.json"
+                cache_path = cache_dir / f"{_cache_key(clip_path, 'cohere-local:medium:ko-KR:sig')}.json"
                 cache_path.write_text(
                     json.dumps({"provider": "cache", "transcript": []}, ensure_ascii=False),
                     encoding="utf-8",
                 )
 
-                with patch("video_summary.captions._transcribe_with_faster_whisper") as mocked_transcribe:
+                with patch("video_summary.captions._transcribe_with_cohere_transformers") as mocked_transcribe:
                     transcript, provider = _load_or_generate_clip_transcript(
                         clip_path,
                         cache_dir,
                         speech_locale="ko-KR",
                         model_size="medium",
-                        provider="faster-whisper",
                         taxonomy=taxonomy,
                     )
 
@@ -70,7 +69,6 @@ class CaptionsTests(unittest.TestCase):
                     build_dir,
                     project_name="sample",
                     clip_paths=[str(clip_one), str(clip_two)],
-                    provider="faster-whisper",
                     model_size="medium",
                 )
 
