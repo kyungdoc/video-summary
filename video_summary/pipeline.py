@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -20,7 +21,12 @@ from .brief import (
     load_project_prompt,
     load_project_metadata,
 )
-from .captions import transcribe_project_clips
+from .captions import (
+    DEFAULT_CAPTION_MODEL,
+    DEFAULT_TRANSCRIPTION_BASE_URL,
+    DEFAULT_TRANSCRIPTION_PROVIDER,
+    transcribe_project_clips,
+)
 from .candidates import build_segment_candidates, validate_segment_selection
 from .look_presets import collect_look_presets
 from .media import dominant_fps, scan_media_directory
@@ -158,6 +164,9 @@ def configure_project(
     timezone_name: str | None = None,
     day_start_hour: int | None = None,
     speech_locale: str | None = None,
+    transcription_provider: str | None = None,
+    transcription_model: str | None = None,
+    transcription_base_url: str | None = None,
     metadata_path: str | Path | None = None,
     prompt_text: str | None = None,
     prompt_path: str | Path | None = None,
@@ -270,6 +279,30 @@ def configure_project(
     elif "speech_locale" not in manifest:
         manifest["speech_locale"] = DEFAULT_SPEECH_LOCALE
 
+    if transcription_provider is not None:
+        manifest["transcription_provider"] = transcription_provider
+    elif "transcription_provider" not in manifest:
+        manifest["transcription_provider"] = os.environ.get(
+            "VIDEO_SUMMARY_TRANSCRIPTION_PROVIDER",
+            DEFAULT_TRANSCRIPTION_PROVIDER,
+        )
+
+    if transcription_model is not None:
+        manifest["transcription_model"] = transcription_model
+    elif "transcription_model" not in manifest:
+        manifest["transcription_model"] = os.environ.get(
+            "VIDEO_SUMMARY_TRANSCRIPTION_MODEL",
+            DEFAULT_CAPTION_MODEL,
+        )
+
+    if transcription_base_url is not None:
+        manifest["transcription_base_url"] = transcription_base_url
+    elif "transcription_base_url" not in manifest:
+        manifest["transcription_base_url"] = os.environ.get(
+            "VIDEO_SUMMARY_TRANSCRIPTION_BASE_URL",
+            DEFAULT_TRANSCRIPTION_BASE_URL,
+        )
+
     manifest["project"] = project_name
     manifest["slug"] = slugify(project_name)
     manifest["taxonomy_path"] = str(ensure_project_taxonomy(paths["build"], project_name))
@@ -367,6 +400,9 @@ def scan_project(
     timezone_name: str | None = None,
     day_start_hour: int | None = None,
     speech_locale: str | None = None,
+    transcription_provider: str | None = None,
+    transcription_model: str | None = None,
+    transcription_base_url: str | None = None,
 ) -> Dict[str, object]:
     settings = configure_project(
         project_name,
@@ -378,6 +414,9 @@ def scan_project(
         timezone_name=timezone_name,
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
+        transcription_provider=transcription_provider,
+        transcription_model=transcription_model,
+        transcription_base_url=transcription_base_url,
     )
     paths = _project_paths(project_name, settings=settings)
     raw_dir = _project_source_dir(project_name, settings)
@@ -394,6 +433,9 @@ def scan_project(
         "timezone": settings["timezone"],
         "day_start_hour": settings["day_start_hour"],
         "speech_locale": settings["speech_locale"],
+        "transcription_provider": settings["transcription_provider"],
+        "transcription_model": settings["transcription_model"],
+        "transcription_base_url": settings["transcription_base_url"],
         "clip_count": len(clips),
         "clips": [clip.to_dict() for clip in clips],
     }
@@ -426,6 +468,9 @@ def plan_project(
     timezone_name: str | None = None,
     day_start_hour: int | None = None,
     speech_locale: str | None = None,
+    transcription_provider: str | None = None,
+    transcription_model: str | None = None,
+    transcription_base_url: str | None = None,
 ) -> Dict[str, object]:
     settings = configure_project(
         project_name,
@@ -437,6 +482,9 @@ def plan_project(
         timezone_name=timezone_name,
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
+        transcription_provider=transcription_provider,
+        transcription_model=transcription_model,
+        transcription_base_url=transcription_base_url,
     )
     paths = _project_paths(project_name, settings=settings)
     prompt_text_value = _require_project_prompt(project_name)
@@ -451,6 +499,10 @@ def plan_project(
         [clip.path for clip in clips],
         metadata_path=_project_metadata_path(project_name, settings),
         speech_locale=str(settings["speech_locale"]),
+        provider=str(settings["transcription_provider"]),
+        model_size=str(settings["transcription_model"]),
+        base_url=str(settings.get("transcription_base_url") or ""),
+        api_key=os.environ.get("VIDEO_SUMMARY_TRANSCRIPTION_API_KEY"),
     )
     candidates = build_segment_candidates(paths["build"], trip_title, clips, brief)
     selections = validate_segment_selection(paths["build"])
@@ -597,6 +649,9 @@ def render_project(
     timezone_name: str | None = None,
     day_start_hour: int | None = None,
     speech_locale: str | None = None,
+    transcription_provider: str | None = None,
+    transcription_model: str | None = None,
+    transcription_base_url: str | None = None,
 ) -> Dict[str, str]:
     configure_project(
         project_name,
@@ -608,6 +663,9 @@ def render_project(
         timezone_name=timezone_name,
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
+        transcription_provider=transcription_provider,
+        transcription_model=transcription_model,
+        transcription_base_url=transcription_base_url,
     )
     return _render_project_outputs(project_name, draft=draft)
 
@@ -622,6 +680,9 @@ def run_project_pipeline(
     timezone_name: str | None = None,
     day_start_hour: int | None = None,
     speech_locale: str | None = None,
+    transcription_provider: str | None = None,
+    transcription_model: str | None = None,
+    transcription_base_url: str | None = None,
     draft: bool = False,
 ) -> Dict[str, object]:
     settings = configure_project(
@@ -634,6 +695,9 @@ def run_project_pipeline(
         timezone_name=timezone_name,
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
+        transcription_provider=transcription_provider,
+        transcription_model=transcription_model,
+        transcription_base_url=transcription_base_url,
     )
     _require_project_prompt(project_name)
     clip_manifest = scan_project(
@@ -646,6 +710,9 @@ def run_project_pipeline(
         timezone_name=timezone_name,
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
+        transcription_provider=transcription_provider,
+        transcription_model=transcription_model,
+        transcription_base_url=transcription_base_url,
     )
     plans = plan_project(
         project_name,
@@ -657,6 +724,9 @@ def run_project_pipeline(
         timezone_name=timezone_name,
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
+        transcription_provider=transcription_provider,
+        transcription_model=transcription_model,
+        transcription_base_url=transcription_base_url,
     )
     outputs = render_project(
         project_name,
@@ -669,6 +739,9 @@ def run_project_pipeline(
         timezone_name=timezone_name,
         day_start_hour=day_start_hour,
         speech_locale=speech_locale,
+        transcription_provider=transcription_provider,
+        transcription_model=transcription_model,
+        transcription_base_url=transcription_base_url,
     )
     return {
         "project": settings,

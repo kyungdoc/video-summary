@@ -4,6 +4,7 @@ An open-source toolkit for prompt-first travel video editing built around:
 
 - local ASR transcription
 - candidate segment packaging
+- cue-level analysis by travel day
 - LLM-driven day-based segment selection
 - single-final rendering
 - prompt-first project setup
@@ -28,7 +29,7 @@ video_summary/ Python implementation of the pipeline
 - Python 3.12+
 - `uv`
 - `ffmpeg`
-- local environment capable of running `faster-whisper`
+- local environment capable of running either `transformers`+`torch` or `faster-whisper`
 
 ## Quick Start
 
@@ -37,10 +38,30 @@ uv sync
 python3 -m video_summary run \
   --project "Sample-Trip" \
   --source-dir "/absolute/path/to/raw-clips" \
+  --transcription-provider "cohere-transformers" \
+  --transcription-model "CohereLabs/cohere-transcribe-03-2026" \
   --prompt "여행 브이로그를 따뜻하고 여유롭게 편집해줘. 날짜 순서를 지키고, 식사 장면과 리액션을 살리고, 전체 러닝타임은 40분 정도로 맞춰줘."
 ```
 
 `--prompt-file /absolute/path/to/project_prompt.md` 도 사용할 수 있습니다.
+
+ASR provider options:
+
+- `cohere-transformers`:
+  local Hugging Face inference for `CohereLabs/cohere-transcribe-03-2026`. This is the default path.
+- `openai-compatible`:
+  sends audio to an OpenAI-compatible `/audio/transcriptions` endpoint. Use this when you want to point the pipeline at a remote transcription server.
+- `faster-whisper`:
+  keeps the previous local Whisper path available as a fallback.
+
+Environment overrides are also supported:
+
+```bash
+export VIDEO_SUMMARY_TRANSCRIPTION_PROVIDER="openai-compatible"
+export VIDEO_SUMMARY_TRANSCRIPTION_MODEL="CohereLabs/cohere-transcribe-03-2026"
+export VIDEO_SUMMARY_TRANSCRIPTION_BASE_URL="http://127.0.0.1:8000/v1"
+export VIDEO_SUMMARY_TRANSCRIPTION_API_KEY="dummy"
+```
 
 When `--source-dir` is provided, Codex-friendly outputs are written under the current workspace root instead of next to the source media:
 
@@ -122,4 +143,4 @@ After bootstrap, Codex can run the workflow directly against that repository.
 
 - The Python implementation is still evolving; the `workflow/` directory is the intended stable public surface.
 - The Codex skill is meant to consume the workflow docs rather than duplicate them.
-- `project_metadata.yaml`, `segment_candidates.json`, and `timeline_final.json` are internal build artifacts.
+- `project_metadata.yaml`, `segment_candidates.json`, `cue_analysis_by_day.json`, and `timeline_final.json` are internal build artifacts.

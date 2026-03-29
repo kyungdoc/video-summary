@@ -21,7 +21,7 @@ class CaptionsTests(unittest.TestCase):
             taxonomy = {"context": "", "terms": [], "prompt_terms": [], "replacement_rules": []}
 
             with patch("video_summary.captions.taxonomy_signature", return_value="sig"):
-                cache_path = cache_dir / f"{_cache_key(clip_path, 'medium:ko-KR:sig')}.json"
+                cache_path = cache_dir / f"{_cache_key(clip_path, 'faster-whisper:medium:ko-KR::sig')}.json"
                 cache_path.write_text(
                     json.dumps({"provider": "cache", "transcript": []}, ensure_ascii=False),
                     encoding="utf-8",
@@ -33,6 +33,7 @@ class CaptionsTests(unittest.TestCase):
                         cache_dir,
                         speech_locale="ko-KR",
                         model_size="medium",
+                        provider="faster-whisper",
                         taxonomy=taxonomy,
                     )
 
@@ -69,8 +70,12 @@ class CaptionsTests(unittest.TestCase):
                     build_dir,
                     project_name="sample",
                     clip_paths=[str(clip_one), str(clip_two)],
+                    provider="faster-whisper",
+                    model_size="medium",
                 )
 
+            self.assertEqual(summary["provider"], "cache")
+            self.assertEqual(summary["model"], "medium")
             self.assertEqual(summary["clip_count"], 2)
             self.assertEqual(summary["transcribed_clip_count"], 1)
             self.assertEqual(summary["empty_transcript_count"], 1)

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 from datetime import datetime
 from hashlib import sha1
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-from .brief import brief_editorial_brief_text, brief_target_runtime_seconds
+from .brief import brief_editorial_brief_text, brief_people_terms, brief_target_runtime_seconds
 from .clip_results import load_all_clip_results
 from .models import ClipInfo
 
@@ -25,6 +26,7 @@ SEGMENT_POST_ROLL = 0.85
 INTRO_SECONDS = 3.6
 OUTRO_SECONDS = 2.8
 TITLE_SECONDS = 2.6
+CUE_ANALYSIS_FILENAME = "cue_analysis_by_day.json"
 
 
 def _normalize_transcript_cues(cues: List[Dict[str, object]]) -> List[Dict[str, float | str]]:
@@ -122,6 +124,141 @@ def _candidate_excerpt(texts: List[str]) -> str:
     return merged[:500].strip()
 
 
+def _brief_people_lookup(brief: Dict[str, object]) -> List[Dict[str, object]]:
+    return brief_people_terms(brief)
+
+
+def _event_type(text: str, anchor: str) -> str:
+    combined = f"{anchor} {text}".lower()
+    if any(word in combined for word in ("식사", "조식", "점심", "저녁", "커피", "카페", "디저트", "맛있", "meal", "food")):
+        return "meal"
+    if any(word in combined for word in ("웃", "하하", "우와", "반응", "리액션", "reaction")):
+        return "reaction"
+    if any(word in combined for word in ("공항", "이동", "출발", "도착", "departure", "arrival", "return", "transfer")):
+        return "transition"
+    if any(word in combined for word in ("바다", "풍경", "야경", "노을", "경치", "view", "beach", "sunset")):
+        return "scenery"
+    if any(word in combined for word in ("시장", "거리", "구경", "쇼핑", "투어", "tour", "walk")):
+        return "activity"
+    return "moment"
+
+
+def _score_hits(text: str, words: List[str], weight: float, max_score: float = 1.0) -> float:
+    if not words:
+        return 0.0
+    hits = sum(1 for word in words if word in text)
+    return min(max_score, hits * weight)
+
+
+def _extract_people(text: str, brief: Dict[str, object]) -> List[str]:
+    lowered = text.lower()
+    people: List[str] = []
+    for person in _brief_people_lookup(brief):
+        canonical = str(person.get("canonical", "")).strip()
+        aliases = [str(alias).strip() for alias in person.get("aliases", []) if str(alias).strip()]
+        if canonical and canonical.lower() in lowered:
+            people.append(canonical)
+            continue
+        if any(alias.lower() in lowered for alias in aliases):
+            people.append(canonical or aliases[0])
+    generic_groups = {
+        "family": ["엄마", "아빠", "할머니", "할아버지", "가족", "family", "kids", "아이"],
+        "friends": ["친구", "friends"],
+    }
+    for label, keywords in generic_groups.items():
+        if label not in people and any(keyword in lowered for keyword in keywords):
+            people.append(label)
+    return people
+
+
+def _summary_text(event_type: str, people: List[str], excerpt: str) -> str:
+    people_text = ", ".join(people) if people else "등장인물 언급 적음"
+    compact = re.sub(r"\s+", " ", excerpt).strip()
+    if not compact:
+        compact = "대사보다는 상황과 분위기로 읽히는 구간"
+    return f"{event_type} 장면. 인물: {people_text}. 핵심: {compact[:140]}".strip()
+
+
+def _feature_scores(entry: Dict[str, object], brief: Dict[str, object], day_index: int, total_days: int) -> Dict[str, float]:
+    text = _candidate_search_text(entry)
+    anchor = str(entry.get("story_anchor_id", "")).lower()
+    duration = float(entry.get("duration", 0.0))
+    editorial_text = brief_editorial_brief_text(brief).lower()
+    people = _extract_people(text, brief)
+
+    importance = 0.35
+    if any(term in text for term in _must_include_terms(brief)):
+        importance += 0.35
+    if anchor:
+        importance += 0.12
+    if day_index == 1 and any(word in anchor for word in ("departure", "airport", "arrival")):
+        importance += 0.18
+    if day_index == total_days and any(word in anchor for word in ("return", "closing", "home")):
+        importance += 0.18
+
+    fun = 0.15
+    fun += _score_hits(text, ["웃", "하하", "우와", "재밌", "신나", "fun", "wow", "laugh"], 0.18, max_score=0.55)
+    fun += _score_hits(text, ["맛있", "카페", "디저트", "음식", "meal", "food"], 0.08, max_score=0.22)
+
+    people_score = min(1.0, 0.22 + len(people) * 0.26)
+    audio_score = 1.0 if bool(entry.get("has_audio", False)) else 0.25
+    scenery_score = 0.12 + _score_hits(text, ["풍경", "야경", "노을", "경치", "바다", "view", "sunset"], 0.18, max_score=0.68)
+    food_score = _score_hits(text, ["식사", "조식", "점심", "저녁", "커피", "카페", "디저트", "맛있", "meal", "food"], 0.25, max_score=1.0)
+    emotion_score = 0.1 + _score_hits(text, ["행복", "감동", "좋아", "웃", "우와", "반응", "emotion", "reaction"], 0.2, max_score=0.8)
+    transition_score = _score_hits(text + " " + anchor, ["공항", "출발", "도착", "이동", "departure", "arrival", "return"], 0.24, max_score=1.0)
+
+    duration_fit = 0.65
+    if 2.5 <= duration <= 14.0:
+        duration_fit = 1.0
+    elif duration > 22.0:
+        duration_fit = 0.45
+
+    if any(word in editorial_text for word in ("식사", "meal", "food", "음식")):
+        importance += food_score * 0.18
+    if any(word in editorial_text for word in ("리액션", "reaction", "반응")):
+        importance += fun * 0.14
+
+    return {
+        "importance": round(min(1.0, importance), 3),
+        "fun": round(min(1.0, fun), 3),
+        "people": round(min(1.0, people_score), 3),
+        "audio": round(min(1.0, audio_score), 3),
+        "scenery": round(min(1.0, scenery_score), 3),
+        "food": round(min(1.0, food_score), 3),
+        "emotion": round(min(1.0, emotion_score), 3),
+        "transition": round(min(1.0, transition_score), 3),
+        "duration_fit": round(min(1.0, duration_fit), 3),
+    }
+
+
+def _candidate_analysis(entry: Dict[str, object], brief: Dict[str, object], day_index: int, total_days: int) -> Dict[str, object]:
+    excerpt = str(entry.get("transcript_excerpt", "")).strip()
+    anchor = str(entry.get("story_anchor_label", "")).strip() or str(entry.get("story_anchor_id", "")).strip()
+    text = _candidate_search_text(entry)
+    people = _extract_people(text, brief)
+    event_type = _event_type(text, anchor)
+    features = _feature_scores(entry, brief, day_index, total_days)
+    overall = (
+        features["importance"] * 0.34
+        + features["fun"] * 0.16
+        + features["people"] * 0.12
+        + features["emotion"] * 0.12
+        + features["food"] * 0.08
+        + features["scenery"] * 0.08
+        + features["transition"] * 0.05
+        + features["audio"] * 0.03
+        + features["duration_fit"] * 0.02
+    )
+    return {
+        "event_type": event_type,
+        "people": people,
+        "summary": _summary_text(event_type, people, excerpt),
+        "anchor": anchor,
+        "features": features,
+        "overall_score": round(min(1.0, overall), 3),
+    }
+
+
 def _story_anchor_lookup(brief: Dict[str, object]) -> Dict[str, Dict[str, object]]:
     anchors = brief.get("story_anchors", []) if isinstance(brief, dict) else []
     return {
@@ -157,36 +294,16 @@ def _candidate_search_text(entry: Dict[str, object]) -> str:
 
 
 def _candidate_priority(entry: Dict[str, object], brief: Dict[str, object], day_index: int, total_days: int) -> float:
-    text = _candidate_search_text(entry)
-    score = 1.0
-    if bool(entry.get("has_audio", False)):
-        score += 0.25
-
-    duration = float(entry.get("duration", 0.0))
-    if 3.0 <= duration <= 12.0:
-        score += 0.18
-    elif duration > 16.0:
-        score -= 0.08
-
-    if any(term in text for term in _must_include_terms(brief)):
-        score += 0.35
-
-    editorial_text = brief_editorial_brief_text(brief).lower()
-    if any(word in editorial_text for word in ("식사", "meal", "food", "음식")) and any(
-        word in text for word in ("식사", "조식", "점심", "저녁", "커피", "카페", "디저트", "맛있", "meal", "food")
-    ):
-        score += 0.28
-    if any(word in editorial_text for word in ("리액션", "reaction", "반응")) and any(
-        word in text for word in ("우와", "웃", "하하", "반응", "reaction")
-    ):
-        score += 0.22
-
-    anchor_id = str(entry.get("story_anchor_id", "")).lower()
-    if day_index == 1 and any(word in anchor_id for word in ("departure", "airport")):
-        score += 0.18
-    if day_index == total_days and any(word in anchor_id for word in ("return", "closing", "home")):
-        score += 0.18
-    return score
+    analysis = entry.get("analysis")
+    if not isinstance(analysis, dict):
+        analysis = _candidate_analysis(entry, brief, day_index, total_days)
+    features = analysis.get("features", {}) if isinstance(analysis, dict) else {}
+    return (
+        float(analysis.get("overall_score", 0.0))
+        + float(features.get("importance", 0.0)) * 0.35
+        + float(features.get("fun", 0.0)) * 0.12
+        + float(features.get("emotion", 0.0)) * 0.08
+    )
 
 
 def _infer_role(entry: Dict[str, object], day_index: int, total_days: int, ordinal: int, count: int) -> str:
@@ -208,7 +325,10 @@ def _infer_role(entry: Dict[str, object], day_index: int, total_days: int, ordin
 def _selection_reason(entry: Dict[str, object], role: str, brief: Dict[str, object]) -> str:
     excerpt = str(entry.get("transcript_excerpt", "")).strip()
     anchor = str(entry.get("story_anchor_label", "")).strip() or str(entry.get("story_anchor_id", "")).strip()
-    brief_text = brief_editorial_brief_text(brief)
+    analysis = entry.get("analysis", {}) if isinstance(entry.get("analysis"), dict) else {}
+    event_type = str(analysis.get("event_type", "")).strip()
+    people = analysis.get("people", []) if isinstance(analysis, dict) else []
+    summary = str(analysis.get("summary", "")).strip()
     if role == "meal":
         return f"식사 리듬과 여행 분위기를 살리는 장면이라 선택했다. ({anchor})"
     if role == "reaction":
@@ -218,7 +338,11 @@ def _selection_reason(entry: Dict[str, object], role: str, brief: Dict[str, obje
     if role == "closer":
         return "여행을 정리하고 마무리하는 감정선을 남기는 장면이라 마지막에 배치했다."
     if anchor:
-        return f"프롬프트 의도와 하루 흐름을 살리는 핵심 장면이라 선택했다. ({anchor})"
+        return f"프롬프트 의도와 하루 흐름을 살리는 핵심 {event_type or '장면'}이라 선택했다. ({anchor})"
+    if people:
+        return f"등장인물 반응과 분위기가 잘 드러나는 구간이라 선택했다. {', '.join(str(item) for item in people[:3])}"
+    if summary:
+        return summary
     return f"프롬프트 의도에 맞는 흐름을 만들기 위해 선택했다. {excerpt[:80]}".strip()
 
 
@@ -245,13 +369,22 @@ def _auto_select_day(
     )
     chosen_ids: List[str] = []
     used = 0.0
+    event_counts: Dict[str, int] = {}
     for entry in ranked:
         duration = float(entry.get("duration", 0.0))
-        if chosen_ids and used + duration > budget_seconds * 1.08:
+        analysis = entry.get("analysis", {}) if isinstance(entry.get("analysis"), dict) else {}
+        event_type = str(analysis.get("event_type", "moment")).strip() or "moment"
+        balance_penalty = 0.12 * event_counts.get(event_type, 0)
+        priority = _candidate_priority(entry, brief, day_index, total_days) - balance_penalty
+        if chosen_ids and priority < 0.55:
+            continue
+        if chosen_ids and used + duration > budget_seconds * 1.18:
             continue
         chosen_ids.append(str(entry["candidate_id"]))
         used += duration
-        if used >= budget_seconds:
+        event_counts[event_type] = event_counts.get(event_type, 0) + 1
+        minimum_picks = 2 if len(entries) >= 3 else 1
+        if used >= budget_seconds and len(chosen_ids) >= minimum_picks:
             break
     if not chosen_ids and ranked:
         chosen_ids.append(str(ranked[0]["candidate_id"]))
@@ -271,9 +404,54 @@ def _auto_select_day(
                 "enabled": True,
                 "role": role,
                 "reason": _selection_reason(entry, role, brief),
+                "analysis_summary": str(entry.get("analysis", {}).get("summary", "")).strip(),
             }
         )
     return output
+
+
+def _write_cue_analysis(
+    build_dir: Path,
+    project_title: str,
+    candidates: List[Dict[str, object]],
+) -> Path:
+    grouped: Dict[str, List[Dict[str, object]]] = {}
+    for candidate in candidates:
+        grouped.setdefault(str(candidate.get("date_key", "")), []).append(candidate)
+
+    payload = {
+        "project_title": project_title,
+        "days": [],
+    }
+    for index, date_key in enumerate(sorted(grouped), start=1):
+        day_candidates = sorted(
+            grouped[date_key],
+            key=lambda item: (-float(item.get("analysis", {}).get("overall_score", 0.0)), str(item.get("source_time", ""))),
+        )
+        payload["days"].append(
+            {
+                "travel_day": index,
+                "date_key": date_key,
+                "label": f"Day {index} · {date_key}",
+                "cue_count": len(day_candidates),
+                "cues": [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "clip_path": item["clip_path"],
+                        "start": item["start"],
+                        "end": item["end"],
+                        "duration": item["duration"],
+                        "transcript_excerpt": item["transcript_excerpt"],
+                        "analysis": item["analysis"],
+                    }
+                    for item in day_candidates
+                ],
+            }
+        )
+
+    path = build_dir / "segment_candidates" / CUE_ANALYSIS_FILENAME
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def write_auto_segment_selection(
@@ -375,6 +553,15 @@ def build_segment_candidates(
                 }
             )
 
+    total_days = max((int(item.get("travel_day", 0) or 0) for item in entries), default=1)
+    for entry in entries:
+        entry["analysis"] = _candidate_analysis(
+            entry,
+            brief,
+            max(1, int(entry.get("travel_day", 1) or 1)),
+            total_days,
+        )
+
     if not entries:
         raise ValueError("No segment candidates could be generated from transcripts.")
 
@@ -387,12 +574,14 @@ def build_segment_candidates(
         "candidates": entries,
     }
     candidates_path.write_text(json.dumps(candidates_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    cue_analysis_path = _write_cue_analysis(build_dir, project_title, entries)
 
     selection_path = write_auto_segment_selection(build_dir, project_title, brief)
 
     return {
         "segment_candidates_path": str(candidates_path.resolve()),
         "segment_selection_path": str(selection_path.resolve()),
+        "cue_analysis_path": str(cue_analysis_path.resolve()),
         "frames_dir": str(frames_dir.resolve()),
         "candidate_count": len(entries),
     }

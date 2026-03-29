@@ -5,6 +5,7 @@ import importlib.util
 import json
 import re
 import subprocess
+import wave
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -13,7 +14,9 @@ from .clip_results import load_all_clip_results, update_clip_result
 from .taxonomy import load_project_taxonomy, taxonomy_signature
 
 
-DEFAULT_CAPTION_MODEL = "medium"
+DEFAULT_TRANSCRIPTION_PROVIDER = "cohere-transformers"
+DEFAULT_CAPTION_MODEL = "CohereLabs/cohere-transcribe-03-2026"
+DEFAULT_TRANSCRIPTION_BASE_URL = "http://127.0.0.1:8000/v1"
 _MODEL_CACHE: Dict[Tuple[str, str, str], object] = {}
 
 
@@ -109,6 +112,21 @@ def _apply_taxonomy(text: str, taxonomy: Dict[str, object]) -> str:
     return corrected.replace("  ", " ").strip()
 
 
+def _speech_language_code(speech_locale: str) -> str:
+    return speech_locale.split("-", 1)[0].lower().strip() or "en"
+
+
+def _read_pcm16_mono(audio_path: Path) -> List[float]:
+    with wave.open(str(audio_path), "rb") as wav_file:
+        sample_width = wav_file.getsampwidth()
+        if sample_width != 2:
+            raise RuntimeError(f"Expected 16-bit PCM WAV for transcription input, got sample width {sample_width}.")
+        frame_count = wav_file.getnframes()
+        raw = wav_file.readframes(frame_count)
+    samples = memoryview(raw).cast("h")
+    return [max(-1.0, min(1.0, float(value) / 32768.0)) for value in samples]
+
+
 def _faster_whisper_model(model_size: str):
     if importlib.util.find_spec("faster_whisper") is None:
         raise RuntimeError(
@@ -119,6 +137,30 @@ def _faster_whisper_model(model_size: str):
     key = ("faster-whisper", model_size, "cpu-int8")
     if key not in _MODEL_CACHE:
         _MODEL_CACHE[key] = WhisperModel(model_size, device="cpu", compute_type="int8")
+    return _MODEL_CACHE[key]
+
+
+def _cohere_transformers_components(model_id: str):
+    if importlib.util.find_spec("transformers") is None:
+        raise RuntimeError(
+            "transformers is required for Cohere transcription. Install dependencies with `uv sync` first."
+        )
+    if importlib.util.find_spec("torch") is None:
+        raise RuntimeError(
+            "torch is required for Cohere transcription. Install dependencies with `uv sync` first."
+        )
+    import torch
+    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    dtype = torch.float16 if device == "mps" else torch.float32
+    key = ("cohere-transformers", model_id, device)
+    if key not in _MODEL_CACHE:
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = CohereAsrForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype)
+        model.to(device)
+        model.eval()
+        _MODEL_CACHE[key] = (processor, model, device, dtype)
     return _MODEL_CACHE[key]
 
 
@@ -155,14 +197,105 @@ def _transcribe_with_faster_whisper(
     return results
 
 
+def _transcribe_with_cohere_transformers(
+    audio_path: Path,
+    speech_locale: str,
+    model_id: str,
+    taxonomy: Dict[str, object],
+) -> List[Dict[str, object]]:
+    processor, model, device, dtype = _cohere_transformers_components(model_id)
+    audio = _read_pcm16_mono(audio_path)
+    language = _speech_language_code(speech_locale)
+    prompt = _taxonomy_prompt(taxonomy)
+
+    inputs = processor(
+        audio=audio,
+        sampling_rate=16000,
+        return_tensors="pt",
+        language=language,
+        prompt=prompt or None,
+    )
+    audio_chunk_index = inputs.get("audio_chunk_index")
+    inputs = {key: value.to(device=device, dtype=dtype) if hasattr(value, "to") else value for key, value in inputs.items()}
+
+    outputs = model.generate(**inputs, max_new_tokens=256)
+    decoded = processor.decode(
+        outputs,
+        skip_special_tokens=True,
+        audio_chunk_index=audio_chunk_index,
+        language=language,
+    )
+    text = decoded[0] if isinstance(decoded, list) else str(decoded)
+    text = _apply_taxonomy(_normalize_caption_text(text), taxonomy)
+    if not text:
+        return []
+    duration = 0.0
+    with wave.open(str(audio_path), "rb") as wav_file:
+        duration = wav_file.getnframes() / float(max(wav_file.getframerate(), 1))
+    return [{"start": 0.0, "end": round(duration, 3), "text": text}]
+
+
+def _transcribe_with_openai_compatible_api(
+    audio_path: Path,
+    speech_locale: str,
+    model_id: str,
+    taxonomy: Dict[str, object],
+    base_url: str,
+    api_key: str | None,
+) -> List[Dict[str, object]]:
+    if importlib.util.find_spec("openai") is None:
+        raise RuntimeError(
+            "openai is required for OpenAI-compatible transcription endpoints. Install dependencies with `uv sync` first."
+        )
+    from openai import OpenAI
+
+    client = OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key or "codex-local")
+    language = _speech_language_code(speech_locale)
+    with audio_path.open("rb") as audio_file:
+        response = client.audio.transcriptions.create(
+            file=audio_file,
+            model=model_id,
+            language=language,
+            prompt=_taxonomy_prompt(taxonomy) or None,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+
+    payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+    segments = payload.get("segments", [])
+    results: List[Dict[str, object]] = []
+    for segment in segments if isinstance(segments, list) else []:
+        if not isinstance(segment, dict):
+            continue
+        text = _apply_taxonomy(_normalize_caption_text(str(segment.get("text", ""))), taxonomy)
+        if not text:
+            continue
+        try:
+            start = float(segment.get("start", 0.0))
+            end = float(segment.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        results.append({"start": round(start, 3), "end": round(end, 3), "text": text})
+    if results:
+        return results
+
+    text_value = _apply_taxonomy(_normalize_caption_text(str(payload.get("text", ""))), taxonomy)
+    if not text_value:
+        return []
+    return [{"start": 0.0, "end": 0.0, "text": text_value}]
+
+
 def _load_or_generate_clip_transcript(
     clip_path: Path,
     cache_dir: Path,
     speech_locale: str,
     model_size: str,
+    provider: str,
     taxonomy: Dict[str, object],
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> Tuple[List[Dict[str, object]], str]:
-    cache_signature = f"{model_size}:{speech_locale}:{taxonomy_signature(taxonomy)}"
+    cache_signature = f"{provider}:{model_size}:{speech_locale}:{base_url or ''}:{taxonomy_signature(taxonomy)}"
     cache_path = cache_dir / f"{_cache_key(clip_path, cache_signature)}.json"
     if cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -170,19 +303,39 @@ def _load_or_generate_clip_transcript(
             transcript = list(cached.get("transcript", []))
             return transcript, str(cached.get("provider", "cache"))
 
-    provider = "faster-whisper"
     audio_path = cache_dir / f"{_cache_key(clip_path, cache_signature)}.wav"
     extracted_audio = _extract_audio(clip_path, audio_path)
-    transcript = _transcribe_with_faster_whisper(
-        extracted_audio,
-        speech_locale,
-        model_size,
-        taxonomy=taxonomy,
-    )
+    if provider == "faster-whisper":
+        transcript = _transcribe_with_faster_whisper(
+            extracted_audio,
+            speech_locale,
+            model_size,
+            taxonomy=taxonomy,
+        )
+    elif provider == "cohere-transformers":
+        transcript = _transcribe_with_cohere_transformers(
+            extracted_audio,
+            speech_locale,
+            model_size,
+            taxonomy=taxonomy,
+        )
+    elif provider == "openai-compatible":
+        transcript = _transcribe_with_openai_compatible_api(
+            extracted_audio,
+            speech_locale,
+            model_size,
+            taxonomy=taxonomy,
+            base_url=base_url or DEFAULT_TRANSCRIPTION_BASE_URL,
+            api_key=api_key,
+        )
+    else:
+        raise ValueError(f"Unsupported transcription provider: {provider}")
     cache_path.write_text(
         json.dumps(
             {
                 "provider": provider,
+                "model": model_size,
+                "base_url": base_url or "",
                 "clip_path": str(clip_path),
                 "taxonomy_signature": taxonomy_signature(taxonomy),
                 "transcript": transcript,
@@ -207,6 +360,9 @@ def transcribe_project_clips(
     metadata_path: str | Path | None = None,
     speech_locale: str = "ko-KR",
     model_size: str = DEFAULT_CAPTION_MODEL,
+    provider: str = DEFAULT_TRANSCRIPTION_PROVIDER,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> Dict[str, object]:
     cache_dir = build_dir / "captions"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -224,7 +380,10 @@ def transcribe_project_clips(
             cache_dir,
             speech_locale=speech_locale,
             model_size=model_size,
+            provider=provider,
             taxonomy=taxonomy,
+            base_url=base_url,
+            api_key=api_key,
         )
         providers.add(provider)
         if not transcript:
@@ -234,6 +393,8 @@ def transcribe_project_clips(
             clip_path,
             {
                 "provider": provider,
+                "transcription_model": model_size,
+                "transcription_base_url": base_url or "",
                 "speech_locale": speech_locale,
                 "taxonomy_signature": taxonomy_signature(taxonomy),
                 "transcript_status": "empty" if not transcript else "ok",
@@ -247,7 +408,9 @@ def transcribe_project_clips(
         {
             "project": project_name,
             "speech_locale": speech_locale,
-            "provider": ", ".join(sorted(providers)) if providers else "faster-whisper",
+            "provider": ", ".join(sorted(providers)) if providers else provider,
+            "model": model_size,
+            "base_url": base_url or "",
             "clips": [
                 {
                     "clip_path": item.get("clip_path"),
@@ -259,7 +422,9 @@ def transcribe_project_clips(
         },
     )
     summary = {
-        "provider": ", ".join(sorted(providers)) if providers else "faster-whisper",
+        "provider": ", ".join(sorted(providers)) if providers else provider,
+        "model": model_size,
+        "base_url": base_url or "",
         "speech_locale": speech_locale,
         "taxonomy_path": str((build_dir / "taxonomy.json").resolve()),
         "taxonomy_signature": taxonomy_signature(taxonomy),
