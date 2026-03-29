@@ -2,6 +2,13 @@
 
 This directory is the stable, model-agnostic specification for the video-editing workflow.
 
+Current repository behavior:
+
+- transcription is local-only
+- transcription uses `CohereLabs/cohere-transcribe-03-2026` via `transformers`
+- the default user path is still a single `run` command
+- planning also writes day-based cue analysis artifacts before final rendering
+
 Read in this order:
 
 1. [pipeline.md](pipeline.md)

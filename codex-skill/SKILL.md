@@ -33,8 +33,8 @@ bash /absolute/path/to/this-skill/scripts/bootstrap-video-summary.sh \
 4. Treat the user's current project directory only as a source of inputs such as raw clips and prompt files.
 5. Read the workflow docs from inside `$VIDEO_SUMMARY_REPO`, starting with `workflow/pipeline.md`.
 6. Accept a free-form editing prompt as the primary user input.
-7. Codex runs the local commands for scan, ASR, candidate packaging, timeline generation, and render.
-8. Codex inspects the generated candidate artifacts and uses the editing prompt to decide which cues belong in the final timeline.
+7. Codex normally runs one local `run` command, which internally performs scan, local Cohere transcription, candidate packaging, cue analysis, timeline generation, and render.
+8. If debugging is needed, Codex may inspect the generated candidate artifacts and day-based cue analysis before rendering again.
 9. Treat generated planning artifacts as internal implementation details unless debugging is necessary.
 10. Preserve day-based episode structure and chronological order inside each day by default.
 
@@ -73,6 +73,7 @@ This wrapper keeps outputs under the caller's workspace root even when the sourc
 - Python 3.12+
 - `uv`
 - `ffmpeg`
+- local Python environment capable of running `transformers` + `torch`
 
 When the skill is installed by itself, Codex should bootstrap the backing repository automatically on first use. The manual fallback is:
 
@@ -86,6 +87,8 @@ bash /absolute/path/to/this-skill/scripts/bootstrap-video-summary.sh \
 - Do not ask the user to prepare YAML before getting started.
 - Do not split the experience into separate “plan skill” and “render skill” steps unless the user explicitly asks for that level of control.
 - Default to one-shot execution from prompt to final output.
+- The default skill path is still one wrapper command using `run`.
+- The transcription step is local-only and uses `CohereLabs/cohere-transcribe-03-2026`.
 - Treat generated planning artifacts as internal implementation details unless debugging is necessary.
 - Codex should normally use the one-shot `run` entrypoint first.
 - If inspection is needed, Codex may switch to `plan` and `render`, but those commands must still run from `$VIDEO_SUMMARY_REPO`.

@@ -35,11 +35,14 @@ Pass `--project-dir` only when the user explicitly wants a different output loca
 This skill wraps the repository workflow:
 
 - one-shot prompt-first execution
-- local ASR
+- local-only transcription with `CohereLabs/cohere-transcribe-03-2026`
 - candidate packaging
+- day-based cue analysis
 - automatic day-based selection
 - final timeline generation
 - final render
+
+The default path remains a single wrapper command using `run`.
 
 After bootstrap, the canonical workflow docs live in:
 
