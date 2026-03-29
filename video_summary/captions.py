@@ -134,6 +134,10 @@ def _cohere_transformers_components(model_id: str):
         raise RuntimeError(
             "torch is required for Cohere transcription. Install dependencies with `uv sync` first."
         )
+    if importlib.util.find_spec("librosa") is None:
+        raise RuntimeError(
+            "librosa is required for Cohere transcription audio loading. Install dependencies with `uv sync` first."
+        )
     import torch
     from transformers import AutoProcessor, CohereAsrForConditionalGeneration
 

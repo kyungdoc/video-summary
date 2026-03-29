@@ -29,7 +29,7 @@ video_summary/ Python implementation of the pipeline
 - Python 3.12+
 - `uv`
 - `ffmpeg`
-- local environment capable of running `transformers` + `torch`
+- local environment capable of running `transformers` + `torch` + `librosa`
 
 ## Quick Start
 
