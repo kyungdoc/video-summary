@@ -12,11 +12,6 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required." >&2
-  exit 1
-fi
-
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required. Install it from https://docs.astral.sh/uv/." >&2
   exit 1
@@ -27,12 +22,20 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v ffprobe >/dev/null 2>&1; then
+  echo "ffprobe is required and must be installed before scanning." >&2
+  exit 1
+fi
+
 if [[ -n "${REPO_URL}" ]]; then
   mkdir -p "$(dirname "${INSTALL_ROOT}")"
   if [[ -d "${INSTALL_ROOT}/.git" ]]; then
     git -C "${INSTALL_ROOT}" pull --ff-only
   else
-    rm -rf "${INSTALL_ROOT}"
+    if [[ -e "${INSTALL_ROOT}" ]] && [[ -n "$(ls -A "${INSTALL_ROOT}" 2>/dev/null)" ]]; then
+      echo "Install directory exists and is not an empty git repository: ${INSTALL_ROOT}" >&2
+      exit 1
+    fi
     git clone "${REPO_URL}" "${INSTALL_ROOT}"
   fi
   REPO_ROOT="${INSTALL_ROOT}"
@@ -47,7 +50,7 @@ else
 fi
 
 cd "${REPO_ROOT}"
-uv sync
+uv sync --frozen
 
 cat > "${ENV_FILE}" <<EOF
 export VIDEO_SUMMARY_REPO="${REPO_ROOT}"

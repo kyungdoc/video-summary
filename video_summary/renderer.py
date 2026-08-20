@@ -1,641 +1,1598 @@
 from __future__ import annotations
 
-import json
-import shlex
+import os
+import math
 import shutil
-import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageOps
 
-from .models import TimelinePlan
-
-
-FONT_PATH = Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf")
-MASTER_FRAME = (3840, 2160)
-DRAFT_FRAME = (1280, 720)
-
-
-def _shell_join(command: List[str]) -> str:
-    return " ".join(shlex.quote(part) for part in command)
-
-
-def _run(command: List[str]) -> None:
-    subprocess.run(command, check=True)
-
-
-def _log_step(message: str) -> None:
-    print(f"[render] {message}", flush=True)
-
-
-def _slugify(value: str) -> str:
-    return "".join(character.lower() if character.isalnum() else "-" for character in value).strip("-")
-
-
-def _item_duration(item: Dict[str, object]) -> float:
-    if "duration" in item:
-        return float(item["duration"])
-    start = float(item.get("start", 0.0))
-    end = float(item.get("end", start))
-    return max(0.0, end - start)
-
-
-def _chunk_plan(plan: TimelinePlan, label: str, items: List[Dict[str, object]]) -> TimelinePlan:
-    return TimelinePlan(
-        title=f"{plan.title} · {label}",
-        fps=plan.fps,
-        target_duration=sum(_item_duration(item) for item in items),
-        items=items,
-        days=[],
-        chapters=[{"timecode": "00:00", "label": label}],
-        notes=[f"Chunk render for {label}"],
-    )
+from .animated_mosaic import ANIMATED_MOSAIC_POLICY_VERSION, render_animated_mosaic
+from .candidates import load_candidates
+from .media import load_clips, probe_media
+from .models import Candidate, Clip, EditPlan, Episode, PlanSegment
+from .planner import validate_and_normalize_plan
+from .project import ProjectPaths
+from .render_assets import (
+    FONT_CANDIDATES,
+    MOSAIC_CAPACITY,
+    MOSAIC_COLUMNS,
+    MOSAIC_ROWS,
+    chapter_time,
+    create_card,
+    create_lower_third,
+    create_mosaic_card,
+    vtt_time,
+)
+from .state import StateStore
+from .transcribe import load_transcript
+from .utils import (
+    VideoSummaryError,
+    atomic_write_text,
+    file_fingerprint,
+    print_status,
+    read_json,
+    run_command,
+    stable_hash,
+    write_json,
+)
 
 
-def split_plan_into_chunks(plan: TimelinePlan) -> List[Dict[str, object]]:
-    if not plan.items:
-        return []
-
-    items = list(plan.items)
-    title_starts = [index for index, item in enumerate(items) if item.get("kind") == "title"]
-    chunks: List[Dict[str, object]] = []
-
-    if not title_starts:
-        label = str(plan.title).strip() or "Timeline"
-        return [{"label": label, "slug": _slugify(label) or "timeline", "plan": _chunk_plan(plan, label, items)}]
-
-    first_title_index = title_starts[0]
-    if first_title_index > 0:
-        prelude_items = items[:first_title_index]
-        first_label = str(prelude_items[0].get("label", "")).strip() if prelude_items else ""
-        label = "Cold Open" if first_label.startswith("Cold Open") else "Prelude"
-        chunks.append(
-            {
-                "label": label,
-                "slug": _slugify(label) or "prelude",
-                "plan": _chunk_plan(plan, label, prelude_items),
-            }
-        )
-
-    for chunk_index, start_index in enumerate(title_starts):
-        end_index = title_starts[chunk_index + 1] if chunk_index + 1 < len(title_starts) else len(items)
-        chunk_items = items[start_index:end_index]
-        label = str(items[start_index].get("label", "")).strip() or f"Chapter {chunk_index + 1}"
-        chunks.append(
-            {
-                "label": label,
-                "slug": _slugify(label) or f"chapter-{chunk_index + 1}",
-                "plan": _chunk_plan(plan, label, chunk_items),
-            }
-        )
-    return chunks
+RENDER_POLICY_VERSION = 12
+SOURCE_RENDER_POLICY_VERSION = 6
+CARD_RENDER_POLICY_VERSION = 3
+MOSAIC_CARD_POLICY_VERSION = 4
+YOUTUBE_MIN_CHAPTERS = 3
+YOUTUBE_MIN_CHAPTER_SECONDS = 10
+AAC_FRAME_SAMPLES = 1024
+DEFAULT_AUDIO_SAMPLE_RATE = 48000
 
 
-def concat_copy_videos(input_paths: List[Path], output_path: Path, build_dir: Path) -> None:
-    if not input_paths:
-        raise ValueError("At least one input path is required for concat.")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    build_dir.mkdir(parents=True, exist_ok=True)
-
-    if len(input_paths) == 1:
-        shutil.copy2(input_paths[0], output_path)
-        return
-
-    concat_list = build_dir / f"{output_path.stem}_concat.txt"
-    concat_list.write_text(
-        "".join(f"file '{path.resolve().as_posix()}'\n" for path in input_paths),
-        encoding="utf-8",
-    )
-    command = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_list),
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-    _run(command)
+@dataclass(slots=True)
+class Piece:
+    path: Path
+    duration: float
+    label: str
+    candidate: Candidate | None = None
+    segment: PlanSegment | None = None
+    day_chapter: str | None = None
+    source_members: tuple["SourceMember", ...] = ()
 
 
-def _title_png(label: str, output_path: Path, frame_width: int = MASTER_FRAME[0], frame_height: int = MASTER_FRAME[1]) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.new("RGB", (frame_width, frame_height), color=(15, 13, 11))
-    draw = ImageDraw.Draw(image)
-    scale = frame_width / MASTER_FRAME[0]
-    major_font = ImageFont.truetype(str(FONT_PATH), max(40, int(120 * scale)))
-    minor_font = ImageFont.truetype(str(FONT_PATH), max(24, int(60 * scale)))
-
-    if "·" in label:
-        title, subtitle = [part.strip() for part in label.split("·", 1)]
-    else:
-        title, subtitle = label.strip(), ""
-
-    title_box = draw.textbbox((0, 0), title, font=major_font)
-    title_width = title_box[2] - title_box[0]
-    title_height = title_box[3] - title_box[1]
-    title_x = (frame_width - title_width) / 2
-    title_y = frame_height * 0.42
-    draw.text((title_x, title_y), title, fill=(246, 242, 236), font=major_font)
-
-    if subtitle:
-        subtitle_box = draw.textbbox((0, 0), subtitle, font=minor_font)
-        subtitle_width = subtitle_box[2] - subtitle_box[0]
-        subtitle_x = (frame_width - subtitle_width) / 2
-        subtitle_y = title_y + title_height + max(20, int(48 * scale))
-        draw.text((subtitle_x, subtitle_y), subtitle, fill=(214, 208, 198), font=minor_font)
-
-    image.save(output_path)
+@dataclass(frozen=True, slots=True)
+class SourceMember:
+    candidate: Candidate
+    segment: PlanSegment
+    offset: float
+    label: str
 
 
-def create_title_card(
-    label: str,
-    duration: float,
-    fps: float,
-    output_path: Path,
-    frame_width: int = MASTER_FRAME[0],
-    frame_height: int = MASTER_FRAME[1],
-    preset: str = "medium",
-    crf: int = 12,
-) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    png_path = output_path.with_suffix(".png")
-    if not png_path.exists():
-        _title_png(label, png_path, frame_width=frame_width, frame_height=frame_height)
-    command = [
-        "ffmpeg",
-        "-y",
-        "-loop",
-        "1",
-        "-i",
-        str(png_path),
-        "-f",
-        "lavfi",
-        "-i",
-        "anullsrc=r=48000:cl=stereo",
-        "-t",
-        str(duration),
-        "-shortest",
-        "-vf",
-        "fps={fps},scale={frame_width}:{frame_height}:flags=lanczos,format=yuv420p".format(
-            fps=fps,
-            frame_width=frame_width,
-            frame_height=frame_height,
-        ),
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        str(output_path),
-    ]
-    _run(command)
+@dataclass(frozen=True, slots=True)
+class SourceSelection:
+    candidate: Candidate
+    segment: PlanSegment
 
 
-def ensure_title_assets(
-    plan: TimelinePlan,
-    asset_dir: Path,
-    frame_width: int = MASTER_FRAME[0],
-    frame_height: int = MASTER_FRAME[1],
-    preset: str = "medium",
-    crf: int = 12,
-) -> Dict[str, Path]:
-    assets: Dict[str, Path] = {}
-    variant = f"_{frame_width}x{frame_height}"
-    for index, item in enumerate(plan.items):
-        if item["kind"] != "title":
+def render_cache_key(
+    plan: EditPlan,
+    clips: list[Clip],
+    render_config: dict[str, Any],
+    mode: str,
+    draft: bool,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+    *,
+    version: int,
+    font_signature: list[dict[str, str]] | None = None,
+    trip_intro_signature: list[dict[str, str]] | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "version": version,
+        "plan": plan.to_dict(),
+        "clips": [(clip.clip_id, clip.fingerprint) for clip in clips],
+        "render": render_config,
+        "episode_mode": mode,
+        "draft": draft,
+        "format": [width, height, fps, encoder, bitrate],
+    }
+    if font_signature is not None:
+        payload["font_signature"] = font_signature
+    if trip_intro_signature is not None:
+        grid_size = configured_mosaic_grid_size(render_config)
+        payload["trip_intro_signature"] = {
+            "grid": [grid_size, grid_size],
+            "frames": trip_intro_signature,
+        }
+    return stable_hash(payload, length=32)
+
+
+def render_font_signature(config: dict[str, Any]) -> list[dict[str, str]]:
+    configured = Path(str(config["render"].get("font_file", ""))).expanduser()
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for path in (configured, *FONT_CANDIDATES):
+        normalized = str(path)
+        if not normalized or normalized in seen:
             continue
-        asset_path = asset_dir / f"title_{index:03d}{variant}.mp4"
-        if not asset_path.exists():
-            create_title_card(
-                str(item["label"]),
-                float(item["duration"]),
-                plan.fps,
-                asset_path,
-                frame_width=frame_width,
-                frame_height=frame_height,
-                preset=preset,
-                crf=crf,
-            )
-        assets[str(index)] = asset_path
-    return assets
+        seen.add(normalized)
+        try:
+            if path.is_file():
+                result.append({"path": normalized, "fingerprint": file_fingerprint(path)})
+        except OSError:
+            result.append({"path": normalized, "fingerprint": "unreadable"})
+    return result
 
 
-def _input_map(plan: TimelinePlan, title_assets: Dict[str, Path]) -> Tuple[List[str], Dict[str, int]]:
-    inputs: List[str] = []
-    mapping: Dict[str, int] = {}
-    for index, item in enumerate(plan.items):
-        if item["kind"] == "title":
-            path = str(title_assets[str(index)].resolve())
-        else:
-            path = str(Path(str(item["clip_path"])).resolve())
-        if path not in mapping:
-            mapping[path] = len(inputs)
-            inputs.append(path)
-    return inputs, mapping
-
-
-def _video_fade(duration: float) -> float:
-    return min(0.24, max(0.10, duration * 0.075))
-
-
-def _video_chain(
-    label_index: int,
-    input_index: int,
-    item: Dict[str, object],
-    fps: float,
-    frame_width: int = MASTER_FRAME[0],
-    frame_height: int = MASTER_FRAME[1],
-    pixel_format: str = "yuv422p10le",
-    draft: bool = False,
-) -> List[str]:
-    duration = float(item["duration"])
-    fade = _video_fade(duration)
-    fade_out_start = max(0.0, duration - fade)
-    if item["kind"] == "title":
-        base_ref = f"v{label_index}base"
-        filters = [
-            f"[{input_index}:v]trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS,scale={frame_width}:{frame_height}:flags=lanczos,"
-            f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f},setsar=1,fps={fps},format={pixel_format}[{base_ref}]"
-        ]
-        filters.append(f"[{base_ref}]null[v{label_index}]")
-        return filters
-
-    start = float(item["start"])
-    end = float(item["end"])
-    if draft:
-        base_ref = f"v{label_index}base"
-        filters = [
-            f"[{input_index}:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,split=2[v{label_index}bg][v{label_index}fg]",
-            f"[v{label_index}bg]scale={frame_width}:{frame_height}:force_original_aspect_ratio=increase:flags=bicubic,crop={frame_width}:{frame_height},boxblur=12:1,eq=brightness=-0.03:contrast=1.02:saturation=0.88[v{label_index}bgb]",
-            f"[v{label_index}fg]scale={frame_width}:{frame_height}:force_original_aspect_ratio=decrease:flags=bicubic,eq=contrast=1.05:brightness=0.01:saturation=1.06:gamma=0.98,unsharp=3:3:0.35:3:3:0.0[v{label_index}fgb]",
-            f"[v{label_index}bgb][v{label_index}fgb]overlay=(W-w)/2:(H-h)/2,fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f},setsar=1,fps={fps},format={pixel_format}[{base_ref}]",
-        ]
-        filters.append(f"[{base_ref}]null[v{label_index}]")
-        return filters
-    base_ref = f"v{label_index}base"
-    filters = [
-        f"[{input_index}:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,split=2[v{label_index}bg][v{label_index}fg]",
-        f"[v{label_index}bg]scale={frame_width}:{frame_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={frame_width}:{frame_height},boxblur=18:2,eq=brightness=-0.02:saturation=0.90[v{label_index}bgb]",
-        f"[v{label_index}fg]scale={frame_width}:{frame_height}:force_original_aspect_ratio=decrease:flags=lanczos,eq=contrast=1.06:brightness=0.01:saturation=1.08:gamma=0.98,unsharp=5:5:0.4:5:5:0.0[v{label_index}fgb]",
-        f"[v{label_index}bgb][v{label_index}fgb]overlay=(W-w)/2:(H-h)/2,fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f},setsar=1,fps={fps},format={pixel_format}[{base_ref}]",
-    ]
-    filters.append(f"[{base_ref}]null[v{label_index}]")
-    return filters
-
-
-def _audio_chain(label_index: int, input_index: int, item: Dict[str, object]) -> List[str]:
-    duration = float(item["duration"])
-    fade = min(0.20, max(0.10, duration * 0.09))
-    fade_out_start = max(0.0, duration - fade)
-
-    if item["kind"] == "title":
-        return [
-            f"[{input_index}:a]atrim=start=0:end={duration:.3f},asetpts=PTS-STARTPTS,aresample=48000[a{label_index}]"
-        ]
-
-    if bool(item.get("has_audio", False)):
-        start = float(item["start"])
-        end = float(item["end"])
-        return [
-            f"[{input_index}:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS,aresample=48000,highpass=f=55,lowpass=f=14000,afade=t=in:st=0:d={fade:.3f},afade=t=out:st={fade_out_start:.3f}:d={fade:.3f}[a{label_index}]"
-        ]
-
-    return [
-        f"anullsrc=r=48000:cl=stereo,atrim=duration={duration:.3f}[a{label_index}]"
-    ]
-
-
-def write_filter_script(
-    plan: TimelinePlan,
-    title_assets: Dict[str, Path],
-    script_path: Path,
-    frame_width: int = MASTER_FRAME[0],
-    frame_height: int = MASTER_FRAME[1],
-    pixel_format: str = "yuv422p10le",
-    draft: bool = False,
-) -> Tuple[List[str], str, str]:
-    inputs, mapping = _input_map(plan, title_assets)
-    script_lines: List[str] = []
-    concat_refs: List[str] = []
-    has_live_audio = any(
-        item.get("kind") != "title" and bool(item.get("has_audio", False))
-        for item in plan.items
+def source_cache_namespace(
+    config: dict[str, Any],
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+) -> str:
+    return stable_hash(
+        {
+            "version": SOURCE_RENDER_POLICY_VERSION,
+            "format": [width, height, fps, encoder, bitrate],
+            "audio_bitrate": str(config["render"].get("audio_bitrate", "192k")),
+            "font_signature": render_font_signature(config),
+        },
+        length=24,
     )
 
-    for index, item in enumerate(plan.items):
-        if item["kind"] == "title":
-            key = str(title_assets[str(index)].resolve())
+
+def report_outputs_exist(report: dict[str, Any]) -> bool:
+    outputs = report.get("outputs", [])
+    if not isinstance(outputs, list) or not outputs:
+        return False
+    required = ("path", "description", "chapters", "subtitles", "timeline")
+    return all(
+        isinstance(item, dict)
+        and all(isinstance(item.get(key), str) and Path(item[key]).exists() for key in required)
+        for item in outputs
+    )
+
+
+def render_project(
+    paths: ProjectPaths,
+    config: dict[str, Any],
+    *,
+    draft: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    if not paths.plan.exists():
+        raise VideoSummaryError("먼저 plan 또는 run을 실행하세요.")
+    candidates = load_candidates(paths, config)
+    clips = load_clips(paths, config)
+    candidates_payload = read_json(paths.candidates)
+    raw_plan = read_json(paths.plan)
+    validated = validate_and_normalize_plan(
+        raw_plan,
+        config,
+        str(raw_plan.get("prompt") or config["editing"].get("prompt", "")),
+        candidates,
+        str(candidates_payload["candidate_set_hash"]),
+        str(raw_plan.get("planner", "file")),
+    )
+    render_config = dict(config["render"])
+    width, height = resolution("720p" if draft else str(render_config["resolution"]))
+    fps = int(render_config.get("fps", 30))
+    bitrate = "4M" if draft else str(render_config.get("video_bitrate", "14M"))
+    encoder = resolve_encoder(str(render_config.get("encoder", "auto")))
+    mode = str(config["editing"].get("episode_mode", "daily"))
+    candidate_by_id = {item.candidate_id: item for item in candidates}
+    ordered_episodes = sorted(validated.episodes, key=lambda item: (item.travel_day, item.day_key))
+    trip_intro_signature: list[dict[str, str]] | None = None
+    if mode == "trip" and render_config.get("trip_intro_style") == "mosaic":
+        grid_size = configured_mosaic_grid_size(render_config)
+        selected_intro_frames = select_trip_intro_frames(
+            ordered_episodes,
+            candidate_by_id,
+            paths.root,
+            render_config.get("trip_intro_candidate_ids", []),
+            limit=grid_size * grid_size,
+        )
+        trip_intro_signature = [
+            {
+                "candidate_id": candidate.candidate_id,
+                "fingerprint": file_fingerprint(path),
+            }
+            for candidate, path in selected_intro_frames
+        ]
+    cache_key = render_cache_key(
+        validated, clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
+        version=RENDER_POLICY_VERSION,
+        font_signature=render_font_signature(config),
+        trip_intro_signature=trip_intro_signature,
+    )
+    legacy_cache_key = render_cache_key(
+        validated, clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
+        version=5,
+    )
+    report_path = paths.root / "render-report.json"
+    state = StateStore(paths.state)
+    if not force and report_path.exists() and state.is_complete("render", cache_key):
+        report = read_json(report_path)
+        if report.get("cache_key") == cache_key and report_outputs_exist(report):
+            print_status("render: 캐시 사용")
+            return report
+
+    state.mark_running("render", cache_key, {"encoder": encoder, "resolution": [width, height]})
+    try:
+        render_root = paths.render / cache_key
+        segments_dir = paths.render / "content" / "segments" / source_cache_namespace(
+            config, width, height, fps, encoder, bitrate
+        )
+        legacy_segments_dirs = legacy_segment_directories(paths.render, legacy_cache_key)
+        cards_dir = render_root / "cards"
+        overlays_dir = render_root / "overlays"
+        for directory in (segments_dir, cards_dir, overlays_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+        clip_by_id = {item.clip_id: item for item in clips}
+        outputs: list[dict[str, Any]] = []
+        trip_intro_report: dict[str, Any] | None = None
+        if mode == "daily":
+            for episode in ordered_episodes:
+                print_status(f"render DAY {episode.travel_day}: {episode.day_key}")
+                pieces = episode_pieces(
+                    episode,
+                    validated,
+                    candidate_by_id,
+                    clip_by_id,
+                    config,
+                    segments_dir,
+                    cards_dir,
+                    overlays_dir,
+                    width,
+                    height,
+                    fps,
+                    encoder,
+                    bitrate,
+                    draft,
+                    include_intro=True,
+                    include_outro=True,
+                    force=force,
+                    legacy_segments_dirs=legacy_segments_dirs,
+                )
+                filename = f"{episode.day_key}-day-{episode.travel_day:02d}{'-draft' if draft else ''}.mp4"
+                outputs.append(
+                    assemble_output(
+                        pieces,
+                        paths.exports / filename,
+                        episode,
+                        paths,
+                        config,
+                        render_root / f"assembly-day-{episode.travel_day:02d}",
+                        width,
+                        height,
+                        draft,
+                    )
+                )
         else:
-            key = str(Path(str(item["clip_path"])).resolve())
-        input_index = mapping[key]
-        script_lines.extend(
-            _video_chain(
-                index,
-                input_index,
-                item,
-                plan.fps,
-                frame_width=frame_width,
-                frame_height=frame_height,
-                pixel_format=pixel_format,
-                draft=draft,
+            trip_intro, trip_intro_report = render_trip_intro_piece(
+                ordered_episodes,
+                candidate_by_id,
+                paths.root,
+                cards_dir,
+                validated.project,
+                trip_date_range(ordered_episodes),
+                float(render_config.get("intro_seconds", 4.0)),
+                width,
+                height,
+                fps,
+                encoder,
+                bitrate,
+                config,
+                force,
+            )
+            pieces = [trip_intro]
+            for episode in ordered_episodes:
+                pieces.extend(
+                    episode_pieces(
+                        episode,
+                        validated,
+                        candidate_by_id,
+                        clip_by_id,
+                        config,
+                        segments_dir,
+                        cards_dir,
+                        overlays_dir,
+                        width,
+                        height,
+                        fps,
+                        encoder,
+                        bitrate,
+                        draft,
+                        include_intro=False,
+                        include_outro=False,
+                        force=force,
+                        legacy_segments_dirs=legacy_segments_dirs,
+                    )
+                )
+            pieces.append(
+                render_card_piece(
+                    cards_dir,
+                    "trip-outro",
+                    str(render_config.get("outro_text", "여행은 계속됩니다")),
+                    validated.project,
+                    float(render_config.get("outro_seconds", 5.0)),
+                    width,
+                    height,
+                    fps,
+                    encoder,
+                    bitrate,
+                    config,
+                    force,
+                )
+            )
+            summary_episode = Episode(
+                day_key=ordered_episodes[0].day_key,
+                travel_day=1,
+                title=validated.project,
+                subtitle=trip_date_range(ordered_episodes),
+                summary=f"{trip_date_range(ordered_episodes)} 동안의 여정과 재미있는 순간을 날짜 순서대로 담았습니다.",
+                target_duration=sum(episode.target_duration for episode in ordered_episodes),
+                segments=[],
+            )
+            outputs.append(
+                assemble_output(
+                    pieces,
+                    paths.exports / f"trip-summary{'-draft' if draft else ''}.mp4",
+                    summary_episode,
+                    paths,
+                    config,
+                    render_root / "assembly-trip",
+                    width,
+                    height,
+                    draft,
+                )
+            )
+        report = {
+            "version": 2,
+            "cache_key": cache_key,
+            "project": validated.project,
+            "planner": validated.planner,
+            "encoder": encoder,
+            "resolution": [width, height],
+            "fps": fps,
+            "mode": mode,
+            "draft": draft,
+            "outputs": outputs,
+        }
+        if trip_intro_report is not None:
+            report["trip_intro"] = trip_intro_report
+        write_json(report_path, report)
+        state.mark_complete("render", cache_key, {"output_count": len(outputs), "encoder": encoder})
+        return report
+    except BaseException as exc:
+        state.mark_failed("render", cache_key, str(exc))
+        raise
+
+
+def resolve_encoder(requested: str) -> str:
+    completed = run_command(["ffmpeg", "-hide_banner", "-encoders"])
+    available = completed.stdout + completed.stderr
+    if requested == "auto":
+        return "h264_videotoolbox" if "h264_videotoolbox" in available else "libx264"
+    if requested not in {"h264_videotoolbox", "libx264"}:
+        raise VideoSummaryError("encoder는 auto, h264_videotoolbox, libx264 중 하나여야 합니다.")
+    if requested not in available:
+        raise VideoSummaryError(f"현재 FFmpeg가 {requested} encoder를 지원하지 않습니다.")
+    return requested
+
+
+def episode_pieces(
+    episode: Episode,
+    plan: EditPlan,
+    candidate_by_id: dict[str, Candidate],
+    clip_by_id: dict[str, Clip],
+    config: dict[str, Any],
+    segments_dir: Path,
+    cards_dir: Path,
+    overlays_dir: Path,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+    draft: bool,
+    *,
+    include_intro: bool,
+    include_outro: bool,
+    force: bool,
+    legacy_segments_dirs: tuple[Path, ...] = (),
+) -> list[Piece]:
+    pieces: list[Piece] = []
+    render_config = config["render"]
+    segments = sorted(
+        episode.segments,
+        key=lambda segment: source_segment_sort_key(segment, candidate_by_id),
+    )
+    if include_intro:
+        pieces.append(
+            render_card_piece(
+                cards_dir, f"intro-day-{episode.travel_day}", plan.project, episode.title,
+                float(render_config.get("intro_seconds", 4.0)), width, height, fps, encoder, bitrate, config, force,
             )
         )
-        script_lines.extend(_audio_chain(index, input_index, item))
-        concat_refs.append(f"[v{index}][a{index}]")
-
-    script_lines.append(
-        "".join(concat_refs) + f"concat=n={len(plan.items)}:v=1:a=1[vcat][acat]"
+    date_piece = render_card_piece(
+        cards_dir, f"date-day-{episode.travel_day}", episode.title, episode.subtitle,
+        float(render_config.get("date_card_seconds", 3.0)), width, height, fps, encoder, bitrate, config, force,
     )
-    if has_live_audio:
-        script_lines.append("[acat]loudnorm=I=-14:TP=-1:LRA=11,aresample=48000[aout]")
+    date_piece.day_chapter = day_chapter_label(episode)
+    pieces.append(date_piece)
+    groups = coalesce_source_selections(segments, candidate_by_id)
+    last_location: str | None = None
+    for group_index, group in enumerate(groups):
+        first = group[0]
+        segment = first.segment
+        candidate = first.candidate
+        location = effective_source_location(segment, candidate)
+        show_location = location if location and location != last_location else None
+        if location:
+            last_location = location
+        member_labels = [
+            show_location if member_index == 0 and show_location else member.segment.role
+            for member_index, member in enumerate(group)
+        ]
+        pieces.append(
+            render_source_piece(
+                segment, candidate, clip_by_id[candidate.clip_id], segments_dir, overlays_dir,
+                width, height, fps, encoder, bitrate, config, location_overlay=show_location, force=force,
+                fade_in=group_index == 0, fade_out=group_index == len(groups) - 1,
+                coalesced_selections=tuple(group), member_labels=tuple(member_labels),
+                legacy_segments_dirs=legacy_segments_dirs,
+            )
+        )
+    if include_outro:
+        pieces.append(
+            render_card_piece(
+                cards_dir, f"outro-day-{episode.travel_day}", str(render_config.get("outro_text", "여행은 계속됩니다")),
+                episode.title, float(render_config.get("outro_seconds", 5.0)), width, height, fps, encoder, bitrate, config, force,
+            )
+        )
+    return pieces
+
+
+def source_segment_sort_key(
+    segment: PlanSegment,
+    candidate_by_id: dict[str, Candidate],
+) -> tuple[float, float, str]:
+    candidate = candidate_by_id[segment.candidate_id]
+    try:
+        captured_at = datetime.fromisoformat(candidate.captured_at.replace("Z", "+00:00"))
+    except ValueError:
+        return (float("inf"), candidate.start, candidate.candidate_id)
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    return (captured_at.astimezone(timezone.utc).timestamp(), candidate.start, candidate.candidate_id)
+
+
+def normalized_optional_text(value: str | None) -> str | None:
+    normalized = " ".join((value or "").split())
+    return normalized or None
+
+
+def effective_source_location(segment: PlanSegment, candidate: Candidate) -> str | None:
+    return normalized_optional_text(segment.location or candidate.location)
+
+
+def source_selections_are_contiguous(
+    previous: SourceSelection,
+    current: SourceSelection,
+    *,
+    tolerance: float = 0.001,
+) -> bool:
+    gap = current.candidate.start - previous.candidate.end
+    return (
+        previous.candidate.clip_id == current.candidate.clip_id
+        and -tolerance - 1e-9 <= gap <= tolerance + 1e-9
+        and previous.segment.speed == current.segment.speed
+        and effective_source_location(previous.segment, previous.candidate)
+        == effective_source_location(current.segment, current.candidate)
+        and normalized_optional_text(previous.segment.caption)
+        == normalized_optional_text(current.segment.caption)
+    )
+
+
+def coalesce_source_selections(
+    segments: list[PlanSegment],
+    candidate_by_id: dict[str, Candidate],
+) -> list[list[SourceSelection]]:
+    groups: list[list[SourceSelection]] = []
+    for segment in segments:
+        selection = SourceSelection(candidate_by_id[segment.candidate_id], segment)
+        if groups and source_selections_are_contiguous(groups[-1][-1], selection):
+            groups[-1].append(selection)
+        else:
+            groups.append([selection])
+    return groups
+
+
+def day_chapter_label(episode: Episode) -> str:
+    title = " ".join(episode.title.split())
+    prefix = f"DAY {episode.travel_day}"
+    detail = title
+    if title.casefold().startswith(prefix.casefold()):
+        detail = title[len(prefix):].lstrip(" ·-")
+    if detail and detail != "여행의 하루":
+        return f"{prefix} · {episode.day_key} · {detail}"
+    return f"{prefix} · {episode.day_key}"
+
+
+def legacy_segment_directories(render_root: Path, preferred_key: str) -> tuple[Path, ...]:
+    # v3 segment names did not include the audio bitrate or a font fingerprint.
+    # Only the exact v5 render root proves the rest of render_config matched.
+    return (render_root / preferred_key / "segments",)
+
+
+def resolution(value: str) -> tuple[int, int]:
+    return {"720p": (1280, 720), "1080p": (1920, 1080), "2160p": (3840, 2160)}[value]
+
+
+def configured_mosaic_grid_size(render_config: dict[str, Any]) -> int:
+    return int(render_config.get("trip_intro_grid_size", MOSAIC_COLUMNS))
+
+
+def trip_date_range(episodes: list[Episode]) -> str:
+    if not episodes:
+        return ""
+    if len(episodes) == 1:
+        return episodes[0].day_key
+    return f"{episodes[0].day_key} — {episodes[-1].day_key}"
+
+
+def render_trip_intro_piece(
+    episodes: list[Episode],
+    candidate_by_id: dict[str, Candidate],
+    project_root: Path,
+    cards_dir: Path,
+    title: str,
+    subtitle: str,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+    config: dict[str, Any],
+    force: bool,
+) -> tuple[Piece, dict[str, Any]]:
+    requested_style = str(config["render"].get("trip_intro_style", "mosaic"))
+    selected: list[tuple[Candidate, Path]] = []
+    if requested_style == "mosaic":
+        grid_size = configured_mosaic_grid_size(config["render"])
+        selected = select_trip_intro_frames(
+            episodes,
+            candidate_by_id,
+            project_root,
+            config["render"].get("trip_intro_candidate_ids", []),
+            limit=grid_size * grid_size,
+        )
+    if selected:
+        try:
+            mosaic_title = " ".join(title.replace("-", " ").split()).upper()
+            piece = render_mosaic_card_piece(
+                cards_dir,
+                "trip-intro-mosaic",
+                mosaic_title,
+                subtitle,
+                duration,
+                selected,
+                width,
+                height,
+                fps,
+                encoder,
+                bitrate,
+                config,
+                force,
+            )
+            animation = str(config["render"].get("trip_intro_animation", "flow"))
+            return piece, {
+                "requested_style": requested_style,
+                "effective_style": "mosaic",
+                "grid": [grid_size, grid_size],
+                "frame_count": len(selected),
+                "tile_count": len(selected),
+                "video_frame_count": int(round(piece.duration * fps)),
+                "requested_duration": duration,
+                "rendered_duration": piece.duration,
+                "motion": animation,
+                "flow_order": "chronological_serpentine" if animation == "flow" else "chronological_row_major",
+                "candidate_ids": [candidate.candidate_id for candidate, _path in selected],
+                "frames_per_day": mosaic_frames_per_day(selected),
+            }
+        except (OSError, ValueError, VideoSummaryError) as exc:
+            print_status(f"trip intro: 모자이크 생성 실패, 제목 카드 사용 ({exc})")
+            fallback_reason = str(exc)
+    elif requested_style == "mosaic":
+        print_status("trip intro: 사용할 대표 프레임이 없어 제목 카드 사용")
+        fallback_reason = "usable representative frame not found"
     else:
-        script_lines.append("[acat]aresample=48000[aout]")
-    script_path.write_text(";\n".join(script_lines) + ";\n", encoding="utf-8")
-    return inputs, "[vcat]", "[aout]"
+        fallback_reason = None
+
+    piece = render_card_piece(
+        cards_dir,
+        "trip-intro",
+        title,
+        subtitle,
+        duration,
+        width,
+        height,
+        fps,
+        encoder,
+        bitrate,
+        config,
+        force,
+    )
+    report: dict[str, Any] = {
+        "requested_style": requested_style,
+        "effective_style": "card",
+        "grid": [configured_mosaic_grid_size(config["render"])] * 2,
+        "frame_count": 0,
+        "tile_count": 0,
+        "video_frame_count": int(round(piece.duration * fps)),
+        "requested_duration": duration,
+        "rendered_duration": piece.duration,
+        "motion": "static",
+        "candidate_ids": [],
+        "frames_per_day": {},
+    }
+    if fallback_reason:
+        report["fallback_reason"] = fallback_reason
+    return piece, report
 
 
-def render_master(plan: TimelinePlan, asset_dir: Path, build_dir: Path, output_path: Path) -> None:
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    build_dir.mkdir(parents=True, exist_ok=True)
-    title_assets = ensure_title_assets(plan, asset_dir)
-    filter_script = build_dir / f"{output_path.stem}_filtergraph.ffscript"
-    inputs, video_label, audio_label = write_filter_script(plan, title_assets, filter_script)
+def mosaic_frames_per_day(selected: list[tuple[Candidate, Path]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for candidate, _path in selected:
+        key = str(candidate.travel_day)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
-    command: List[str] = ["ffmpeg", "-y"]
-    for input_path in inputs:
-        command.extend(["-i", input_path])
-    command.extend(
-        [
-            "-filter_complex_script",
-            str(filter_script),
-            "-map",
-            video_label,
-            "-map",
-            audio_label,
-            "-c:v",
-            "prores_ks",
-            "-profile:v",
-            "3",
-            "-pix_fmt",
-            "yuv422p10le",
-            "-c:a",
-            "pcm_s24le",
-            str(output_path),
+
+def select_trip_intro_frames(
+    episodes: list[Episode],
+    candidate_by_id: dict[str, Candidate],
+    project_root: Path,
+    configured_ids: Any = None,
+    *,
+    limit: int = MOSAIC_CAPACITY,
+) -> list[tuple[Candidate, Path]]:
+    if limit <= 0:
+        return []
+    ordered_episodes = sorted(episodes, key=lambda item: (item.travel_day, item.day_key))
+    configured = [value.strip() for value in configured_ids if isinstance(value, str)] if isinstance(configured_ids, list) else []
+    configured_rank = {value: index for index, value in enumerate(configured) if isinstance(value, str)}
+    ranked_by_episode: list[list[Candidate]] = []
+    candidate_plan_order: dict[str, tuple[int, int]] = {}
+    for episode_index, episode in enumerate(ordered_episodes):
+        episode_candidates: list[Candidate] = []
+        seen: set[str] = set()
+        for segment_index, segment in enumerate(episode.segments):
+            candidate = candidate_by_id.get(segment.candidate_id)
+            if (
+                candidate is None
+                or candidate.candidate_id in seen
+                or candidate.travel_day != episode.travel_day
+                or candidate.day_key != episode.day_key
+            ):
+                continue
+            seen.add(candidate.candidate_id)
+            episode_candidates.append(candidate)
+            candidate_plan_order.setdefault(candidate.candidate_id, (episode_index, segment_index))
+        ranked = sorted(episode_candidates, key=lambda candidate: mosaic_candidate_sort_key(candidate, configured_rank))
+        ranked_by_episode.append(ranked)
+
+    frame_cache: dict[str, Path | None] = {}
+
+    def frame_for(candidate: Candidate) -> Path | None:
+        if candidate.candidate_id not in frame_cache:
+            frame_cache[candidate.candidate_id] = usable_candidate_frame(project_root, candidate)
+        return frame_cache[candidate.candidate_id]
+
+    coverage_by_episode: dict[int, tuple[Candidate, Path]] = {}
+    for episode_index, ranked in enumerate(ranked_by_episode):
+        for candidate in ranked:
+            frame = frame_for(candidate)
+            if frame is not None:
+                coverage_by_episode[episode_index] = (candidate, frame)
+                break
+
+    usable_episode_indices = list(coverage_by_episode)
+    if len(usable_episode_indices) > limit:
+        selected_episode_indices = [
+            usable_episode_indices[position]
+            for position in evenly_spaced_indices(len(usable_episode_indices), limit)
         ]
+    else:
+        selected_episode_indices = usable_episode_indices
+
+    selected: list[tuple[Candidate, Path]] = []
+    selected_ids: set[str] = set()
+    selected_clip_ids: set[str] = set()
+
+    def add_candidate(candidate: Candidate) -> bool:
+        if candidate.candidate_id in selected_ids or len(selected) >= limit:
+            return False
+        frame = frame_for(candidate)
+        if frame is None:
+            return False
+        selected_ids.add(candidate.candidate_id)
+        selected_clip_ids.add(candidate.clip_id)
+        selected.append((candidate, frame))
+        return True
+
+    def next_from_episode(episode_index: int, *, unseen_clip_only: bool) -> Candidate | None:
+        for candidate in ranked_by_episode[episode_index]:
+            if (
+                candidate.candidate_id not in selected_ids
+                and (not unseen_clip_only or candidate.clip_id not in selected_clip_ids)
+                and frame_for(candidate) is not None
+            ):
+                return candidate
+        return None
+
+    # First guarantee broad coverage: one usable frame from every sampled DAY.
+    for episode_index in selected_episode_indices:
+        candidate, _frame = coverage_by_episode[episode_index]
+        add_candidate(candidate)
+
+    # Fill remaining cells in balanced DAY rounds. Prefer a new source clip for
+    # every tile so the overview shows more of the trip; repeat a clip only when
+    # there are not enough distinct plan-selected clips to fill the grid.
+    def fill_rounds(*, unseen_clip_only: bool) -> None:
+        while len(selected) < limit:
+            next_by_episode = {
+                index: candidate
+                for index in selected_episode_indices
+                if (candidate := next_from_episode(index, unseen_clip_only=unseen_clip_only)) is not None
+            }
+            available_indices = list(next_by_episode)
+            if not next_by_episode:
+                break
+            remaining = limit - len(selected)
+            if remaining >= len(available_indices):
+                round_indices = available_indices
+            else:
+                reviewed_indices = sorted(
+                    (
+                        index
+                        for index in available_indices
+                        if next_by_episode[index].candidate_id in configured_rank
+                    ),
+                    key=lambda index: configured_rank[next_by_episode[index].candidate_id],
+                )
+                round_indices = reviewed_indices[:remaining]
+                slots = remaining - len(round_indices)
+                if slots:
+                    reviewed_set = set(round_indices)
+                    automatic_indices = [index for index in available_indices if index not in reviewed_set]
+                    positions = evenly_spaced_indices(len(automatic_indices), slots)
+                    round_indices.extend(automatic_indices[position] for position in positions)
+                round_indices.sort()
+            added = sum(1 for episode_index in round_indices if add_candidate(next_by_episode[episode_index]))
+            if added == 0:
+                break
+
+    fill_rounds(unseen_clip_only=True)
+    fill_rounds(unseen_clip_only=False)
+
+    return sorted(
+        selected,
+        key=lambda item: (
+            candidate_plan_order.get(item[0].candidate_id, (len(ordered_episodes), 0)),
+            item[0].candidate_id,
+        ),
     )
-    _run(command)
 
 
-def render_draft(plan: TimelinePlan, asset_dir: Path, build_dir: Path, output_path: Path) -> None:
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    build_dir.mkdir(parents=True, exist_ok=True)
-    title_assets = ensure_title_assets(
-        plan,
-        asset_dir,
-        frame_width=DRAFT_FRAME[0],
-        frame_height=DRAFT_FRAME[1],
-        preset="veryfast",
-        crf=18,
-    )
-    filter_script = build_dir / f"{output_path.stem}_filtergraph.ffscript"
-    inputs, video_label, audio_label = write_filter_script(
-        plan,
-        title_assets,
-        filter_script,
-        frame_width=DRAFT_FRAME[0],
-        frame_height=DRAFT_FRAME[1],
-        pixel_format="yuv420p",
-        draft=True,
+def mosaic_candidate_sort_key(
+    candidate: Candidate,
+    configured_rank: dict[str, int],
+) -> tuple[int, int, float, float, float, str]:
+    return (
+        0 if candidate.candidate_id in configured_rank else 1,
+        configured_rank.get(candidate.candidate_id, len(configured_rank)),
+        -candidate.visual_quality,
+        -candidate.score,
+        candidate_capture_timestamp(candidate),
+        candidate.candidate_id,
     )
 
-    command: List[str] = ["ffmpeg", "-y"]
-    for input_path in inputs:
-        command.extend(["-i", input_path])
-    command.extend(
-        [
-            "-filter_complex_script",
-            str(filter_script),
-            "-map",
-            video_label,
-            "-map",
-            audio_label,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            str(output_path),
-        ]
-    )
-    _run(command)
+
+def evenly_spaced_indices(count: int, take: int) -> list[int]:
+    if count <= 0 or take <= 0:
+        return []
+    if take >= count:
+        return list(range(count))
+    if take == 1:
+        return [count // 2]
+    return [index * (count - 1) // (take - 1) for index in range(take)]
 
 
-def render_delivery_base(plan: TimelinePlan, asset_dir: Path, build_dir: Path, output_path: Path) -> None:
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    build_dir.mkdir(parents=True, exist_ok=True)
-    title_assets = ensure_title_assets(plan, asset_dir)
-    filter_script = build_dir / f"{output_path.stem}_filtergraph.ffscript"
-    inputs, video_label, audio_label = write_filter_script(plan, title_assets, filter_script)
-
-    command: List[str] = ["ffmpeg", "-y"]
-    for input_path in inputs:
-        command.extend(["-i", input_path])
-    command.extend(
-        [
-            "-filter_complex_script",
-            str(filter_script),
-            "-map",
-            video_label,
-            "-map",
-            audio_label,
-            "-c:v",
-            "h264_videotoolbox",
-            "-b:v",
-            "40M",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "320k",
-            str(output_path),
-        ]
-    )
-    _run(command)
+def candidate_capture_timestamp(candidate: Candidate) -> float:
+    try:
+        captured_at = datetime.fromisoformat(candidate.captured_at.replace("Z", "+00:00"))
+    except ValueError:
+        return float("inf")
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    return captured_at.astimezone(timezone.utc).timestamp()
 
 
-def grade_delivery_variant(source_path: Path, output_path: Path, video_filter: str) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source_path),
-        "-vf",
-        video_filter,
-        "-c:v",
-        "h264_videotoolbox",
-        "-b:v",
-        "35M",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-c:a",
-        "copy",
-        str(output_path),
+def usable_candidate_frame(project_root: Path, candidate: Candidate) -> Path | None:
+    if not candidate.frame_path:
+        return None
+    root = project_root.resolve()
+    try:
+        frame = (root / candidate.frame_path).resolve()
+        frame.relative_to(root)
+        if not frame.is_file():
+            return None
+        with Image.open(frame) as source:
+            oriented = ImageOps.exif_transpose(source)
+            try:
+                with oriented.convert("RGB") as decoded:
+                    decoded.load()
+            finally:
+                if oriented is not source:
+                    oriented.close()
+        return frame
+    except (OSError, ValueError):
+        return None
+
+
+def render_mosaic_card_piece(
+    cards_dir: Path,
+    card_id: str,
+    title: str,
+    subtitle: str,
+    duration: float,
+    selected_frames: list[tuple[Candidate, Path]],
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+    config: dict[str, Any],
+    force: bool,
+) -> Piece:
+    grid_size = configured_mosaic_grid_size(config["render"])
+    animation = str(config["render"].get("trip_intro_animation", "flow"))
+    frame_records = [
+        {
+            "candidate_id": candidate.candidate_id,
+            "path": str(path),
+            "fingerprint": file_fingerprint(path),
+        }
+        for candidate, path in selected_frames
     ]
-    _run(command)
+    key = stable_hash(
+        {
+            "version": MOSAIC_CARD_POLICY_VERSION,
+            "id": card_id,
+            "title": title,
+            "subtitle": subtitle,
+            "duration": duration,
+            "grid": [grid_size, grid_size],
+            "animation": animation,
+            "animation_policy": ANIMATED_MOSAIC_POLICY_VERSION if animation == "flow" else None,
+            "frames": frame_records,
+            "format": [width, height, fps, encoder, bitrate],
+            "audio_bitrate": str(config["render"].get("audio_bitrate", "192k")),
+            "font_signature": render_font_signature(config),
+        },
+        length=28,
+    )
+    png = cards_dir / f"{key}.png"
+    output = cards_dir / f"{key}.mp4"
+    if animation == "flow":
+        result = render_animated_mosaic(
+            output,
+            [path for _candidate, path in selected_frames],
+            title,
+            subtitle,
+            duration,
+            width,
+            height,
+            fps,
+            encoder,
+            bitrate,
+            str(config["render"].get("audio_bitrate", "192k")),
+            grid_size=grid_size,
+            animation_style=animation,
+            font_file=str(config["render"].get("font_file", "")),
+            force=force,
+        )
+        return Piece(output, result.duration, title)
+    if not force and cached_piece_is_usable(output, width, height):
+        return Piece(output, duration, title)
+    create_mosaic_card(
+        png,
+        [path for _candidate, path in selected_frames],
+        title,
+        subtitle,
+        width,
+        height,
+        config,
+        columns=grid_size,
+        rows=grid_size,
+    )
+    render_still_image_piece(
+        png,
+        output,
+        card_id,
+        duration,
+        width,
+        height,
+        fps,
+        encoder,
+        bitrate,
+        config,
+    )
+    return Piece(output, duration, title)
 
 
-def render_delivery_chunked(
-    plan: TimelinePlan,
-    asset_dir: Path,
-    build_dir: Path,
-    chunk_dir: Path,
-    base_output_path: Path,
-    final_output_path: Path,
-    video_filter: str,
-) -> Dict[str, List[str]]:
-    chunk_dir.mkdir(parents=True, exist_ok=True)
-    build_dir.mkdir(parents=True, exist_ok=True)
-    chunks = split_plan_into_chunks(plan)
-    if not chunks:
-        raise ValueError("Timeline plan is empty; nothing to render.")
+def render_source_piece(
+    segment: PlanSegment,
+    candidate: Candidate,
+    clip: Clip,
+    segments_dir: Path,
+    overlays_dir: Path,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+    config: dict[str, Any],
+    *,
+    location_overlay: str | None,
+    fade_in: bool,
+    fade_out: bool,
+    force: bool,
+    coalesced_selections: tuple[SourceSelection, ...] = (),
+    member_labels: tuple[str, ...] = (),
+    legacy_segments_dirs: tuple[Path, ...] = (),
+) -> Piece:
+    selections = coalesced_selections or (SourceSelection(candidate, segment),)
+    if (
+        selections[0].candidate.candidate_id != candidate.candidate_id
+        or selections[0].segment != segment
+        or any(selection.candidate.clip_id != clip.clip_id for selection in selections)
+        or any(
+            not source_selections_are_contiguous(previous, current)
+            for previous, current in zip(selections, selections[1:])
+        )
+    ):
+        raise VideoSummaryError("서로 호환되지 않는 원본 구간은 하나의 렌더 조각으로 합칠 수 없습니다.")
+    if member_labels and len(member_labels) != len(selections):
+        raise VideoSummaryError("합친 원본 구간의 타임라인 레이블 수가 일치하지 않습니다.")
+    source_start = selections[0].candidate.start
+    source_end = max(selection.candidate.end for selection in selections)
+    frame_count, output_duration = source_output_timing((source_end - source_start) / segment.speed, fps)
+    labels = member_labels or tuple(
+        location_overlay if index == 0 and location_overlay else selection.segment.role
+        for index, selection in enumerate(selections)
+    )
+    source_members = tuple(
+        SourceMember(
+            selection.candidate,
+            selection.segment,
+            (selection.candidate.start - source_start) / segment.speed,
+            labels[index],
+        )
+        for index, selection in enumerate(selections)
+    )
+    transition = source_transition_seconds(config, output_duration)
+    transition_in = transition if fade_in else 0.0
+    transition_out = transition if fade_out else 0.0
+    key = stable_hash(
+        {
+            "version": SOURCE_RENDER_POLICY_VERSION,
+            "clip": clip.fingerprint,
+            "source": [source_start, source_end, clip.has_audio],
+            "members": [
+                [member.candidate.candidate_id, member.candidate.start, member.candidate.end]
+                for member in source_members
+            ],
+            "speed": segment.speed,
+            "transitions": [transition_in, transition_out],
+            "location_overlay": location_overlay,
+            "format": [width, height, fps, encoder, bitrate],
+        },
+        length=28,
+    )
+    output = segments_dir / f"{key}.mp4"
+    if not force and cached_piece_is_usable(
+        output,
+        width,
+        height,
+        expected_frame_count=frame_count,
+        expected_duration=output_duration,
+        expected_fps=fps,
+    ):
+        return Piece(
+            output,
+            output_duration,
+            source_members[0].label,
+            candidate,
+            segment,
+            source_members=source_members,
+        )
+    # Earlier source artifacts can be one frame short and have no transition or
+    # contiguous-range contract, so policy v6 intentionally does not import them.
 
-    base_chunks: List[Path] = []
-    final_chunks: List[Path] = []
-    total_chunks = len(chunks)
+    args = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "2",
+        "-ss", f"{source_start:.3f}", "-i", clip.path,
+    ]
+    overlay_input: int | None = None
+    if location_overlay:
+        overlay = overlays_dir / f"location-{stable_hash([location_overlay, width, height], 18)}.png"
+        if force or not overlay.exists():
+            create_lower_third(overlay, location_overlay, width, height, config)
+        args.extend(["-loop", "1", "-framerate", str(fps), "-i", str(overlay)])
+        overlay_input = 1
+    silence_input: int | None = None
+    if not clip.has_audio:
+        silence_input = 2 if overlay_input is not None else 1
+        args.extend(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
 
-    for index, chunk in enumerate(chunks, start=1):
-        label = str(chunk["label"])
-        slug = str(chunk["slug"])
-        chunk_plan = chunk["plan"]
-        chunk_prefix = f"{index:03d}_{slug}"
-        chunk_asset_dir = asset_dir / "chunks" / chunk_prefix
-        chunk_build_dir = build_dir / "chunks" / chunk_prefix
-        base_chunk_path = chunk_dir / f"{chunk_prefix}_base_4k.mp4"
-        final_chunk_path = chunk_dir / f"{chunk_prefix}_final_4k.mp4"
+    video_pad = max(0.1, 3.0 / fps)
+    filters = [
+        f"[0:v:0]setpts=(PTS-STARTPTS)/{segment.speed:.6f},"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x101318,"
+        f"fps=fps={fps}:start_time=0:round=near,tpad=stop_mode=clone:stop_duration={video_pad:.6f},"
+        f"trim=end_frame={frame_count},setpts=N/({fps}*TB),format=yuv420p[vbase]"
+    ]
+    if overlay_input is not None:
+        filters.append(
+            f"[{overlay_input}:v:0]format=rgba[overlay];"
+            "[vbase][overlay]overlay=0:0:enable='between(t,0,2.8)':eof_action=pass[vcontent]"
+        )
+    else:
+        filters.append("[vbase]null[vcontent]")
+    video_transition_filters: list[str] = []
+    if transition_in > 0:
+        video_transition_filters.append(f"fade=t=in:st=0:d={transition_in:.6f}:color=black")
+    if transition_out > 0:
+        video_fade_out_start = max(0.0, (frame_count - 1) / fps - transition_out)
+        video_transition_filters.append(
+            f"fade=t=out:st={video_fade_out_start:.6f}:d={transition_out:.6f}:color=black"
+        )
+    if video_transition_filters:
+        filters.append(f"[vcontent]{','.join(video_transition_filters)}[vout]")
+    else:
+        filters.append("[vcontent]null[vout]")
+    audio_transition_parts: list[str] = []
+    if transition_in > 0:
+        audio_transition_parts.append(f"afade=t=in:st=0:d={transition_in:.6f}")
+    if transition_out > 0:
+        audio_transition_parts.append(
+            f"afade=t=out:st={output_duration - transition_out:.6f}:d={transition_out:.6f}"
+        )
+    audio_transition = "," + ",".join(audio_transition_parts) if audio_transition_parts else ""
+    if clip.has_audio:
+        filters.append(
+            f"[0:a:0]asetpts=PTS-STARTPTS,aresample=48000,"
+            f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"atempo={segment.speed:.6f},loudnorm=I=-16:LRA=11:TP=-1.5,"
+            f"apad=whole_dur={output_duration:.6f},atrim=duration={output_duration:.6f}"
+            f"{audio_transition},asetpts=PTS-STARTPTS[aout]"
+        )
+    else:
+        assert silence_input is not None
+        filters.append(
+            f"[{silence_input}:a:0]atrim=duration={output_duration:.6f},"
+            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+            f"{audio_transition},asetpts=PTS-STARTPTS[aout]"
+        )
+    temporary = output.with_name(f".{output.stem}.partial.mp4")
+    args.extend(
+        [
+            "-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "[aout]",
+            "-frames:v", str(frame_count), "-t", f"{output_duration:.6f}", *video_encode_args(encoder, bitrate),
+            "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
+            "-ar", "48000", "-ac", "2", "-video_track_timescale", "90000",
+            "-map_metadata", "-1", "-map_chapters", "-1",
+            "-movflags", "+faststart", "-y", str(temporary),
+        ]
+    )
+    run_command(args)
+    os.replace(temporary, output)
+    if not cached_piece_is_usable(
+        output,
+        width,
+        height,
+        expected_frame_count=frame_count,
+        expected_duration=output_duration,
+        expected_fps=fps,
+    ):
+        output.unlink(missing_ok=True)
+        candidate_ids = ", ".join(member.candidate.candidate_id for member in source_members)
+        raise VideoSummaryError(f"렌더 조각의 프레임 수나 길이가 예상과 다릅니다: {candidate_ids}")
+    return Piece(
+        output,
+        output_duration,
+        source_members[0].label,
+        candidate,
+        segment,
+        source_members=source_members,
+    )
 
-        _log_step(f"[{index}/{total_chunks}] render base chunk: {label}")
-        render_delivery_base(chunk_plan, chunk_asset_dir, chunk_build_dir, base_chunk_path)
-        base_chunks.append(base_chunk_path)
 
-        _log_step(f"[{index}/{total_chunks}] grade final chunk: {label}")
-        grade_delivery_variant(base_chunk_path, final_chunk_path, video_filter)
-        final_chunks.append(final_chunk_path)
+def source_output_timing(duration: float, fps: int) -> tuple[int, float]:
+    frame_count = max(1, int(math.floor(max(0.0, duration) * fps + 0.5)))
+    return frame_count, frame_count / fps
 
-    _log_step(f"concat base chunks -> {base_output_path.name}")
-    concat_copy_videos(base_chunks, base_output_path, build_dir / "concat")
-    _log_step(f"concat final chunks -> {final_output_path.name}")
-    concat_copy_videos(final_chunks, final_output_path, build_dir / "concat")
 
+def source_transition_seconds(config: dict[str, Any], output_duration: float) -> float:
+    requested = max(0.0, float(config["render"].get("transition_seconds", 0.18)))
+    return min(requested, max(0.0, output_duration) / 3.0)
+
+
+def positive_number(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0.0 else None
+
+
+def positive_ratio(value: Any) -> float | None:
+    raw = str(value or "").strip()
+    if not raw or raw == "N/A":
+        return None
+    numerator, separator, denominator = raw.partition("/")
+    try:
+        parsed = float(numerator) / float(denominator) if separator else float(numerator)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0.0 else None
+
+
+def stream_frame_rate(stream: dict[str, Any]) -> float | None:
+    for key in ("r_frame_rate", "avg_frame_rate"):
+        if (rate := positive_ratio(stream.get(key))) is not None:
+            return rate
+    return None
+
+
+def stream_duration(stream: dict[str, Any], *, frame_rate: float | None = None) -> float | None:
+    if (duration := positive_number(stream.get("duration"))) is not None:
+        return duration
+    duration_ts = positive_number(stream.get("duration_ts"))
+    time_base = positive_ratio(stream.get("time_base"))
+    if duration_ts is not None and time_base is not None:
+        return duration_ts * time_base
+    if stream.get("codec_type") == "video":
+        frames = positive_number(stream.get("nb_frames"))
+        rate = frame_rate or stream_frame_rate(stream)
+        if frames is not None and rate is not None:
+            return frames / rate
+    return None
+
+
+def audio_tail_tolerance(audio: dict[str, Any], frame_duration: float) -> float:
+    sample_rate = positive_number(audio.get("sample_rate")) or DEFAULT_AUDIO_SAMPLE_RATE
+    return AAC_FRAME_SAMPLES / sample_rate + frame_duration
+
+
+def cached_piece_is_usable(
+    path: Path,
+    width: int,
+    height: int,
+    *,
+    expected_frame_count: int | None = None,
+    expected_duration: float | None = None,
+    expected_fps: int | None = None,
+) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size <= 1024:
+            return False
+        probe = probe_media(path)
+        video = next((item for item in probe.get("streams", []) if item.get("codec_type") == "video"), None)
+        audio = next((item for item in probe.get("streams", []) if item.get("codec_type") == "audio"), None)
+        if (
+            not video
+            or not audio
+            or int(video.get("width", 0)) != width
+            or int(video.get("height", 0)) != height
+        ):
+            return False
+        frame_rate = stream_frame_rate(video)
+        video_duration = stream_duration(video, frame_rate=frame_rate)
+        audio_duration = stream_duration(audio)
+        format_duration = positive_number(probe.get("format", {}).get("duration"))
+        if video_duration is None and audio_duration is None and format_duration is None:
+            return False
+        if expected_frame_count is not None:
+            raw_frame_count = video.get("nb_frames")
+            if raw_frame_count in {None, "", "N/A"} or int(raw_frame_count) != expected_frame_count:
+                return False
+        if expected_fps is not None:
+            if frame_rate is None or abs(frame_rate - expected_fps) > 0.001:
+                return False
+        if expected_duration is not None:
+            if video_duration is None:
+                return False
+            if expected_fps is not None:
+                frame_duration = 1.0 / expected_fps
+            elif expected_frame_count is not None:
+                frame_duration = expected_duration / max(1, expected_frame_count)
+            else:
+                frame_duration = 1.0 / 30.0
+            if abs(video_duration - expected_duration) > max(0.002, frame_duration / 3.0):
+                return False
+            mux_tolerance = audio_tail_tolerance(audio, frame_duration)
+            if audio_duration is not None and abs(audio_duration - expected_duration) > mux_tolerance:
+                return False
+            if format_duration is not None and abs(format_duration - expected_duration) > mux_tolerance:
+                return False
+        return True
+    except (OSError, TypeError, ValueError, VideoSummaryError):
+        return False
+
+
+def import_cached_piece(source: Path, output: Path, width: int, height: int) -> bool:
+    if not cached_piece_is_usable(source, width, height):
+        return False
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.stem}.import.partial.mp4")
+    temporary.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
+def render_card_piece(
+    cards_dir: Path,
+    card_id: str,
+    title: str,
+    subtitle: str,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+    config: dict[str, Any],
+    force: bool,
+) -> Piece:
+    key = stable_hash(
+        {
+            "version": CARD_RENDER_POLICY_VERSION, "id": card_id, "title": title, "subtitle": subtitle,
+            "duration": duration, "format": [width, height, fps, encoder, bitrate],
+        },
+        length=28,
+    )
+    png = cards_dir / f"{key}.png"
+    output = cards_dir / f"{key}.mp4"
+    if output.exists() and not force:
+        return Piece(output, duration, title)
+    create_card(png, title, subtitle, width, height, config)
+    render_still_image_piece(
+        png,
+        output,
+        card_id,
+        duration,
+        width,
+        height,
+        fps,
+        encoder,
+        bitrate,
+        config,
+    )
+    return Piece(output, duration, title)
+
+
+def render_still_image_piece(
+    png: Path,
+    output: Path,
+    card_id: str,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    bitrate: str,
+    config: dict[str, Any],
+) -> None:
+    fade = card_fade_seconds(card_id, duration)
+    temporary = output.with_name(f".{output.stem}.partial.mp4")
+    run_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "2",
+            "-loop", "1", "-framerate", str(fps), "-i", str(png),
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", f"{duration:.3f}",
+            "-vf", f"fps={fps},format=yuv420p,fade=t=in:st=0:d={fade:.3f},"
+            f"fade=t=out:st={max(0.0, duration - fade):.3f}:d={fade:.3f}",
+            "-af", f"atrim=duration={duration:.3f},asetpts=PTS-STARTPTS",
+            *video_encode_args(encoder, bitrate),
+            "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
+            "-ar", "48000", "-ac", "2", "-video_track_timescale", "90000",
+            "-movflags", "+faststart", "-shortest", "-y", str(temporary),
+        ]
+    )
+    os.replace(temporary, output)
+
+
+def card_fade_seconds(card_id: str, duration: float) -> float:
+    cap = 0.5 if card_id.startswith("date-") else 0.65
+    return min(cap, max(0.0, duration) / 4.0)
+
+
+def video_encode_args(encoder: str, bitrate: str) -> list[str]:
+    if encoder == "h264_videotoolbox":
+        return ["-c:v", encoder, "-allow_sw", "1", "-b:v", bitrate, "-pix_fmt", "yuv420p", "-tag:v", "avc1"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", "-tag:v", "avc1"]
+
+
+def validate_assembled_media(
+    probe: dict[str, Any],
+    output: Path,
+    *,
+    width: int,
+    height: int,
+    expected_duration: float,
+    expected_fps: int,
+) -> float:
+    video = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "video"), None)
+    audio = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"), None)
+    if not video or not audio:
+        raise VideoSummaryError(f"완성 영상의 스트림 검증에 실패했습니다: {output}")
+    if int(video.get("width", 0)) != width or int(video.get("height", 0)) != height:
+        raise VideoSummaryError(f"완성 영상 해상도가 예상과 다릅니다: {output}")
+
+    frame_duration = 1.0 / max(1, expected_fps)
+    video_duration = stream_duration(video, frame_rate=stream_frame_rate(video))
+    audio_duration = stream_duration(audio)
+    format_duration = positive_number(probe.get("format", {}).get("duration"))
+    if video_duration is None:
+        raise VideoSummaryError(f"완성 영상의 재생 시간을 확인할 수 없습니다: {output}")
+    if abs(video_duration - expected_duration) > frame_duration + 1e-6:
+        raise VideoSummaryError(
+            f"완성 영상 길이가 타임라인과 1프레임 이상 다릅니다: {output} "
+            f"(예상 {expected_duration:.6f}초, 영상 {video_duration:.6f}초)"
+        )
+    checked_audio_duration = audio_duration or format_duration
+    if checked_audio_duration is None:
+        raise VideoSummaryError(f"완성 영상의 오디오 재생 시간을 확인할 수 없습니다: {output}")
+    tolerance = audio_tail_tolerance(audio, frame_duration)
+    if abs(video_duration - checked_audio_duration) > tolerance + 1e-6:
+        raise VideoSummaryError(
+            f"완성 영상의 오디오/비디오 길이 차이가 큽니다: {output} "
+            f"(영상 {video_duration:.6f}초, 오디오 {checked_audio_duration:.6f}초)"
+        )
+    reported_duration = format_duration or max(
+        duration for duration in (video_duration, audio_duration) if duration is not None
+    )
+    return reported_duration
+
+
+def assemble_output(
+    pieces: list[Piece],
+    output: Path,
+    episode: Episode,
+    paths: ProjectPaths,
+    config: dict[str, Any],
+    assembly_dir: Path,
+    width: int,
+    height: int,
+    draft: bool,
+) -> dict[str, Any]:
+    if not pieces:
+        raise VideoSummaryError("조립할 영상 조각이 없습니다.")
+    assembly_dir.mkdir(parents=True, exist_ok=True)
+    linked: list[Path] = []
+    for index, piece in enumerate(pieces):
+        target = assembly_dir / f"piece-{index:04d}.mp4"
+        target.unlink(missing_ok=True)
+        try:
+            os.link(piece.path, target)
+        except OSError:
+            shutil.copy2(piece.path, target)
+        linked.append(target)
+    concat_path = assembly_dir / "concat.txt"
+    atomic_write_text(concat_path, "".join(f"file {path.name}\n" for path in linked))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    music_value = str(config["render"].get("music_file", "")).strip()
+    assembled = assembly_dir / "assembled.mp4" if music_value else output.with_name(f".{output.stem}.partial.mp4")
+    run_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "1",
+            "-i", concat_path.name, "-c", "copy", "-movflags", "+faststart", "-y", str(assembled),
+        ],
+        cwd=assembly_dir,
+    )
+    if music_value:
+        mix_music(assembled, output, pieces, config, music_value)
+    else:
+        os.replace(assembled, output)
+
+    metadata_base = output.with_suffix("")
+    write_vtt(metadata_base.with_suffix(".vtt"), pieces, paths)
+    timeline_path = metadata_base.with_suffix(".timeline.txt")
+    write_timeline(timeline_path, pieces)
+    chapters_path = metadata_base.with_suffix(".chapters.txt")
+    if str(config["editing"].get("episode_mode", "daily")) == "trip":
+        chapters = write_trip_day_chapters(chapters_path, pieces)
+    else:
+        chapters = write_chapters(chapters_path, pieces)
+    description = (
+        f"# {episode.title}\n\n{episode.summary}\n\n"
+        + "\n".join(chapters)
+        + "\n\n#여행브이로그 #여행\n"
+    )
+    atomic_write_text(metadata_base.with_suffix(".description.md"), description)
+    probe = probe_media(output)
+    duration = validate_assembled_media(
+        probe,
+        output,
+        width=width,
+        height=height,
+        expected_duration=sum(piece.duration for piece in pieces),
+        expected_fps=int(config["render"].get("fps", 30)),
+    )
     return {
-        "base_chunks": [str(path.resolve()) for path in base_chunks],
-        "final_chunks": [str(path.resolve()) for path in final_chunks],
+        "path": str(output),
+        "duration": round(duration, 3),
+        "size_bytes": output.stat().st_size,
+        "title": episode.title,
+        "description": str(metadata_base.with_suffix(".description.md")),
+        "chapters": str(chapters_path),
+        "timeline": str(timeline_path),
+        "subtitles": str(metadata_base.with_suffix(".vtt")),
+        "draft": draft,
     }
 
 
-def grade_preview_variant(source_path: Path, output_path: Path, video_filter: str) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source_path),
-        "-vf",
-        video_filter,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "16",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-c:a",
-        "copy",
-        str(output_path),
-    ]
-    _run(command)
+def mix_music(
+    assembled: Path,
+    output: Path,
+    pieces: list[Piece],
+    config: dict[str, Any],
+    music_value: str,
+) -> None:
+    music = Path(music_value).expanduser().resolve()
+    if not music.exists():
+        raise VideoSummaryError(f"배경음악 파일이 없습니다: {music}")
+    temporary = output.with_name(f".{output.stem}.partial.mp4")
+    duration = sum(piece.duration for piece in pieces)
+    volume = float(config["render"].get("music_volume", 0.08))
+    filter_complex = (
+        "[0:a]asplit=2[voice][side];"
+        f"[1:a]aresample=48000,volume={volume:.4f},atrim=duration={duration:.3f},"
+        f"afade=t=in:st=0:d=1,afade=t=out:st={max(0.0, duration - 2):.3f}:d=2[bg];"
+        "[bg][side]sidechaincompress=threshold=0.035:ratio=8:attack=20:release=500[ducked];"
+        "[voice][ducked]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-16:LRA=11:TP=-1.5[aout]"
+    )
+    run_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(assembled),
+            "-stream_loop", "-1", "-i", str(music), "-filter_complex", filter_complex,
+            "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac",
+            "-b:a", str(config["render"].get("audio_bitrate", "192k")),
+            "-t", f"{duration:.3f}", "-movflags", "+faststart", "-y", str(temporary),
+        ]
+    )
+    os.replace(temporary, output)
 
 
-def grade_master_variant(source_path: Path, output_path: Path, video_filter: str) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source_path),
-        "-vf",
-        video_filter,
-        "-c:v",
-        "prores_ks",
-        "-profile:v",
-        "3",
-        "-pix_fmt",
-        "yuv422p10le",
-        "-c:a",
-        "copy",
-        str(output_path),
-    ]
-    _run(command)
+def write_vtt(path: Path, pieces: list[Piece], paths: ProjectPaths) -> None:
+    lines = ["WEBVTT", ""]
+    timeline = 0.0
+    cue_index = 1
+    for piece in pieces:
+        for member in piece_source_members(piece):
+            candidate = member.candidate
+            speed = member.segment.speed
+            for cue in load_transcript(paths, candidate.clip_id):
+                source_start = max(candidate.start, cue.start)
+                source_end = min(candidate.end, cue.end)
+                if source_end <= source_start or not cue.text.strip():
+                    continue
+                start = timeline + member.offset + (source_start - candidate.start) / speed
+                end = min(
+                    timeline + piece.duration,
+                    timeline + member.offset + (source_end - candidate.start) / speed,
+                )
+                if end <= start:
+                    continue
+                lines.extend([str(cue_index), f"{vtt_time(start)} --> {vtt_time(end)}", cue.text.strip(), ""])
+                cue_index += 1
+        timeline += piece.duration
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
 
 
-def render_youtube(master_path: Path, output_path: Path) -> None:
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(master_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "16",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "320k",
-        str(output_path),
-    ]
-    _run(command)
+def write_chapters(path: Path, pieces: list[Piece]) -> list[str]:
+    lines: list[str] = []
+    timeline = 0.0
+    previous = ""
+    previous_time = float("-inf")
+    for piece in pieces:
+        entries = piece_timeline_entries(piece)
+        for offset, raw_label, _candidate in entries:
+            entry_time = timeline + offset
+            label = normalize_timeline_label(raw_label)
+            if label and label != previous and (not lines or entry_time - previous_time >= 1.0):
+                lines.append(f"{chapter_time(entry_time)} {label}")
+                previous = label
+                previous_time = entry_time
+        timeline += piece.duration
+    atomic_write_text(path, "\n".join(lines) + "\n")
+    return lines
 
 
-def write_chapters(plan: TimelinePlan, output_path: Path) -> None:
-    lines = [f"{entry['timecode']} {entry['label']}" for entry in plan.chapters]
-    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def write_timeline(path: Path, pieces: list[Piece]) -> list[str]:
+    lines: list[str] = []
+    timeline = 0.0
+    for piece in pieces:
+        for offset, raw_label, candidate in piece_timeline_entries(piece):
+            label = normalize_timeline_label(raw_label) or "untitled"
+            if candidate is not None:
+                label = f"{label} [{candidate.candidate_id}]"
+            lines.append(f"{vtt_time(timeline + offset)} {label}")
+        timeline += piece.duration
+    atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+    return lines
+
+
+def piece_source_members(piece: Piece) -> tuple[SourceMember, ...]:
+    if piece.source_members:
+        return piece.source_members
+    if piece.candidate is not None and piece.segment is not None:
+        return (SourceMember(piece.candidate, piece.segment, 0.0, piece.label),)
+    return ()
+
+
+def piece_timeline_entries(piece: Piece) -> list[tuple[float, str, Candidate | None]]:
+    members = piece_source_members(piece)
+    if members:
+        return [(member.offset, member.label, member.candidate) for member in members]
+    return [(0.0, piece.label, None)]
+
+
+def write_trip_day_chapters(path: Path, pieces: list[Piece]) -> list[str]:
+    boundaries: list[tuple[int, str]] = []
+    timeline = 0.0
+    for piece in pieces:
+        if piece.day_chapter:
+            label = normalize_timeline_label(piece.day_chapter)
+            if label:
+                boundaries.append((int(timeline), label))
+        timeline += piece.duration
+    if boundaries:
+        boundaries[0] = (0, boundaries[0][1])
+    total_seconds = int(timeline)
+    valid = (
+        len(boundaries) >= YOUTUBE_MIN_CHAPTERS
+        and all(
+            current[0] - previous[0] >= YOUTUBE_MIN_CHAPTER_SECONDS
+            for previous, current in zip(boundaries, boundaries[1:])
+        )
+        and total_seconds - boundaries[-1][0] >= YOUTUBE_MIN_CHAPTER_SECONDS
+    )
+    lines = [f"{chapter_time(seconds)} {label}" for seconds, label in boundaries] if valid else []
+    atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+    return lines
+
+
+def normalize_timeline_label(value: str) -> str:
+    return " ".join(value.split())
