@@ -1,42 +1,60 @@
-# Pipeline
+# Pipeline Contract
 
-## End-to-End Flow
+## One-shot flow
 
-1. A user provides a free-form editing prompt, either inline or from a text file.
-2. Local transcription uses `CohereLabs/cohere-transcribe-03-2026` through `transformers` to generate cue-level transcripts for every clip.
-3. Cue groups become `segment_candidates`.
-4. Representative frames are extracted for each candidate.
-5. Cue analysis scores each candidate by features such as event type, people, fun, emotion, food, scenery, and transition value, then writes a day-based analysis list.
-6. `plan` automatically derives an internal selection from the prompt and candidate bundle.
-7. `plan` validates that selection and materializes:
-   - `cue_analysis_by_day.json`
-   - `timeline_final.json`
-8. `render` creates one final video from that timeline.
-9. `run` performs the full flow in one shot.
+`run`은 다음 단계를 순서대로 실행합니다.
 
-## Failure Behavior
+1. `scan`: 원본을 재귀 검색하고 ffprobe 메타데이터, 촬영시각, 여행일, 위치 규칙을 manifest로 정규화
+2. `analyze/transcribe`: 자연어 `.srt/.vtt`, whisper.cpp 또는 faster-whisper로 클립별 전사
+3. `analyze/visual`: 폭 96px 저해상도 프레임을 스트리밍하여 밝기·대비·움직임 신호 계산
+4. `candidates`: 전사 구간과 무음 풍경/이동 구간을 함께 후보화하고 대표 프레임 생성
+5. `plan`: local 규칙 또는 Codex/Claude가 날짜별 후보 ID를 선택
+6. `validate`: candidate ID, 날짜, 시간순, 중복·같은 원본 시간 겹침, 길이와 allowlist를 검증
+7. `render`: 한 세그먼트씩 동일 규격으로 렌더하고 concat stream-copy로 날짜별 영상 조립
+8. `package`: VTT, YouTube 설명란용 chapters, description 초안과 render report 생성
 
-- No transcript cues: fail
-- No candidates: fail
-- No valid enabled selections: fail
-- Out-of-bounds selection windows: fail
+## Stable invariants
 
-There is intentionally no heuristic fallback timeline generation.
+- 각 여행일의 모든 source 구간은 첫 장면부터 마지막 장면까지 실제 촬영 시간순입니다. `cold_open`도 이 순서를 깨지 않으며, 선택된 후보 중 가장 이른 하나만 첫 source인 `hook`이 될 수 있습니다.
+- 로컬 plan은 각 DAY의 가장 이른 후보를 시작 앵커로 보존하고, 화면 품질이 충분한 무대사·저대사 `scenery` 후보를 시각 앵커로 우선 검토합니다. 전사량만으로 풍경이나 야외 장면을 탈락시키지 않습니다.
+- 카메라 달력이 초기화된 여행은 `date_overrides`의 폴더 glob, 현지 날짜와 IANA timezone으로 보정할 수 있습니다. 폴더 날짜를 회차 경계로 쓸 때는 `day_start_hour: 0`을 사용합니다.
+- 원본 파일은 읽기만 하며 모든 파생물은 workspace 아래에 저장합니다.
+- 전사, 시각 분석, 렌더는 기본 동시성 1입니다.
+- 완료 artifact만 atomic rename으로 공개합니다.
+- 같은 원본에서 겹치거나 맞닿은 후보 창은 후보 생성 때 union하고, planner가 같은 원본에서 1ms를 넘게 겹치는 실시간 구간을 선택하면 검증에서 거부합니다.
+- source 조각은 목표 fps의 정수 프레임 수로 길이를 양자화하고 fps·PTS·영상/음성 길이를 정규화하며, 캐시 재사용 전에도 정확한 프레임 수와 길이를 확인합니다.
+- 프롬프트 변경은 plan/render만, 렌더 설정 변경은 render만 무효화합니다.
+- 외부 planner는 파일 경로나 FFmpeg 인자를 결정할 수 없습니다.
+- 기본 출력은 날짜별 1080p/30fps H.264 + AAC입니다.
 
-## Default Loop
+## Failure and resume
 
-1. Install dependencies with `uv sync`
-2. Run `python3 -m video_summary run --source-dir ... --prompt "..."`
+- 손상된 영상, 잘못된 날짜/설정, 후보 없음, out-of-bounds plan은 즉시 실패합니다.
+- 성공한 클립 전사·신호·프레임·렌더 세그먼트는 보존합니다.
+- 같은 명령을 다시 실행하면 `state.sqlite3`와 artifact cache key를 이용해 미완료 지점부터 이어갑니다.
+- 외부 planner의 실행·JSON·검증이 실패하고 strict 모드가 아니면 그 실행만 local fallback으로 완주하되, fallback을 영구 cache hit로 취급하지 않습니다.
 
-Path handling rules:
+## Planner boundary
 
-- Use `--project-dir` when you want artifacts under a specific root.
-- Otherwise, artifacts go under the current workspace root.
+Planner가 반환할 수 있는 것은 프로젝트/후보 해시, 날짜별 제목·요약, candidate ID와 편집 메타데이터(role/reason 및 선택적 location/caption/speed)뿐입니다. `role=hook`은 해당 DAY의 첫 번째 source이자 선택된 후보 중 실제 촬영 시각이 가장 이른 후보에만 허용됩니다. 원본 경로·시간 범위·FFmpeg 인자는 반환할 수 없으며 renderer가 검증된 catalog에서 다시 조회합니다.
 
-The pipeline is designed to work without manual editing of internal artifacts.
-The default one-shot path stays a single `run` command.
+## Output modes
 
-## Advanced Loop
+- `daily` (기본): 여행일마다 MP4 하나
+- `trip`: 여행 인트로 모자이크(실패 시 제목 카드) → DAY 날짜 카드 → 해당 DAY의 모든 source(`hook` 포함, 시간순) → 다음 DAY 반복 → 여행 아웃트로 카드 순서의 합본 MP4
 
-1. Run `plan --source-dir ... --prompt "..."`
-2. Run `render`
+두 모드 모두 인트로, 날짜 카드, 위치 lower-third, 아웃트로와 YouTube 보조 파일을 생성합니다. 날짜 카드와 아웃트로의 권장 길이는 각각 `date_card_seconds: 3.0`, `outro_seconds: 5.0`입니다. 여러 날 여행의 flow 모자이크는 `intro_seconds: 6.0`을 권장하며, 각 카드 길이는 0.1~30초 사이의 유한한 숫자여야 합니다.
+
+`trip_intro_style: mosaic`는 plan-selected source 중 정상적으로 읽을 수 있는 candidate JPEG만 대상으로 합니다. `trip_intro_grid_size`는 `6`, `7`, `8`만 허용하고 기본값 `7`은 최대 49장의 7×7 모자이크를 만듭니다. `6`은 최대 36장의 더 큰 타일, `8`은 최대 64장의 조밀한 타일 옵션입니다. 먼저 usable frame이 있는 DAY마다 한 장을 확보합니다. usable DAY가 grid 용량보다 많으면 첫날·마지막 날을 포함해 용량만큼 전체 기간에서 균등 선택합니다. 남은 칸에는 `trip_intro_candidate_ids`와 DAY별 균형을 반영하되, 서로 다른 원본 clip을 한 장씩 먼저 사용하고 고유 원본이 부족할 때만 같은 clip을 반복합니다. 자동 후보 순서는 `visual_quality desc → score desc → captured_at asc → candidate_id`입니다. 용량보다 적은 프레임은 어두운 빈 셀을 남기며, 손상·누락 JPEG는 같은 DAY의 다음 후보로 넘어갑니다.
+
+`trip_intro_animation`은 `flow` 또는 `static`만 허용합니다. 기본 `flow`는 선택 프레임을 edit-plan 시간순으로 정렬하고, 행마다 좌→우와 우→좌를 번갈아 진행하는 serpentine 순서로 cell을 채웁니다. 각 tile은 짧은 horizontal flip/slide 뒤 자리를 잡으며, 중앙 제목·기간의 반투명 어두운 panel은 모자이크가 충분히 보인 후반에 나타납니다. `static`은 같은 선택 프레임의 완성된 모자이크를 처음부터 표시합니다. flow asset 생성이 실패하면 static으로 fallback하고, usable frame이 없거나 static 생성도 실패하면 classic title card로 fallback합니다.
+
+`trip_intro_candidate_ids`는 이미 plan-selected된 ID의 전역 선택 우선순위이며 타일 위치 목록이 아닙니다. 같은 DAY의 ID를 여러 개 포함할 수 있지만 DAY 커버리지를 먼저 확보합니다. 오래됐거나 최종 plan에 선택되지 않은 ID는 무시하며, 선택된 타일은 최종 edit plan의 시간순으로 배치합니다. `daily` 인트로에는 이 설정이 영향을 주지 않습니다.
+
+모자이크는 기존 candidate JPEG를 한 번에 한 장씩 로컬에서 합성하는 저메모리 render-only 파생물입니다. 모자이크를 켠 것만으로 외부 전송이 생기지는 않지만, 별도로 `--planner-images`를 쓰면 candidate frame 기반의 축소 contact sheet가 외부 플래너에 전달됩니다. style·grid·animation·선택 ID·프레임 지문·제목·기간·렌더 형식은 render cache에 포함합니다. 모자이크 레이아웃·animation·선택·제목 패널·intro 길이만 바뀌면 transcript/analyze/source segment cache를 재사용합니다. 반면 source 출력 형식이나 정확 프레임 정책이 바뀌면 source segment를 다시 렌더합니다.
+
+`transition_seconds`는 기본 `0.18`초이며 0~1초만 허용합니다. 각 DAY의 첫 source는 날짜 카드 뒤에서 블랙·무음으로부터 fade-in하고, 마지막 source는 다음 날짜 카드 또는 아웃트로를 향해 블랙·무음으로 fade-out합니다. DAY 내부 source-to-source는 clean cut이고 실제 crossfade는 사용하지 않습니다. `0`이면 경계 fade를 끕니다.
+
+MP4의 카드는 영상 프레임에 렌더되는 시각 요소입니다. `.chapters.txt`는 MP4 embedded chapter가 아니라 YouTube 설명란에 복사할 timestamp 텍스트이고, 자동 업로드되지 않습니다. `trip`에서는 DAY마다 챕터 하나를 생성하며 DAY 1은 여행 인트로를 포함한 `00:00`, 이후 DAY는 해당 날짜 카드의 시작 시각을 사용합니다. timestamp의 오름차순·영상 범위를 검증하고, YouTube에 사용할 때는 `00:00` 시작·최소 3개·각 챕터 10초 이상 조건을 확인합니다.
+
+카드와 모든 source 후보의 상세 누적 시각은 별도 `.timeline.txt`에 보존하며 YouTube 챕터와 섞지 않습니다.

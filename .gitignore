@@ -4,3 +4,6 @@ __pycache__/
 .DS_Store
 .venv/
 work/
+.video-summary/
+exports/
+codex-skill/video-summary.env

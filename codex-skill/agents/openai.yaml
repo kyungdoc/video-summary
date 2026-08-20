@@ -1,7 +1,7 @@
 interface:
   display_name: "Video Summary"
-  short_description: "Turn raw travel clips into one final edited video."
-  default_prompt: "Use $video-summary to turn the user's travel clips and editing prompt into one finished video. Infer the clip path from the user's message or current workspace when possible."
+  short_description: "Turn raw travel clips into daily or trip-summary videos."
+  default_prompt: "Use $video-summary to turn the user's travel clips and editing prompt into daily videos or one combined trip summary with journey flow, fun moments, titles, dates, locations, subtitles, and YouTube chapters. Infer the source path when safe and keep artifacts in the caller workspace."
 
 policy:
   allow_implicit_invocation: true
