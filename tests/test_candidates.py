@@ -2,11 +2,33 @@ from __future__ import annotations
 
 import unittest
 
-from video_summary.candidates import _candidate_windows, _merge_overlapping_windows
+from video_summary.candidates import _candidate_location, _candidate_windows, _merge_overlapping_windows
 from video_summary.models import Clip, TranscriptCue
 
 
 class CandidateCoverageTests(unittest.TestCase):
+    def test_candidate_location_rechecks_ordered_rules_before_scan_fallback(self) -> None:
+        clip = Clip(
+            clip_id="clip", path="/tmp/day-02/DJI_0002.MP4",
+            relative_path="day-02/DJI_0002.MP4", fingerprint="fp", size_bytes=1,
+            duration=10.0, captured_at="2026-08-20T10:00:00+09:00",
+            capture_source="filename", day_key="2026-08-20", travel_day=2,
+            width=1920, height=1080, fps=30.0, codec="h264", rotation=0,
+            has_audio=True, location="오키나와 · 나하",
+        )
+        rules = [
+            {
+                "label": "인천국제공항",
+                "day_key": "2026-08-20",
+                "match": ["airport/*"],
+                "keywords": ["공항", "탑승"],
+            },
+            {"label": "오키나와 · 나하", "day_key": "2026-08-20", "match": ["*"]},
+        ]
+
+        self.assertEqual(_candidate_location(clip, "공항에 도착했다", rules), "인천국제공항")
+        self.assertEqual(_candidate_location(clip, "바다에 도착했다", rules), "오키나와 · 나하")
+
     def test_overlapping_windows_are_merged_into_continuous_unique_ranges(self) -> None:
         windows = _merge_overlapping_windows(
             [

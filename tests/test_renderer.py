@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import array
 import copy
+import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -15,6 +19,7 @@ from video_summary.project import DEFAULT_CONFIG, ProjectPaths
 from video_summary.render_assets import MOSAIC_CAPACITY
 from video_summary.renderer import (
     Piece,
+    RENDER_POLICY_VERSION,
     SourceMember,
     SourceSelection,
     assemble_output,
@@ -23,17 +28,23 @@ from video_summary.renderer import (
     coalesce_source_selections,
     episode_pieces,
     legacy_segment_directories,
+    render_cache_key,
+    render_card_piece,
     render_mosaic_card_piece,
     render_trip_intro_piece,
     select_trip_intro_frames,
     render_source_piece,
     source_output_timing,
     source_cache_namespace,
+    write_chapters,
     write_timeline,
     write_trip_day_chapters,
     write_vtt,
 )
 from video_summary.utils import VideoSummaryError
+
+
+FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
 def candidate(
@@ -328,6 +339,41 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(chapters_path.read_text(encoding="utf-8"), "")
             self.assertIn("DAY 2", timeline_path.read_text(encoding="utf-8"))
 
+    def test_daily_chapters_select_valid_subset_and_keep_full_timeline(self) -> None:
+        pieces = [
+            Piece(Path("intro"), 4.0, "Intro"),
+            Piece(Path("date"), 3.0, "Date"),
+            Piece(Path("early"), 10.0, "Early source"),
+            Piece(Path("middle"), 11.0, "Middle source"),
+            Piece(Path("late"), 12.0, "Late source"),
+            Piece(Path("too-late"), 4.0, "Too late for a 10 second tail"),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chapters_path = Path(tmpdir) / "daily.chapters.txt"
+            timeline_path = Path(tmpdir) / "daily.timeline.txt"
+            chapters = write_chapters(chapters_path, pieces)
+            timeline = write_timeline(timeline_path, pieces)
+
+        self.assertEqual(chapters, [
+            "00:00 Intro",
+            "00:17 Middle source",
+            "00:28 Late source",
+        ])
+        self.assertEqual(len(timeline), len(pieces))
+        self.assertTrue(all("Date" not in line and "Early source" not in line for line in chapters))
+        self.assertNotIn("Too late", "\n".join(chapters))
+
+    def test_daily_chapters_are_empty_when_no_valid_three_chapter_subset_exists(self) -> None:
+        pieces = [
+            Piece(Path("intro"), 4.0, "Intro"),
+            Piece(Path("date"), 3.0, "Date"),
+            Piece(Path("source"), 12.0, "Source"),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chapters_path = Path(tmpdir) / "daily.chapters.txt"
+            self.assertEqual(write_chapters(chapters_path, pieces), [])
+            self.assertEqual(chapters_path.read_text(encoding="utf-8"), "")
+
     def test_card_fade_and_source_cache_scope(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         original = source_cache_namespace(config, 1280, 720, 30, "libx264", "4M")
@@ -343,6 +389,56 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(card_fade_seconds("intro-day-1", 4.0), 0.65)
         self.assertEqual(card_fade_seconds("date-day-1", 3.0), 0.5)
         self.assertEqual(card_fade_seconds("trip-outro", 0.4), 0.1)
+
+    def test_regular_cards_use_integer_frame_durations_without_accumulated_drift(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("video_summary.renderer.cached_piece_is_usable", return_value=False),
+            patch("video_summary.renderer.create_card"),
+            patch("video_summary.renderer.render_still_image_piece") as render_still,
+        ):
+            cards = Path(tmpdir)
+            pieces = [
+                render_card_piece(
+                    cards,
+                    f"card-{index}",
+                    "Title",
+                    "Subtitle",
+                    2.91,
+                    1280,
+                    720,
+                    30,
+                    "libx264",
+                    "4M",
+                    config,
+                    False,
+                )
+                for index in range(20)
+            ]
+
+        self.assertTrue(all(piece.duration == 2.9 for piece in pieces))
+        self.assertAlmostEqual(sum(piece.duration for piece in pieces), 58.0)
+        self.assertTrue(all(call.args[3] == 2.9 for call in render_still.call_args_list))
+
+    def test_render_cache_key_tracks_music_file_contents_not_just_path(self) -> None:
+        plan = EditPlan("Trip", "", "local", "hash", [])
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            music = Path(tmpdir) / "music.wav"
+            music.write_bytes(b"first soundtrack")
+            config["render"]["music_file"] = str(music)
+            first = render_cache_key(
+                plan, [], config["render"], "daily", False,
+                1280, 720, 30, "libx264", "4M", version=RENDER_POLICY_VERSION,
+            )
+            music.write_bytes(b"other soundtrack")
+            second = render_cache_key(
+                plan, [], config["render"], "daily", False,
+                1280, 720, 30, "libx264", "4M", version=RENDER_POLICY_VERSION,
+            )
+
+        self.assertNotEqual(first, second)
 
     def test_cached_piece_requires_exact_frames_fps_and_duration(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -401,6 +497,121 @@ class RendererTests(unittest.TestCase):
         with self.assertRaisesRegex(VideoSummaryError, "오디오/비디오"):
             self.assemble_with_probe(probe)
 
+    def test_failed_validation_preserves_existing_export_with_and_without_music(self) -> None:
+        for with_music in (False, True):
+            with self.subTest(with_music=with_music), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                paths = ProjectPaths(root, "trip")
+                paths.ensure()
+                source = root / "piece.mp4"
+                source.write_bytes(b"p" * 2048)
+                output = paths.exports / "summary.mp4"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(b"known-good-export")
+                config = copy.deepcopy(DEFAULT_CONFIG)
+                music = root / "music.wav"
+                if with_music:
+                    music.write_bytes(b"music")
+                    config["render"]["music_file"] = str(music)
+                episode = Episode("2026-08-19", 1, "DAY 1", "", "", 2.0, [])
+
+                def fake_run(args: list[str], *, cwd: Path | None = None):
+                    destination = Path(args[-1])
+                    if not destination.is_absolute() and cwd is not None:
+                        destination = cwd / destination
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(b"unvalidated-output" * 128)
+
+                def fake_mix(_assembled: Path, destination: Path, *_args) -> None:
+                    destination.write_bytes(b"unvalidated-mix" * 128)
+
+                invalid_probe = self.media_probe()
+                invalid_probe["streams"][0]["width"] = 640
+                with (
+                    patch("video_summary.renderer.run_command", side_effect=fake_run),
+                    patch("video_summary.renderer.mix_music", side_effect=fake_mix) as mixed,
+                    patch("video_summary.renderer.probe_media", return_value=invalid_probe),
+                ):
+                    with self.assertRaisesRegex(VideoSummaryError, "해상도"):
+                        assemble_output(
+                            [Piece(source, 2.0, "source")],
+                            output,
+                            episode,
+                            paths,
+                            config,
+                            paths.render / "assembly",
+                            1280,
+                            720,
+                            False,
+                        )
+
+                self.assertEqual(output.read_bytes(), b"known-good-export")
+                self.assertFalse(output.with_name(".summary.partial.mp4").exists())
+                self.assertEqual(mixed.called, with_music)
+
+    @unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg/FFprobe are required")
+    def test_final_audio_is_continuous_across_individually_encoded_aac_pieces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = ProjectPaths(root, "trip")
+            paths.ensure()
+            pieces: list[Piece] = []
+            for index in range(2):
+                piece_path = root / f"piece-{index}.mp4"
+                subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", "color=c=blue:s=160x90:r=30:d=1",
+                        "-f", "lavfi", "-i", "aevalsrc=0.25:s=48000:d=1",
+                        "-map", "0:v:0", "-map", "1:a:0", "-frames:v", "30", "-t", "1",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                        "-video_track_timescale", "90000", "-y", str(piece_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                pieces.append(Piece(piece_path, 1.0, f"piece {index}"))
+
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config["render"]["fps"] = 30
+            output = paths.exports / "summary.mp4"
+            assemble_output(
+                pieces,
+                output,
+                Episode("2026-08-19", 1, "DAY 1", "", "", 2.0, []),
+                paths,
+                config,
+                paths.render / "assembly",
+                160,
+                90,
+                False,
+            )
+            decoded = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(output),
+                    "-map", "0:a:0", "-f", "s16le", "-acodec", "pcm_s16le",
+                    "-ar", "48000", "-ac", "1", "pipe:1",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            samples = array.array("h")
+            samples.frombytes(decoded)
+            boundary = 48000
+            window = samples[boundary - 4800:boundary + 4800]
+            longest_quiet_run = 0
+            current_quiet_run = 0
+            for sample in window:
+                if abs(sample) < 500:
+                    current_quiet_run += 1
+                    longest_quiet_run = max(longest_quiet_run, current_quiet_run)
+                else:
+                    current_quiet_run = 0
+
+            self.assertGreater(max(abs(sample) for sample in window), 3000)
+            self.assertLess(longest_quiet_run, 480)  # No AAC-frame-scale silence at the boundary.
+
     def test_source_piece_has_exact_frame_timing_and_soft_transition(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         item = candidate("source", "2026-08-19T08:00:00+09:00", 0.0)
@@ -426,12 +637,107 @@ class RendererTests(unittest.TestCase):
         filters = args[args.index("-filter_complex") + 1]
         self.assertEqual(source_output_timing(5.98, 30), (179, 179 / 30))
         self.assertAlmostEqual(piece.duration, 179 / 30)
-        self.assertEqual(args[args.index("-frames:v") + 1], "179")
+        self.assertNotIn("-frames:v", args)
         self.assertIn("trim=end_frame=179", filters)
         self.assertIn("fade=t=in", filters)
         self.assertIn("fade=t=out", filters)
         self.assertIn("afade=t=in", filters)
         self.assertIn("afade=t=out", filters)
+        self.assertIn("iw*sar", filters)
+        self.assertIn("setsar=1", filters)
+
+    @unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg/FFprobe are required")
+    def test_source_piece_preserves_late_audio_start_and_normalizes_sar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "offset-source.mkv"
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=blue:s=720x480:r=30:d=2",
+                    "-itsoffset", "0.478", "-f", "lavfi", "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=1.5",
+                    "-map", "0:v:0", "-map", "1:a:0", "-vf", "setsar=8/9",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "pcm_s16le",
+                    "-y", str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            item = candidate("offset", "2026-08-19T08:00:00+09:00", 0.0)
+            item.end = 2.0
+            segment = PlanSegment(item.candidate_id, "journey", "")
+            clip = Clip(
+                clip_id="clip", path=str(source), relative_path=source.name,
+                fingerprint="offset-sar-fingerprint", size_bytes=source.stat().st_size,
+                duration=2.0, captured_at=item.captured_at, capture_source="filename",
+                day_key=item.day_key, travel_day=1, width=720, height=480, fps=30.0,
+                codec="h264", rotation=0, has_audio=True,
+            )
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config["render"]["transition_seconds"] = 0.0
+            segments = root / "segments"
+            overlays = root / "overlays"
+            segments.mkdir()
+            overlays.mkdir()
+            piece = render_source_piece(
+                segment,
+                item,
+                clip,
+                segments,
+                overlays,
+                1280,
+                720,
+                30,
+                "libx264",
+                "2M",
+                config,
+                location_overlay=None,
+                fade_in=False,
+                fade_out=False,
+                force=False,
+            )
+
+            probe = json.loads(subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(piece.path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout)
+            video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+            self.assertEqual(video["sample_aspect_ratio"], "1:1")
+
+            decoded_frame = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "1.0",
+                    "-i", str(piece.path), "-frames:v", "1", "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "pipe:1",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            middle_row = decoded_frame[360 * 1280 * 3:(360 + 1) * 1280 * 3]
+            blue_pixels = [
+                x
+                for x in range(1280)
+                if middle_row[x * 3 + 2] - middle_row[x * 3] > 100
+            ]
+            self.assertAlmostEqual(min(blue_pixels), 160, delta=4)
+            self.assertAlmostEqual(max(blue_pixels), 1119, delta=4)
+
+            decoded = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(piece.path),
+                    "-map", "0:a:0", "-f", "s16le", "-acodec", "pcm_s16le",
+                    "-ar", "48000", "-ac", "1", "pipe:1",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            samples = array.array("h")
+            samples.frombytes(decoded)
+            first_audible = next(index for index, sample in enumerate(samples) if abs(sample) > 500)
+            self.assertAlmostEqual(first_audible / 48000, 0.478, delta=0.06)
 
     def test_contiguous_source_piece_seeks_once_and_preserves_member_offsets(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
@@ -476,7 +782,7 @@ class RendererTests(unittest.TestCase):
 
         args = run.call_args.args[0]
         self.assertEqual(args[args.index("-ss") + 1], "10.000")
-        self.assertEqual(args[args.index("-frames:v") + 1], "300")
+        self.assertIn("trim=end_frame=300", args[args.index("-filter_complex") + 1])
         self.assertAlmostEqual(piece.duration, 10.0)
         self.assertEqual(
             [(member.candidate.candidate_id, member.offset, member.label) for member in piece.source_members],
@@ -522,6 +828,39 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(vtt.count("second cue"), 1)
         self.assertIn("00:00:02.000 journey [first]", timeline)
         self.assertIn("00:00:07.000 scenery [second]", timeline)
+
+    def test_custom_caption_overrides_transcript_and_captions_silent_candidate(self) -> None:
+        first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
+        second = candidate("second", "2026-08-19T08:00:00+09:00", 5.0)
+        first_segment = PlanSegment(first.candidate_id, "journey", "", caption="  Planner caption  ")
+        second_segment = PlanSegment(second.candidate_id, "scenery", "", caption="Silent view")
+        piece = Piece(
+            Path("source.mp4"),
+            10.0,
+            "journey",
+            first,
+            first_segment,
+            source_members=(
+                SourceMember(first, first_segment, 0.0, "journey"),
+                SourceMember(second, second_segment, 5.0, "scenery"),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = ProjectPaths(root, "trip")
+            paths.ensure()
+            output = root / "captions.vtt"
+            with patch(
+                "video_summary.renderer.load_transcript",
+                return_value=[TranscriptCue(0.5, 1.5, "original transcript")],
+            ) as transcript:
+                write_vtt(output, [piece], paths)
+            rendered = output.read_text(encoding="utf-8")
+
+        transcript.assert_not_called()
+        self.assertIn("00:00:00.000 --> 00:00:05.000\nPlanner caption", rendered)
+        self.assertIn("00:00:05.000 --> 00:00:10.000\nSilent view", rendered)
+        self.assertNotIn("original transcript", rendered)
 
     def test_legacy_import_is_scoped_to_exact_render_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -773,6 +1112,51 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(piece.duration, 5.0)
         self.assertEqual(animated.call_args.kwargs["grid_size"], 6)
         self.assertEqual(animated.call_args.kwargs["animation_style"], "flow")
+
+    def test_flow_mosaic_failure_uses_static_mosaic_before_title_card(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["render"]["trip_intro_animation"] = "flow"
+        item = candidate("candidate", "2026-08-19T08:00:00+09:00", 0.0)
+        static_piece = Piece(Path("static.mp4"), 4.0, "Trip")
+        with (
+            patch(
+                "video_summary.renderer.select_trip_intro_frames",
+                return_value=[(item, Path("frame.jpg"))],
+            ),
+            patch(
+                "video_summary.renderer.render_mosaic_card_piece",
+                side_effect=[VideoSummaryError("flow failed"), static_piece],
+            ) as mosaic,
+            patch("video_summary.renderer.render_card_piece") as title_card,
+            patch("video_summary.renderer.print_status") as status,
+        ):
+            piece, report = render_trip_intro_piece(
+                [Episode(item.day_key, 1, "DAY 1", "", "", 5.0, [])],
+                {item.candidate_id: item},
+                Path("/project"),
+                Path("/cards"),
+                "Trip",
+                "Dates",
+                4.0,
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                config,
+                False,
+            )
+
+        self.assertIs(piece, static_piece)
+        self.assertEqual(mosaic.call_count, 2)
+        self.assertEqual(mosaic.call_args_list[0].args[11]["render"]["trip_intro_animation"], "flow")
+        self.assertEqual(mosaic.call_args_list[1].args[11]["render"]["trip_intro_animation"], "static")
+        title_card.assert_not_called()
+        self.assertEqual(report["effective_style"], "mosaic")
+        self.assertEqual(report["requested_motion"], "flow")
+        self.assertEqual(report["motion"], "static")
+        self.assertIn("flow failed", report["fallback_reason"])
+        self.assertTrue(any("정적 모자이크 fallback" in call.args[0] for call in status.call_args_list))
 
     def test_trip_intro_falls_back_to_card_when_no_frame_is_usable(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)

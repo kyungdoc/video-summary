@@ -5,6 +5,7 @@ import math
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -41,10 +42,10 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 12
-SOURCE_RENDER_POLICY_VERSION = 6
-CARD_RENDER_POLICY_VERSION = 3
-MOSAIC_CARD_POLICY_VERSION = 4
+RENDER_POLICY_VERSION = 13
+SOURCE_RENDER_POLICY_VERSION = 7
+CARD_RENDER_POLICY_VERSION = 4
+MOSAIC_CARD_POLICY_VERSION = 5
 YOUTUBE_MIN_CHAPTERS = 3
 YOUTUBE_MIN_CHAPTER_SECONDS = 10
 AAC_FRAME_SAMPLES = 1024
@@ -101,6 +102,8 @@ def render_cache_key(
         "draft": draft,
         "format": [width, height, fps, encoder, bitrate],
     }
+    if version >= 13:
+        payload["music_signature"] = render_music_signature(render_config)
     if font_signature is not None:
         payload["font_signature"] = font_signature
     if trip_intro_signature is not None:
@@ -110,6 +113,18 @@ def render_cache_key(
             "frames": trip_intro_signature,
         }
     return stable_hash(payload, length=32)
+
+
+def render_music_signature(render_config: dict[str, Any]) -> dict[str, str] | None:
+    configured = str(render_config.get("music_file", "")).strip()
+    if not configured:
+        return None
+    path = Path(configured).expanduser().resolve()
+    try:
+        fingerprint = file_fingerprint(path) if path.is_file() else "missing"
+    except OSError:
+        fingerprint = "unreadable"
+    return {"path": str(path), "fingerprint": fingerprint}
 
 
 def render_font_signature(config: dict[str, Any]) -> list[dict[str, str]]:
@@ -577,8 +592,32 @@ def render_trip_intro_piece(
             limit=grid_size * grid_size,
         )
     if selected:
+        mosaic_title = " ".join(title.replace("-", " ").split()).upper()
+        requested_animation = str(config["render"].get("trip_intro_animation", "flow"))
+
+        def mosaic_report(piece: Piece, motion: str, fallback_reason: str | None = None) -> dict[str, Any]:
+            report: dict[str, Any] = {
+                "requested_style": requested_style,
+                "effective_style": "mosaic",
+                "grid": [grid_size, grid_size],
+                "frame_count": len(selected),
+                "tile_count": len(selected),
+                "video_frame_count": int(round(piece.duration * fps)),
+                "requested_duration": duration,
+                "rendered_duration": piece.duration,
+                "requested_motion": requested_animation,
+                "motion": motion,
+                "flow_order": (
+                    "chronological_serpentine" if motion == "flow" else "chronological_row_major"
+                ),
+                "candidate_ids": [candidate.candidate_id for candidate, _path in selected],
+                "frames_per_day": mosaic_frames_per_day(selected),
+            }
+            if fallback_reason:
+                report["fallback_reason"] = fallback_reason
+            return report
+
         try:
-            mosaic_title = " ".join(title.replace("-", " ").split()).upper()
             piece = render_mosaic_card_piece(
                 cards_dir,
                 "trip-intro-mosaic",
@@ -594,24 +633,39 @@ def render_trip_intro_piece(
                 config,
                 force,
             )
-            animation = str(config["render"].get("trip_intro_animation", "flow"))
-            return piece, {
-                "requested_style": requested_style,
-                "effective_style": "mosaic",
-                "grid": [grid_size, grid_size],
-                "frame_count": len(selected),
-                "tile_count": len(selected),
-                "video_frame_count": int(round(piece.duration * fps)),
-                "requested_duration": duration,
-                "rendered_duration": piece.duration,
-                "motion": animation,
-                "flow_order": "chronological_serpentine" if animation == "flow" else "chronological_row_major",
-                "candidate_ids": [candidate.candidate_id for candidate, _path in selected],
-                "frames_per_day": mosaic_frames_per_day(selected),
-            }
+            return piece, mosaic_report(piece, requested_animation)
         except (OSError, ValueError, VideoSummaryError) as exc:
-            print_status(f"trip intro: 모자이크 생성 실패, 제목 카드 사용 ({exc})")
-            fallback_reason = str(exc)
+            if requested_animation == "flow":
+                print_status(f"trip intro: 동적 모자이크 생성 실패, 정적 모자이크 시도 ({exc})")
+                fallback_config = {
+                    **config,
+                    "render": {**config["render"], "trip_intro_animation": "static"},
+                }
+                try:
+                    piece = render_mosaic_card_piece(
+                        cards_dir,
+                        "trip-intro-mosaic",
+                        mosaic_title,
+                        subtitle,
+                        duration,
+                        selected,
+                        width,
+                        height,
+                        fps,
+                        encoder,
+                        bitrate,
+                        fallback_config,
+                        force,
+                    )
+                except (OSError, ValueError, VideoSummaryError) as static_exc:
+                    print_status(f"trip intro: 정적 모자이크 생성 실패, 제목 카드 사용 ({static_exc})")
+                    fallback_reason = f"flow: {exc}; static: {static_exc}"
+                else:
+                    print_status("trip intro: 정적 모자이크 fallback 사용")
+                    return piece, mosaic_report(piece, "static", f"flow: {exc}")
+            else:
+                print_status(f"trip intro: 정적 모자이크 생성 실패, 제목 카드 사용 ({exc})")
+                fallback_reason = str(exc)
     elif requested_style == "mosaic":
         print_status("trip intro: 사용할 대표 프레임이 없어 제목 카드 사용")
         fallback_reason = "usable representative frame not found"
@@ -867,6 +921,7 @@ def render_mosaic_card_piece(
 ) -> Piece:
     grid_size = configured_mosaic_grid_size(config["render"])
     animation = str(config["render"].get("trip_intro_animation", "flow"))
+    frame_count, effective_duration = source_output_timing(duration, fps)
     frame_records = [
         {
             "candidate_id": candidate.candidate_id,
@@ -881,7 +936,8 @@ def render_mosaic_card_piece(
             "id": card_id,
             "title": title,
             "subtitle": subtitle,
-            "duration": duration,
+            "duration": effective_duration,
+            "frame_count": frame_count,
             "grid": [grid_size, grid_size],
             "animation": animation,
             "animation_policy": ANIMATED_MOSAIC_POLICY_VERSION if animation == "flow" else None,
@@ -913,8 +969,15 @@ def render_mosaic_card_piece(
             force=force,
         )
         return Piece(output, result.duration, title)
-    if not force and cached_piece_is_usable(output, width, height):
-        return Piece(output, duration, title)
+    if not force and cached_piece_is_usable(
+        output,
+        width,
+        height,
+        expected_frame_count=frame_count,
+        expected_duration=effective_duration,
+        expected_fps=fps,
+    ):
+        return Piece(output, effective_duration, title)
     create_mosaic_card(
         png,
         [path for _candidate, path in selected_frames],
@@ -930,7 +993,7 @@ def render_mosaic_card_piece(
         png,
         output,
         card_id,
-        duration,
+        effective_duration,
         width,
         height,
         fps,
@@ -938,7 +1001,7 @@ def render_mosaic_card_piece(
         bitrate,
         config,
     )
-    return Piece(output, duration, title)
+    return Piece(output, effective_duration, title)
 
 
 def render_source_piece(
@@ -978,6 +1041,7 @@ def render_source_piece(
     source_start = selections[0].candidate.start
     source_end = max(selection.candidate.end for selection in selections)
     frame_count, output_duration = source_output_timing((source_end - source_start) / segment.speed, fps)
+    video_start_delay, audio_start_delay = source_stream_start_delays(clip, source_start, segment.speed)
     labels = member_labels or tuple(
         location_overlay if index == 0 and location_overlay else selection.segment.role
         for index, selection in enumerate(selections)
@@ -1005,6 +1069,7 @@ def render_source_piece(
             ],
             "speed": segment.speed,
             "transitions": [transition_in, transition_out],
+            "stream_start_delays": [video_start_delay, audio_start_delay],
             "location_overlay": location_overlay,
             "format": [width, height, fps, encoder, bitrate],
         },
@@ -1027,8 +1092,8 @@ def render_source_piece(
             segment,
             source_members=source_members,
         )
-    # Earlier source artifacts can be one frame short and have no transition or
-    # contiguous-range contract, so policy v6 intentionally does not import them.
+    # Earlier source artifacts can be one frame short and have no transition,
+    # stream-offset, SAR, or contiguous-range contract, so v7 does not import them.
 
     args = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "2",
@@ -1047,10 +1112,18 @@ def render_source_piece(
         args.extend(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
 
     video_pad = max(0.1, 3.0 / fps)
+    video_start_pad = (
+        f"tpad=start_mode=add:start_duration={video_start_delay:.6f}:color=0x101318,"
+        if video_start_delay > 0.0
+        else ""
+    )
     filters = [
         f"[0:v:0]setpts=(PTS-STARTPTS)/{segment.speed:.6f},"
+        "scale=w='max(2,trunc(iw*sar/2)*2)':h=ih,setsar=1,"
         f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x101318,"
+        "setsar=1,"
+        f"{video_start_pad}"
         f"fps=fps={fps}:start_time=0:round=near,tpad=stop_mode=clone:stop_duration={video_pad:.6f},"
         f"trim=end_frame={frame_count},setpts=N/({fps}*TB),format=yuv420p[vbase]"
     ]
@@ -1082,11 +1155,18 @@ def render_source_piece(
         )
     audio_transition = "," + ",".join(audio_transition_parts) if audio_transition_parts else ""
     if clip.has_audio:
+        audio_start_pad = (
+            f"adelay={audio_start_delay * 1000.0:.3f}:all=1,"
+            if audio_start_delay > 0.0
+            else ""
+        )
         filters.append(
             f"[0:a:0]asetpts=PTS-STARTPTS,aresample=48000,"
             f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-            f"atempo={segment.speed:.6f},loudnorm=I=-16:LRA=11:TP=-1.5,"
-            f"apad=whole_dur={output_duration:.6f},atrim=duration={output_duration:.6f}"
+            f"atempo={segment.speed:.6f},{audio_start_pad}"
+            "loudnorm=I=-16:LRA=11:TP=-1.5,"
+            "aresample=48000,"
+            f"apad,atrim=duration={output_duration:.6f}"
             f"{audio_transition},asetpts=PTS-STARTPTS[aout]"
         )
     else:
@@ -1100,7 +1180,7 @@ def render_source_piece(
     args.extend(
         [
             "-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "[aout]",
-            "-frames:v", str(frame_count), "-t", f"{output_duration:.6f}", *video_encode_args(encoder, bitrate),
+            *video_encode_args(encoder, bitrate),
             "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
             "-ar", "48000", "-ac", "2", "-video_track_timescale", "90000",
             "-map_metadata", "-1", "-map_chapters", "-1",
@@ -1108,18 +1188,18 @@ def render_source_piece(
         ]
     )
     run_command(args)
-    os.replace(temporary, output)
     if not cached_piece_is_usable(
-        output,
+        temporary,
         width,
         height,
         expected_frame_count=frame_count,
         expected_duration=output_duration,
         expected_fps=fps,
     ):
-        output.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         candidate_ids = ", ".join(member.candidate.candidate_id for member in source_members)
         raise VideoSummaryError(f"렌더 조각의 프레임 수나 길이가 예상과 다릅니다: {candidate_ids}")
+    os.replace(temporary, output)
     return Piece(
         output,
         output_duration,
@@ -1135,17 +1215,51 @@ def source_output_timing(duration: float, fps: int) -> tuple[int, float]:
     return frame_count, frame_count / fps
 
 
+def source_stream_start_delays(clip: Clip, source_start: float, speed: float) -> tuple[float, float]:
+    video_start, audio_start = source_stream_relative_starts(clip.path, clip.fingerprint)
+    return (
+        max(0.0, video_start - source_start) / speed,
+        max(0.0, audio_start - source_start) / speed,
+    )
+
+
+@lru_cache(maxsize=256)
+def source_stream_relative_starts(path: str, fingerprint: str) -> tuple[float, float]:
+    del fingerprint  # The fingerprint makes the memoized probe content-sensitive.
+    try:
+        probe = probe_media(Path(path))
+    except (OSError, VideoSummaryError):
+        return (0.0, 0.0)
+    streams = probe.get("streams", [])
+    video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+    video_start = finite_number(video.get("start_time")) if video else None
+    audio_start = finite_number(audio.get("start_time")) if audio else None
+    format_start = finite_number(probe.get("format", {}).get("start_time"))
+    available = [value for value in (video_start, audio_start) if value is not None]
+    origin = format_start if format_start is not None else (min(available) if available else 0.0)
+    return (
+        max(0.0, (video_start if video_start is not None else origin) - origin),
+        max(0.0, (audio_start if audio_start is not None else origin) - origin),
+    )
+
+
 def source_transition_seconds(config: dict[str, Any], output_duration: float) -> float:
     requested = max(0.0, float(config["render"].get("transition_seconds", 0.18)))
     return min(requested, max(0.0, output_duration) / 3.0)
 
 
 def positive_number(value: Any) -> float | None:
+    parsed = finite_number(value)
+    return parsed if parsed is not None and parsed > 0.0 else None
+
+
+def finite_number(value: Any) -> float | None:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if math.isfinite(parsed) and parsed > 0.0 else None
+    return parsed if math.isfinite(parsed) else None
 
 
 def positive_ratio(value: Any) -> float | None:
@@ -1274,23 +1388,32 @@ def render_card_piece(
     config: dict[str, Any],
     force: bool,
 ) -> Piece:
+    frame_count, effective_duration = source_output_timing(duration, fps)
     key = stable_hash(
         {
             "version": CARD_RENDER_POLICY_VERSION, "id": card_id, "title": title, "subtitle": subtitle,
-            "duration": duration, "format": [width, height, fps, encoder, bitrate],
+            "duration": effective_duration, "frame_count": frame_count,
+            "format": [width, height, fps, encoder, bitrate],
         },
         length=28,
     )
     png = cards_dir / f"{key}.png"
     output = cards_dir / f"{key}.mp4"
-    if output.exists() and not force:
-        return Piece(output, duration, title)
+    if not force and cached_piece_is_usable(
+        output,
+        width,
+        height,
+        expected_frame_count=frame_count,
+        expected_duration=effective_duration,
+        expected_fps=fps,
+    ):
+        return Piece(output, effective_duration, title)
     create_card(png, title, subtitle, width, height, config)
     render_still_image_piece(
         png,
         output,
         card_id,
-        duration,
+        effective_duration,
         width,
         height,
         fps,
@@ -1298,7 +1421,7 @@ def render_card_piece(
         bitrate,
         config,
     )
-    return Piece(output, duration, title)
+    return Piece(output, effective_duration, title)
 
 
 def render_still_image_piece(
@@ -1313,23 +1436,36 @@ def render_still_image_piece(
     bitrate: str,
     config: dict[str, Any],
 ) -> None:
-    fade = card_fade_seconds(card_id, duration)
+    frame_count, effective_duration = source_output_timing(duration, fps)
+    fade = card_fade_seconds(card_id, effective_duration)
     temporary = output.with_name(f".{output.stem}.partial.mp4")
     run_command(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "2",
             "-loop", "1", "-framerate", str(fps), "-i", str(png),
             "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-            "-t", f"{duration:.3f}",
+            "-t", f"{effective_duration:.6f}",
             "-vf", f"fps={fps},format=yuv420p,fade=t=in:st=0:d={fade:.3f},"
-            f"fade=t=out:st={max(0.0, duration - fade):.3f}:d={fade:.3f}",
-            "-af", f"atrim=duration={duration:.3f},asetpts=PTS-STARTPTS",
+            f"fade=t=out:st={max(0.0, effective_duration - fade):.6f}:d={fade:.3f},"
+            f"trim=end_frame={frame_count},setpts=N/({fps}*TB)",
+            "-af", f"atrim=duration={effective_duration:.6f},asetpts=PTS-STARTPTS",
+            "-frames:v", str(frame_count),
             *video_encode_args(encoder, bitrate),
             "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
             "-ar", "48000", "-ac", "2", "-video_track_timescale", "90000",
-            "-movflags", "+faststart", "-shortest", "-y", str(temporary),
+            "-movflags", "+faststart", "-y", str(temporary),
         ]
     )
+    if not cached_piece_is_usable(
+        temporary,
+        width,
+        height,
+        expected_frame_count=frame_count,
+        expected_duration=effective_duration,
+        expected_fps=fps,
+    ):
+        temporary.unlink(missing_ok=True)
+        raise VideoSummaryError(f"카드 렌더의 프레임 수나 길이가 예상과 다릅니다: {card_id}")
     os.replace(temporary, output)
 
 
@@ -1410,46 +1546,65 @@ def assemble_output(
             shutil.copy2(piece.path, target)
         linked.append(target)
     concat_path = assembly_dir / "concat.txt"
-    atomic_write_text(concat_path, "".join(f"file {path.name}\n" for path in linked))
+    concat_lines = ["ffconcat version 1.0"]
+    for piece, path in zip(pieces, linked):
+        concat_lines.extend([f"file {path.name}", f"duration {piece.duration:.9f}"])
+    atomic_write_text(concat_path, "\n".join(concat_lines) + "\n")
     output.parent.mkdir(parents=True, exist_ok=True)
     music_value = str(config["render"].get("music_file", "")).strip()
-    assembled = assembly_dir / "assembled.mp4" if music_value else output.with_name(f".{output.stem}.partial.mp4")
-    run_command(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "1",
-            "-i", concat_path.name, "-c", "copy", "-movflags", "+faststart", "-y", str(assembled),
-        ],
-        cwd=assembly_dir,
-    )
-    if music_value:
-        mix_music(assembled, output, pieces, config, music_value)
-    else:
-        os.replace(assembled, output)
+    expected_duration = sum(piece.duration for piece in pieces)
+    candidate_output = output.with_name(f".{output.stem}.partial.mp4")
+    assembled = assembly_dir / "assembled-audio-normalized.mp4" if music_value else candidate_output
+    candidate_output.unlink(missing_ok=True)
+    if assembled != candidate_output:
+        assembled.unlink(missing_ok=True)
+    try:
+        run_command(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "1",
+                "-i", concat_path.name,
+                "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
+                "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
+                "-ar", "48000", "-ac", "2",
+                "-af", (
+                    "aresample=48000,asetpts=N/SR/TB,"
+                    f"apad=whole_dur={expected_duration:.9f},atrim=duration={expected_duration:.9f}"
+                ),
+                "-movflags", "+faststart", "-y", str(assembled),
+            ],
+            cwd=assembly_dir,
+        )
+        if music_value:
+            mix_music(assembled, candidate_output, pieces, config, music_value)
 
-    metadata_base = output.with_suffix("")
-    write_vtt(metadata_base.with_suffix(".vtt"), pieces, paths)
-    timeline_path = metadata_base.with_suffix(".timeline.txt")
-    write_timeline(timeline_path, pieces)
-    chapters_path = metadata_base.with_suffix(".chapters.txt")
-    if str(config["editing"].get("episode_mode", "daily")) == "trip":
-        chapters = write_trip_day_chapters(chapters_path, pieces)
-    else:
-        chapters = write_chapters(chapters_path, pieces)
-    description = (
-        f"# {episode.title}\n\n{episode.summary}\n\n"
-        + "\n".join(chapters)
-        + "\n\n#여행브이로그 #여행\n"
-    )
-    atomic_write_text(metadata_base.with_suffix(".description.md"), description)
-    probe = probe_media(output)
-    duration = validate_assembled_media(
-        probe,
-        output,
-        width=width,
-        height=height,
-        expected_duration=sum(piece.duration for piece in pieces),
-        expected_fps=int(config["render"].get("fps", 30)),
-    )
+        probe = probe_media(candidate_output)
+        duration = validate_assembled_media(
+            probe,
+            candidate_output,
+            width=width,
+            height=height,
+            expected_duration=expected_duration,
+            expected_fps=int(config["render"].get("fps", 30)),
+        )
+
+        metadata_base = output.with_suffix("")
+        write_vtt(metadata_base.with_suffix(".vtt"), pieces, paths)
+        timeline_path = metadata_base.with_suffix(".timeline.txt")
+        write_timeline(timeline_path, pieces)
+        chapters_path = metadata_base.with_suffix(".chapters.txt")
+        if str(config["editing"].get("episode_mode", "daily")) == "trip":
+            chapters = write_trip_day_chapters(chapters_path, pieces)
+        else:
+            chapters = write_chapters(chapters_path, pieces)
+        description = (
+            f"# {episode.title}\n\n{episode.summary}\n\n"
+            + "\n".join(chapters)
+            + "\n\n#여행브이로그 #여행\n"
+        )
+        atomic_write_text(metadata_base.with_suffix(".description.md"), description)
+        os.replace(candidate_output, output)
+    finally:
+        candidate_output.unlink(missing_ok=True)
     return {
         "path": str(output),
         "duration": round(duration, 3),
@@ -1503,6 +1658,17 @@ def write_vtt(path: Path, pieces: list[Piece], paths: ProjectPaths) -> None:
         for member in piece_source_members(piece):
             candidate = member.candidate
             speed = member.segment.speed
+            caption = normalized_optional_text(member.segment.caption)
+            if caption:
+                start = timeline + member.offset
+                end = min(
+                    timeline + piece.duration,
+                    start + candidate.duration / speed,
+                )
+                if end > start:
+                    lines.extend([str(cue_index), f"{vtt_time(start)} --> {vtt_time(end)}", caption, ""])
+                    cue_index += 1
+                continue
             for cue in load_transcript(paths, candidate.clip_id):
                 source_start = max(candidate.start, cue.start)
                 source_end = min(candidate.end, cue.end)
@@ -1522,7 +1688,7 @@ def write_vtt(path: Path, pieces: list[Piece], paths: ProjectPaths) -> None:
 
 
 def write_chapters(path: Path, pieces: list[Piece]) -> list[str]:
-    lines: list[str] = []
+    boundaries: list[tuple[int, str]] = []
     timeline = 0.0
     previous = ""
     previous_time = float("-inf")
@@ -1531,12 +1697,17 @@ def write_chapters(path: Path, pieces: list[Piece]) -> list[str]:
         for offset, raw_label, _candidate in entries:
             entry_time = timeline + offset
             label = normalize_timeline_label(raw_label)
-            if label and label != previous and (not lines or entry_time - previous_time >= 1.0):
-                lines.append(f"{chapter_time(entry_time)} {label}")
+            if label and label != previous and (not boundaries or entry_time - previous_time >= 1.0):
+                boundaries.append((int(entry_time), label))
                 previous = label
                 previous_time = entry_time
         timeline += piece.duration
-    atomic_write_text(path, "\n".join(lines) + "\n")
+    total_seconds = int(timeline)
+    lines = youtube_chapter_lines(
+        select_daily_youtube_boundaries(boundaries, total_seconds),
+        total_seconds,
+    )
+    atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
     return lines
 
 
@@ -1580,18 +1751,38 @@ def write_trip_day_chapters(path: Path, pieces: list[Piece]) -> list[str]:
         timeline += piece.duration
     if boundaries:
         boundaries[0] = (0, boundaries[0][1])
-    total_seconds = int(timeline)
+    lines = youtube_chapter_lines(boundaries, int(timeline))
+    atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+    return lines
+
+
+def youtube_chapter_lines(boundaries: list[tuple[int, str]], total_seconds: int) -> list[str]:
     valid = (
         len(boundaries) >= YOUTUBE_MIN_CHAPTERS
+        and boundaries[0][0] == 0
         and all(
             current[0] - previous[0] >= YOUTUBE_MIN_CHAPTER_SECONDS
             for previous, current in zip(boundaries, boundaries[1:])
         )
         and total_seconds - boundaries[-1][0] >= YOUTUBE_MIN_CHAPTER_SECONDS
     )
-    lines = [f"{chapter_time(seconds)} {label}" for seconds, label in boundaries] if valid else []
-    atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
-    return lines
+    return [f"{chapter_time(seconds)} {label}" for seconds, label in boundaries] if valid else []
+
+
+def select_daily_youtube_boundaries(
+    boundaries: list[tuple[int, str]],
+    total_seconds: int,
+) -> list[tuple[int, str]]:
+    if not boundaries or boundaries[0][0] != 0:
+        return []
+    selected = [boundaries[0]]
+    for boundary in boundaries[1:]:
+        if (
+            boundary[0] - selected[-1][0] >= YOUTUBE_MIN_CHAPTER_SECONDS
+            and total_seconds - boundary[0] >= YOUTUBE_MIN_CHAPTER_SECONDS
+        ):
+            selected.append(boundary)
+    return selected
 
 
 def normalize_timeline_label(value: str) -> str:

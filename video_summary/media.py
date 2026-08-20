@@ -19,7 +19,7 @@ from .utils import VideoSummaryError, file_fingerprint, print_status, read_json,
 
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mts", ".m2ts", ".avi", ".mkv"}
-_CAPTURE_TIME_POLICY_VERSION = 2
+_CAPTURE_TIME_POLICY_VERSION = 3
 _FILENAME_PATTERNS = (
     re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])[_-]?([0-2]\d)([0-5]\d)([0-5]\d)(?!\d)"),
     re.compile(r"(?<!\d)(20\d{2})[-_](0[1-9]|1[0-2])[-_]([0-2]\d|3[01])[ T_-]([0-2]\d)[-_:]?([0-5]\d)[-_:]?([0-5]\d)(?!\d)"),
@@ -208,9 +208,13 @@ def infer_capture_time(
         override_date = _parse_override_date(str(override.get("date", "")))
         embedded_raw = _creation_time(probe)
         if embedded_raw:
-            embedded = _parse_datetime_raw(embedded_raw)
-            captured = _rebase_capture_date(embedded, override_date, override_timezone)
-            return captured, "date_override:metadata", warnings
+            try:
+                embedded = _parse_datetime_raw(embedded_raw)
+            except VideoSummaryError:
+                warnings.append("메타데이터 촬영 시각을 해석할 수 없어 무시했습니다.")
+            else:
+                captured = _rebase_capture_date(embedded, override_date, override_timezone)
+                return captured, "date_override:metadata", warnings
 
         filename_time = _filename_datetime(path.name, override_timezone)
         if filename_time:
@@ -225,10 +229,14 @@ def infer_capture_time(
     embedded_raw = _creation_time(probe)
     filename_time = _filename_datetime(path.name, timezone)
     if embedded_raw:
-        embedded = _parse_datetime(embedded_raw, timezone)
-        if filename_time and abs((embedded - filename_time).total_seconds()) > 12 * 3600:
-            warnings.append("메타데이터 시각과 파일명 시각이 12시간 이상 다릅니다.")
-        return embedded, "metadata", warnings
+        try:
+            embedded = _parse_datetime(embedded_raw, timezone)
+        except VideoSummaryError:
+            warnings.append("메타데이터 촬영 시각을 해석할 수 없어 무시했습니다.")
+        else:
+            if filename_time and abs((embedded - filename_time).total_seconds()) > 12 * 3600:
+                warnings.append("메타데이터 시각과 파일명 시각이 12시간 이상 다릅니다.")
+            return embedded, "metadata", warnings
     if filename_time:
         return filename_time, "filename", warnings
 
@@ -236,23 +244,62 @@ def infer_capture_time(
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone), "mtime", warnings
 
 
-def resolve_location(relative_path: Path, day_key: str, rules: Any) -> str | None:
+def resolve_location(
+    relative_path: Path,
+    day_key: str,
+    rules: Any,
+    *,
+    transcript: str | None = None,
+) -> str | None:
+    """Resolve the first matching path, day, or transcript location rule.
+
+    ``day_key`` always scopes a rule. ``match`` and ``keywords`` are alternate
+    selectors so a location can be recognized from either its source path or its
+    spoken transcript. A rule without ``match`` is only an implicit wildcard when
+    it also has no keywords; this keeps keyword-only rules from labeling clips
+    before transcription is available.
+    """
     if not isinstance(rules, list):
         return None
     relative = str(relative_path)
+    lowered_transcript = transcript.casefold() if transcript is not None else None
     for rule in rules:
         if not isinstance(rule, dict):
             continue
         if rule.get("day_key") and str(rule["day_key"]) != day_key:
             continue
-        patterns = rule.get("match", ["*"])
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        if any(fnmatch.fnmatch(relative, str(pattern)) or fnmatch.fnmatch(relative_path.name, str(pattern)) for pattern in patterns):
-            label = str(rule.get("label", "")).strip()
-            if label:
-                return label
+
+        keywords = _location_keywords(rule)
+        has_keyword_selector = "keywords" in rule
+        raw_patterns = rule.get("match")
+        if raw_patterns is None:
+            path_matches = not has_keyword_selector
+        else:
+            patterns = [raw_patterns] if isinstance(raw_patterns, str) else raw_patterns
+            path_matches = isinstance(patterns, list) and any(
+                fnmatch.fnmatch(relative, str(pattern))
+                or fnmatch.fnmatch(relative_path.name, str(pattern))
+                for pattern in patterns
+            )
+        transcript_matches = lowered_transcript is not None and any(
+            keyword in lowered_transcript for keyword in keywords
+        )
+        if not (path_matches or transcript_matches):
+            continue
+
+        label = str(rule.get("label", "")).strip()
+        if label:
+            return label
     return None
+
+
+def _location_keywords(rule: dict[str, Any]) -> list[str]:
+    raw_keywords = rule.get("keywords", [])
+    if isinstance(raw_keywords, str):
+        raw_keywords = [raw_keywords]
+    if not isinstance(raw_keywords, list):
+        return []
+    return [str(keyword).strip().casefold() for keyword in raw_keywords if str(keyword).strip()]
 
 
 def analyze_visual_signals(

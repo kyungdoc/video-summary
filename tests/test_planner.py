@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 import unittest
+from pathlib import Path
 
 from video_summary.models import Candidate
 from video_summary.planner import (
     _planner_candidates_payload,
     _prompt_role_weights,
+    _sample_contact_sheets,
     local_plan,
     validate_and_normalize_plan,
 )
@@ -183,6 +185,37 @@ class PlannerTests(unittest.TestCase):
         exported = payload["candidates"][0]
         self.assertNotIn("transcript", exported)
         self.assertLessEqual(len(exported["transcript_excerpt"]), 240)
+
+    def test_contact_sheet_sampling_spans_the_full_trip(self) -> None:
+        sheets = [Path(f"sheet-{index:03d}.jpg") for index in range(1, 31)]
+
+        selected = _sample_contact_sheets(sheets)
+
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(selected[0], sheets[0])
+        self.assertEqual(selected[-1], sheets[-1])
+        self.assertEqual(selected, sorted(selected))
+        self.assertEqual(len(set(selected)), len(selected))
+        self.assertGreater(selected[10], sheets[10])
+
+    def test_contact_sheet_sampling_keeps_a_small_middle_day(self) -> None:
+        sheets = [Path(f"sheet-{index:03d}.jpg") for index in range(1, 31)]
+        sheet_day_keys = (
+            [("2026-08-19",)] * 2
+            + [("2026-08-20",)]
+            + [("2026-08-21",)] * 27
+        )
+
+        selected = _sample_contact_sheets(sheets, sheet_day_keys)
+
+        self.assertEqual(len(selected), 20)
+        self.assertIn(sheets[2], selected)
+        self.assertEqual(selected[0], sheets[0])
+        self.assertEqual(selected[-1], sheets[-1])
+
+    def test_contact_sheet_sampling_preserves_small_inputs(self) -> None:
+        sheets = [Path("sheet-001.jpg"), Path("sheet-002.jpg")]
+        self.assertEqual(_sample_contact_sheets(sheets), sheets)
 
     def test_plan_rejects_overlapping_ranges_from_the_same_clip(self) -> None:
         first, second = self.candidates

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .media import analyze_visual_signals, extract_frame, load_clips
+from .media import analyze_visual_signals, extract_frame, load_clips, resolve_location
 from .models import Candidate, Clip, TranscriptCue
 from .project import ProjectPaths
 from .state import StateStore
@@ -157,7 +157,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 8,
+            "version": 9,
             "project": config["project"]["name"],
             "clips": [
                 (
@@ -436,22 +436,12 @@ def _score_candidate(
 
 
 def _candidate_location(clip: Clip, transcript: str, rules: Any) -> str | None:
-    if clip.location:
-        return clip.location
-    if not isinstance(rules, list):
-        return None
-    lowered = transcript.casefold()
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        keywords = rule.get("keywords", [])
-        if isinstance(keywords, str):
-            keywords = [keywords]
-        if any(str(keyword).casefold() in lowered for keyword in keywords):
-            label = str(rule.get("label", "")).strip()
-            if label:
-                return label
-    return None
+    return resolve_location(
+        Path(clip.relative_path),
+        clip.day_key,
+        rules,
+        transcript=transcript,
+    )
 
 
 def _day_summary(candidates: list[Candidate]) -> list[dict[str, Any]]:

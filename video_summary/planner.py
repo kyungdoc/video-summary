@@ -20,6 +20,8 @@ from .utils import VideoSummaryError, atomic_write_text, command_exists, file_fi
 
 ALLOWED_ROLES = {"hook", "journey", "fun", "food", "scenery", "dialogue", "transition", "closing", "moment"}
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
+MAX_CODEX_CONTACT_SHEETS = 20
+CONTACT_SHEET_CANDIDATES = 12
 
 
 def plan_project(
@@ -50,7 +52,7 @@ def plan_project(
     plan_file_key = file_fingerprint(plan_file_path) if plan_file_path and plan_file_path.exists() else None
     cache_key = stable_hash(
         {
-            "version": 8,
+            "version": 9,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "prompt": editing_prompt,
@@ -100,7 +102,14 @@ def plan_project(
                     if use_images
                     else []
                 )
-                raw = invoke_external_planner(planner_name, external_workspace, request, schema, sheets)
+                raw = invoke_external_planner(
+                    planner_name,
+                    external_workspace,
+                    request,
+                    schema,
+                    sheets,
+                    sheet_day_keys=_contact_sheet_day_keys(candidates),
+                )
                 write_json(paths.planner / f"{planner_name}-raw.json", raw)
                 plan = validate_and_normalize_plan(raw, config, editing_prompt, candidates, candidate_set_hash, planner_name)
             except Exception as exc:
@@ -434,7 +443,7 @@ def build_contact_sheets(
     font = load_font(font_path, 18)
     small_font = load_font(font_path, 14)
     sheets: list[Path] = []
-    per_sheet = 12
+    per_sheet = CONTACT_SHEET_CANDIDATES
     cell_width, cell_height = 320, 220
     for sheet_index in range(0, len(candidates), per_sheet):
         page = candidates[sheet_index : sheet_index + per_sheet]
@@ -461,12 +470,63 @@ def build_contact_sheets(
     return sheets
 
 
+def _contact_sheet_day_keys(candidates: list[Candidate]) -> list[tuple[str, ...]]:
+    result: list[tuple[str, ...]] = []
+    for offset in range(0, len(candidates), CONTACT_SHEET_CANDIDATES):
+        page = candidates[offset : offset + CONTACT_SHEET_CANDIDATES]
+        result.append(tuple(dict.fromkeys(candidate.day_key for candidate in page)))
+    return result
+
+
+def _sample_positions(count: int, limit: int) -> list[int]:
+    if count <= 0 or limit <= 0:
+        return []
+    if count <= limit:
+        return list(range(count))
+    if limit == 1:
+        return [count // 2]
+    return [index * (count - 1) // (limit - 1) for index in range(limit)]
+
+
+def _sample_contact_sheets(
+    sheets: list[Path],
+    sheet_day_keys: list[tuple[str, ...]] | None = None,
+    limit: int = MAX_CODEX_CONTACT_SHEETS,
+) -> list[Path]:
+    """Select chronological sheets while representing each DAY when possible."""
+    if limit <= 0 or not sheets:
+        return []
+    if len(sheets) <= limit:
+        return list(sheets)
+    if not sheet_day_keys or len(sheet_day_keys) != len(sheets):
+        return [sheets[index] for index in _sample_positions(len(sheets), limit)]
+
+    ordered_days = list(dict.fromkeys(day for day_keys in sheet_day_keys for day in day_keys))
+    representative_days = [
+        ordered_days[index]
+        for index in _sample_positions(len(ordered_days), min(len(ordered_days), limit))
+    ]
+    selected_indices = {
+        next(index for index, day_keys in enumerate(sheet_day_keys) if day in day_keys)
+        for day in representative_days
+    }
+
+    remaining = [index for index in range(len(sheets)) if index not in selected_indices]
+    remaining_slots = limit - len(selected_indices)
+    selected_indices.update(
+        remaining[index] for index in _sample_positions(len(remaining), remaining_slots)
+    )
+    return [sheets[index] for index in sorted(selected_indices)]
+
+
 def invoke_external_planner(
     planner_name: str,
     workspace: Path,
     request: str,
     schema: dict[str, Any],
     sheets: list[Path],
+    *,
+    sheet_day_keys: list[tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     schema_path = workspace / "edit-plan.schema.json"
     raw_path = workspace / f"{planner_name}-last-message.json"
@@ -487,7 +547,34 @@ def invoke_external_planner(
             "--output-last-message",
             str(raw_path),
         ]
-        for sheet in sheets[:20]:
+        selected_sheets = _sample_contact_sheets(sheets, sheet_day_keys)
+        if len(selected_sheets) < len(sheets):
+            print_status(
+                f"planner: contact sheet {len(sheets)}개 중 전체 여행을 대표하는 "
+                f"{len(selected_sheets)}개를 균등 선택"
+            )
+            if sheet_day_keys and len(sheet_day_keys) == len(sheets):
+                selected_paths = set(selected_sheets)
+                represented_days = {
+                    day
+                    for sheet, day_keys in zip(sheets, sheet_day_keys)
+                    if sheet in selected_paths
+                    for day in day_keys
+                }
+                omitted_days = list(
+                    dict.fromkeys(
+                        day
+                        for day_keys in sheet_day_keys
+                        for day in day_keys
+                        if day not in represented_days
+                    )
+                )
+                if omitted_days:
+                    print_status(
+                        f"planner: 이미지 제한으로 DAY {len(omitted_days)}개가 contact sheet 입력에서 누락됨 "
+                        f"({', '.join(omitted_days)})"
+                    )
+        for sheet in selected_sheets:
             args.extend(["--image", str(sheet)])
         args.append("-")
         run_command(args, input_text=request)

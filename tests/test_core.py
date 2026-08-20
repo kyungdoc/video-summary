@@ -3,14 +3,21 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from video_summary.media import _day_key, _filename_datetime, _rebase_capture_date, infer_capture_time
+from video_summary.media import (
+    _day_key,
+    _filename_datetime,
+    _rebase_capture_date,
+    infer_capture_time,
+    resolve_location,
+)
 from video_summary.cli import build_parser, parse_target_minutes
 from video_summary.models import Clip, TranscriptCue
 from video_summary.pipeline import _help_has_flag
@@ -66,6 +73,44 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(captured.isoformat(), "2026-08-18T10:30:45+09:00")
         self.assertTrue(warnings)
 
+    def test_invalid_metadata_falls_back_to_filename_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "DJI_20260819_013045_001_D.MP4"
+            path.write_bytes(b"x")
+            probe = {"format": {"tags": {"creation_time": "not-a-timestamp"}}}
+            captured, source, warnings = infer_capture_time(
+                path, Path(path.name), probe, ZoneInfo("Asia/Seoul"), []
+            )
+        self.assertEqual(source, "filename")
+        self.assertEqual(captured.isoformat(), "2026-08-19T01:30:45+09:00")
+        self.assertIn("메타데이터 촬영 시각을 해석할 수 없어 무시했습니다.", warnings)
+
+    def test_invalid_metadata_falls_back_to_mtime_with_and_without_date_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "clip.mp4"
+            path.write_bytes(b"x")
+            fixed_mtime = datetime(2026, 1, 15, 12, 34, 56, tzinfo=timezone.utc).timestamp()
+            os.utime(path, (fixed_mtime, fixed_mtime))
+            probe = {"format": {"tags": {"creation_time": "not-a-timestamp"}}}
+
+            captured, source, warnings = infer_capture_time(
+                path, Path(path.name), probe, ZoneInfo("Asia/Seoul"), []
+            )
+            overridden, override_source, override_warnings = infer_capture_time(
+                path,
+                Path("day") / path.name,
+                probe,
+                ZoneInfo("Asia/Seoul"),
+                [{"match": "day/*", "date": "2026-05-18", "timezone": "America/Los_Angeles"}],
+            )
+
+        self.assertEqual(captured.isoformat(), "2026-01-15T21:34:56+09:00")
+        self.assertEqual(source, "mtime")
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(overridden.isoformat(), "2026-05-18T04:34:56-07:00")
+        self.assertEqual(override_source, "date_override:mtime")
+        self.assertEqual(len(override_warnings), 2)
+
     def test_date_override_rebases_utc_clock_to_real_local_date_and_dst(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "DJI_20000102005724_0011_D.MP4"
@@ -104,6 +149,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(source, "date_override:filename")
         self.assertFalse(warnings)
 
+    def test_date_override_invalid_metadata_falls_back_to_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "DJI_20000103001428_0031_D.MP4"
+            path.write_bytes(b"x")
+            captured, source, warnings = infer_capture_time(
+                path,
+                Path("0518") / path.name,
+                {"format": {"tags": {"creation_time": "broken"}}},
+                ZoneInfo("Asia/Seoul"),
+                [{"match": "0518/*", "date": "2026-05-18", "timezone": "America/Los_Angeles"}],
+            )
+        self.assertEqual(captured.isoformat(), "2026-05-18T00:14:28-07:00")
+        self.assertEqual(source, "date_override:filename")
+        self.assertIn("메타데이터 촬영 시각을 해석할 수 없어 무시했습니다.", warnings)
+
     def test_date_override_rejects_ambiguous_or_missing_dst_wall_time(self) -> None:
         cases = (
             ("2024-03-10", "2000-01-01T02:30:00"),
@@ -126,6 +186,39 @@ class CoreTests(unittest.TestCase):
         timezone = ZoneInfo("America/Los_Angeles")
         self.assertEqual(_day_key(datetime(2026, 5, 18, 3, 59, 59, 999999, tzinfo=timezone), 4), "2026-05-17")
         self.assertEqual(_day_key(datetime(2026, 5, 18, 4, 0, tzinfo=timezone), 4), "2026-05-18")
+
+    def test_location_scan_skips_keyword_only_rule_and_keeps_rule_order(self) -> None:
+        rules = [
+            {
+                "label": "인천국제공항",
+                "day_key": "2026-08-20",
+                "keywords": ["공항", "탑승"],
+            },
+            {"label": "오키나와 · 나하", "day_key": "2026-08-20", "match": ["*"]},
+            {"label": "다른 날짜", "match": ["*"]},
+        ]
+        relative = Path("day-02/DJI_0002.MP4")
+        self.assertEqual(resolve_location(relative, "2026-08-20", rules), "오키나와 · 나하")
+        self.assertEqual(
+            resolve_location(relative, "2026-08-20", rules, transcript="공항에 도착했다"),
+            "인천국제공항",
+        )
+        self.assertEqual(
+            resolve_location(relative, "2026-08-21", rules, transcript="공항에 도착했다"),
+            "다른 날짜",
+        )
+
+    def test_empty_keyword_selector_is_not_an_implicit_wildcard(self) -> None:
+        relative = Path("day-02/DJI_0002.MP4")
+        for keywords in ([], "", [" "]):
+            with self.subTest(keywords=keywords):
+                self.assertIsNone(
+                    resolve_location(
+                        relative,
+                        "2026-08-20",
+                        [{"label": "공항", "keywords": keywords}],
+                    )
+                )
 
     def test_config_rejects_nan_and_bad_worker_count(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
