@@ -436,8 +436,8 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(card_fade_seconds("date-day-1", 3.0), 0.5)
         self.assertEqual(card_fade_seconds("trip-outro", 0.4), 0.1)
 
-    def test_audio_sanitizing_policy_invalidates_render_and_source_caches(self) -> None:
-        self.assertEqual(RENDER_POLICY_VERSION, 16)
+    def test_audio_assembly_policy_invalidates_completed_render_but_reuses_sources(self) -> None:
+        self.assertEqual(RENDER_POLICY_VERSION, 17)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
 
     def test_regular_cards_use_integer_frame_durations_without_accumulated_drift(self) -> None:
@@ -705,6 +705,120 @@ class RendererTests(unittest.TestCase):
 
             self.assertGreater(max(abs(sample) for sample in window), 3000)
             self.assertLess(longest_quiet_run, 480)  # No AAC-frame-scale silence at the boundary.
+
+    @unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg/FFprobe are required")
+    def test_many_aac_pieces_keep_late_audio_marker_within_one_video_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = ProjectPaths(root, "trip")
+            paths.ensure()
+            tone = root / "tone.mp4"
+            silence = root / "silence.mp4"
+            # A cached source piece may validly have up to one AAC frame plus one
+            # video frame less decoded audio than its exact video duration. The
+            # assembler must honor that timestamp gap instead of deleting it at
+            # every boundary and accumulating A/V drift.
+            for path, audio_source, color, audio_filter in (
+                (
+                    tone,
+                    "sine=frequency=440:sample_rate=48000:duration=0.47",
+                    "blue",
+                    "aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:"
+                    "channel_layouts=stereo,loudnorm=I=-16:LRA=11:TP=-1.5,"
+                    "aresample=48000:osf=s16,aformat=sample_fmts=fltp:sample_rates=48000:"
+                    "channel_layouts=stereo,atrim=duration=0.47,asetpts=PTS-STARTPTS",
+                ),
+                (
+                    silence,
+                    "anullsrc=r=48000:cl=stereo:d=0.47",
+                    "red",
+                    "atrim=duration=0.47,asetpts=PTS-STARTPTS",
+                ),
+            ):
+                subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", f"color=c={color}:s=160x90:r=30:d=0.5",
+                        "-f", "lavfi", "-i", audio_source,
+                        "-map", "0:v:0", "-map", "1:a:0", "-frames:v", "15", "-t", "0.5",
+                        "-af", audio_filter,
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                        "-video_track_timescale", "90000", "-y", str(path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+
+            marker_piece_index = 28
+            piece_duration = 0.5
+            pieces = [
+                Piece(tone, piece_duration, f"tone {index}")
+                for index in range(marker_piece_index)
+            ]
+            pieces.append(Piece(silence, piece_duration, "late silent marker"))
+            pieces.extend(
+                Piece(tone, piece_duration, f"tail tone {index}")
+                for index in range(10)
+            )
+            expected_duration = len(pieces) * piece_duration
+            expected_marker_start = marker_piece_index * piece_duration
+            expected_marker_end = expected_marker_start + piece_duration
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config["render"]["fps"] = 30
+            output = paths.exports / "summary.mp4"
+            assemble_output(
+                pieces,
+                output,
+                Episode("2026-08-19", 1, "DAY 1", "", "", expected_duration, []),
+                paths,
+                config,
+                paths.render / "assembly",
+                160,
+                90,
+                False,
+            )
+            decoded = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(output),
+                    "-map", "0:a:0", "-f", "s16le", "-acodec", "pcm_s16le",
+                    "-ar", "48000", "-ac", "1", "pipe:1",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            samples = array.array("h")
+            samples.frombytes(decoded)
+            sample_rate = 48000
+            search_start = int((expected_marker_start - 2.0) * sample_rate)
+            search_end = int((expected_marker_end + 2.0) * sample_rate)
+            longest_start = search_start
+            longest_end = search_start
+            current_start: int | None = None
+            for index in range(search_start, min(search_end, len(samples))):
+                if abs(samples[index]) < 300:
+                    if current_start is None:
+                        current_start = index
+                    if index + 1 - current_start > longest_end - longest_start:
+                        longest_start = current_start
+                        longest_end = index + 1
+                else:
+                    current_start = None
+
+            detected_start = longest_start / sample_rate
+            detected_end = longest_end / sample_rate
+            frame_duration = 1.0 / config["render"]["fps"]
+            self.assertGreater(detected_end - detected_start, 0.35)
+            self.assertLess(
+                abs(detected_start - expected_marker_start),
+                frame_duration,
+                f"detected marker {detected_start:.6f}..{detected_end:.6f}",
+            )
+            self.assertLess(
+                abs(detected_end - expected_marker_end),
+                frame_duration,
+                f"detected marker {detected_start:.6f}..{detected_end:.6f}",
+            )
 
     def test_source_piece_has_exact_frame_timing_and_soft_transition(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
@@ -981,6 +1095,61 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(vtt.count("second cue"), 1)
         self.assertIn("00:00:02.000 journey [first]", timeline)
         self.assertIn("00:00:07.000 scenery [second]", timeline)
+
+    def test_vtt_merges_an_identical_transcript_cue_split_across_source_members(self) -> None:
+        first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
+        second = candidate("second", "2026-08-19T08:00:00+09:00", 5.0)
+        first_segment = PlanSegment(first.candidate_id, "journey", "")
+        second_segment = PlanSegment(second.candidate_id, "journey", "")
+        piece = Piece(
+            Path("source.mp4"),
+            10.0,
+            "journey",
+            first,
+            first_segment,
+            source_members=(
+                SourceMember(first, first_segment, 0.0, "journey"),
+                SourceMember(second, second_segment, 5.0, "journey"),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = ProjectPaths(root, "trip")
+            paths.ensure()
+            output = root / "captions.vtt"
+            with patch(
+                "video_summary.renderer.load_transcript",
+                return_value=[TranscriptCue(4.25, 5.75, "boundary cue")],
+            ):
+                write_vtt(output, [piece], paths)
+            rendered = output.read_text(encoding="utf-8")
+
+        self.assertEqual(rendered.count("boundary cue"), 1)
+        self.assertIn("00:00:04.250 --> 00:00:05.750\nboundary cue", rendered)
+
+    def test_vtt_keeps_distinct_and_meaningfully_separated_cues(self) -> None:
+        item = candidate("source", "2026-08-19T08:00:00+09:00", 0.0)
+        item.end = 10.0
+        segment = PlanSegment(item.candidate_id, "dialogue", "")
+        piece = Piece(Path("source.mp4"), 10.0, "dialogue", item, segment)
+        cues = [
+            TranscriptCue(1.0, 2.0, "same text"),
+            TranscriptCue(2.0, 3.0, "different text"),
+            TranscriptCue(3.1, 4.0, "same text"),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = ProjectPaths(root, "trip")
+            paths.ensure()
+            output = root / "captions.vtt"
+            with patch("video_summary.renderer.load_transcript", return_value=cues):
+                write_vtt(output, [piece], paths)
+            rendered = output.read_text(encoding="utf-8")
+
+        self.assertEqual(rendered.count("same text"), 2)
+        self.assertEqual(rendered.count("different text"), 1)
+        self.assertLess(rendered.index("same text"), rendered.index("different text"))
+        self.assertIn("00:00:03.100 --> 00:00:04.000\nsame text", rendered)
 
     def test_custom_caption_overrides_transcript_and_captions_silent_candidate(self) -> None:
         first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)

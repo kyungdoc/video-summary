@@ -43,7 +43,7 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 16
+RENDER_POLICY_VERSION = 17
 SOURCE_RENDER_POLICY_VERSION = 8
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
@@ -1581,7 +1581,12 @@ def assemble_output(
                 "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
                 "-ar", "48000", "-ac", "2",
                 "-af", (
-                    "aresample=48000,asetpts=N/SR/TB,"
+                    # Compensate against concat-demuxer timestamps before rebuilding a
+                    # continuous sample clock. Repacking decoded AAC directly with N/SR/TB
+                    # drops each piece's priming/edit-list gap and makes audio run
+                    # progressively ahead of video in long assemblies.
+                    "aresample=48000:async=1:first_pts=0:min_hard_comp=0.0001,"
+                    "asetpts=N/SR/TB,"
                     f"apad=whole_dur={expected_duration:.9f},atrim=duration={expected_duration:.9f}"
                 ),
                 "-movflags", "+faststart", "-y", str(assembled),
@@ -1664,10 +1669,36 @@ def mix_music(
     os.replace(temporary, output)
 
 
+VTT_BOUNDARY_TOLERANCE_SECONDS = 0.05
+
+
+def append_vtt_cue(
+    cues: list[tuple[float, float, str]],
+    start: float,
+    end: float,
+    text: str,
+    *,
+    boundary_tolerance: float = VTT_BOUNDARY_TOLERANCE_SECONDS,
+) -> None:
+    normalized_text = text.strip()
+    if end <= start or not normalized_text:
+        return
+    if cues:
+        previous_start, previous_end, previous_text = cues[-1]
+        boundary_gap = start - previous_end
+        if (
+            normalized_text == previous_text
+            and start >= previous_start
+            and boundary_gap <= boundary_tolerance
+        ):
+            cues[-1] = (previous_start, max(previous_end, end), previous_text)
+            return
+    cues.append((start, end, normalized_text))
+
+
 def write_vtt(path: Path, pieces: list[Piece], paths: ProjectPaths) -> None:
-    lines = ["WEBVTT", ""]
+    cues: list[tuple[float, float, str]] = []
     timeline = 0.0
-    cue_index = 1
     for piece in pieces:
         for member in piece_source_members(piece):
             candidate = member.candidate
@@ -1679,9 +1710,7 @@ def write_vtt(path: Path, pieces: list[Piece], paths: ProjectPaths) -> None:
                     timeline + piece.duration,
                     start + candidate.duration / speed,
                 )
-                if end > start:
-                    lines.extend([str(cue_index), f"{vtt_time(start)} --> {vtt_time(end)}", caption, ""])
-                    cue_index += 1
+                append_vtt_cue(cues, start, end, caption)
                 continue
             for cue in load_transcript(paths, candidate.clip_id):
                 source_start = max(candidate.start, cue.start)
@@ -1693,11 +1722,11 @@ def write_vtt(path: Path, pieces: list[Piece], paths: ProjectPaths) -> None:
                     timeline + piece.duration,
                     timeline + member.offset + (source_end - candidate.start) / speed,
                 )
-                if end <= start:
-                    continue
-                lines.extend([str(cue_index), f"{vtt_time(start)} --> {vtt_time(end)}", cue.text.strip(), ""])
-                cue_index += 1
+                append_vtt_cue(cues, start, end, cue.text)
         timeline += piece.duration
+    lines = ["WEBVTT", ""]
+    for cue_index, (start, end, text) in enumerate(cues, start=1):
+        lines.extend([str(cue_index), f"{vtt_time(start)} --> {vtt_time(end)}", text, ""])
     atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
 
 
