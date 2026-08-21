@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         if command in {"init", "scan", "analyze", "plan", "run"}:
             _add_project_overrides(item)
         if command == "render":
+            item.add_argument("--destination", help="인트로에 표시할 여행지 이름; 생략하면 자동 추론")
             item.add_argument("--episode-mode", choices=["daily", "trip"])
             item.add_argument("--resolution", choices=["720p", "1080p", "2160p"])
         if command in {"analyze", "plan", "run"}:
@@ -74,6 +75,7 @@ def _command_help(command: str) -> str:
 
 
 def _add_project_overrides(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--destination", help="인트로에 표시할 여행지 이름; 생략하면 자동 추론")
     parser.add_argument("--prompt", help="자연어 편집 프롬프트")
     parser.add_argument("--prompt-file", help="프롬프트가 담긴 UTF-8 파일")
     parser.add_argument("--timezone", help="예: Asia/Seoul")
@@ -212,6 +214,7 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
             if inferred_target is not None:
                 config["editing"]["target_minutes_per_day"] = inferred_target
     mapping = {
+        "destination": ("project", "destination"),
         "timezone": ("project", "timezone"),
         "day_start_hour": ("project", "day_start_hour"),
         "language": ("project", "language"),

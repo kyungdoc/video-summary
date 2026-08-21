@@ -13,6 +13,7 @@ from PIL import Image, ImageOps
 
 from .animated_mosaic import ANIMATED_MOSAIC_POLICY_VERSION, render_animated_mosaic
 from .candidates import load_candidates
+from .intro_metadata import format_day_period, resolve_intro_metadata
 from .media import load_clips, probe_media
 from .models import Candidate, Clip, EditPlan, Episode, PlanSegment
 from .planner import validate_and_normalize_plan
@@ -42,7 +43,7 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 14
+RENDER_POLICY_VERSION = 15
 SOURCE_RENDER_POLICY_VERSION = 7
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
@@ -92,6 +93,7 @@ def render_cache_key(
     version: int,
     font_signature: list[dict[str, str]] | None = None,
     trip_intro_signature: list[dict[str, str]] | None = None,
+    intro_metadata: dict[str, Any] | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "version": version,
@@ -112,6 +114,8 @@ def render_cache_key(
             "grid": [grid_size, grid_size],
             "frames": trip_intro_signature,
         }
+    if version >= 15:
+        payload["intro_metadata"] = intro_metadata or {}
     return stable_hash(payload, length=32)
 
 
@@ -204,6 +208,12 @@ def render_project(
     mode = str(config["editing"].get("episode_mode", "daily"))
     candidate_by_id = {item.candidate_id: item for item in candidates}
     ordered_episodes = sorted(validated.episodes, key=lambda item: (item.travel_day, item.day_key))
+    manifest = read_json(paths.manifest)
+    intro_metadata = resolve_intro_metadata(
+        config,
+        manifest,
+        (episode.day_key for episode in ordered_episodes),
+    )
     trip_intro_signature: list[dict[str, str]] | None = None
     if mode == "trip" and render_config.get("trip_intro_style") == "mosaic":
         grid_size = configured_mosaic_grid_size(render_config)
@@ -226,6 +236,7 @@ def render_project(
         version=RENDER_POLICY_VERSION,
         font_signature=render_font_signature(config),
         trip_intro_signature=trip_intro_signature,
+        intro_metadata=intro_metadata.to_dict(),
     )
     legacy_cache_key = render_cache_key(
         validated, clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
@@ -273,6 +284,8 @@ def render_project(
                     draft,
                     include_intro=True,
                     include_outro=True,
+                    intro_title=intro_metadata.destination,
+                    intro_subtitle=format_day_period(episode.day_key),
                     force=force,
                     legacy_segments_dirs=legacy_segments_dirs,
                 )
@@ -296,8 +309,8 @@ def render_project(
                 candidate_by_id,
                 paths.root,
                 cards_dir,
-                validated.project,
-                trip_date_range(ordered_episodes),
+                intro_metadata.destination,
+                intro_metadata.period,
                 float(render_config.get("intro_seconds", 4.0)),
                 width,
                 height,
@@ -336,7 +349,7 @@ def render_project(
                     cards_dir,
                     "trip-outro",
                     str(render_config.get("outro_text", "여행은 계속됩니다")),
-                    validated.project,
+                    intro_metadata.destination,
                     float(render_config.get("outro_seconds", 5.0)),
                     width,
                     height,
@@ -350,9 +363,9 @@ def render_project(
             summary_episode = Episode(
                 day_key=ordered_episodes[0].day_key,
                 travel_day=1,
-                title=validated.project,
-                subtitle=trip_date_range(ordered_episodes),
-                summary=f"{trip_date_range(ordered_episodes)} 동안의 여정과 재미있는 순간을 날짜 순서대로 담았습니다.",
+                title=intro_metadata.destination,
+                subtitle=intro_metadata.period,
+                summary=f"{intro_metadata.period} 동안의 여정과 재미있는 순간을 날짜 순서대로 담았습니다.",
                 target_duration=sum(episode.target_duration for episode in ordered_episodes),
                 segments=[],
             )
@@ -370,7 +383,7 @@ def render_project(
                 )
             )
         report = {
-            "version": 2,
+            "version": 3,
             "cache_key": cache_key,
             "project": validated.project,
             "planner": validated.planner,
@@ -379,6 +392,7 @@ def render_project(
             "fps": fps,
             "mode": mode,
             "draft": draft,
+            "intro_metadata": intro_metadata.to_dict(),
             "outputs": outputs,
         }
         if trip_intro_report is not None:
@@ -422,6 +436,8 @@ def episode_pieces(
     include_intro: bool,
     include_outro: bool,
     force: bool,
+    intro_title: str | None = None,
+    intro_subtitle: str | None = None,
     legacy_segments_dirs: tuple[Path, ...] = (),
 ) -> list[Piece]:
     pieces: list[Piece] = []
@@ -433,7 +449,10 @@ def episode_pieces(
     if include_intro:
         pieces.append(
             render_card_piece(
-                cards_dir, f"intro-day-{episode.travel_day}", plan.project, episode.title,
+                cards_dir,
+                f"intro-day-{episode.travel_day}",
+                intro_title or plan.project,
+                intro_subtitle or episode.subtitle,
                 float(render_config.get("intro_seconds", 4.0)), width, height, fps, encoder, bitrate, config, force,
             )
         )
@@ -554,14 +573,6 @@ def resolution(value: str) -> tuple[int, int]:
 
 def configured_mosaic_grid_size(render_config: dict[str, Any]) -> int:
     return int(render_config.get("trip_intro_grid_size", MOSAIC_COLUMNS))
-
-
-def trip_date_range(episodes: list[Episode]) -> str:
-    if not episodes:
-        return ""
-    if len(episodes) == 1:
-        return episodes[0].day_key
-    return f"{episodes[0].day_key} — {episodes[-1].day_key}"
 
 
 def render_trip_intro_piece(

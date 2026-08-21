@@ -39,6 +39,10 @@ uv run --frozen video-summary run \
 
 `--source-dir`는 읽기 전용 원본 경로이고, `--workspace`는 캐시와 최종 결과의 소유 경로입니다. 외장 드라이브의 원본을 복사하거나 수정하지 않습니다. 다만 manifest는 절대 원본 경로를 기억하므로 렌더가 끝날 때까지 드라이브 경로를 유지해야 합니다.
 
+첫 인트로의 큰 제목은 내부 `--project` ID와 분리된 여행지 이름입니다. 기본값은 원본 폴더명에서 선행 날짜와 `trip/raw/videos` 같은 일반 토큰을 걷어내고, 더 구체적인 지명이 함께 있으면 국가 접두어도 제외해 추론합니다. 국가명만 있는 여행은 그 국가명을 유지하며, `DCIM`·`100MEDIA`처럼 목적지를 알 수 없는 카메라 폴더에서는 프로젝트명으로 돌아갑니다. 예를 들어 `2512_vietnam-phuquoc`, `2605_japan-okinawa`, `2605_usa-SF`는 각각 `Phu Quoc`, `Okinawa`, `San Francisco`가 됩니다. 원하는 표기가 있으면 `--destination "푸꾸옥"` 또는 `project.yaml`의 `project.destination`으로 명시할 수 있으며, `render --destination ...`만 다시 실행해도 source segment 캐시는 재사용됩니다.
+
+여행기간은 폴더명의 숫자로 추측하지 않고 scan이 시간대·`day_start_hour`·`date_overrides`를 적용해 확정한 모든 `day_key`의 처음과 끝으로 계산합니다. trip 인트로에는 전체 범위, daily 인트로에는 해당 DAY 날짜가 표시됩니다. 날짜가 틀렸다면 표시 문자열을 덮어쓰는 대신 촬영일 설정을 바로잡고 scan부터 다시 실행하세요. 최종 추론값과 근거는 `render-report.json`의 `intro_metadata`에서 확인할 수 있습니다.
+
 더 나은 의미 기반 선별을 원하면 다음처럼 실행합니다.
 
 ```bash
@@ -113,9 +117,14 @@ render:
   transition_seconds: 0.18
 ```
 
+```yaml
+project:
+  destination: ""  # 비우면 source 폴더명 → project 이름 순으로 자동 추론
+```
+
 `trip_intro_style: mosaic`는 최종 edit plan에 실제로 선택되고 JPEG를 정상적으로 읽을 수 있는 source만 사용합니다. 기본 `trip_intro_grid_size: 7`은 최대 49장의 7×7 인트로를 만들며, `6`은 최대 36장의 더 큰 타일, `8`은 최대 64장의 더 촘촘한 전체 조망을 제공합니다. 먼저 usable frame이 있는 각 DAY를 한 장씩 커버하고, DAY가 현재 grid 용량을 넘으면 첫날과 마지막 날을 포함해 전체 여정에서 용량만큼 DAY를 균등하게 고릅니다. 남은 칸은 검토한 후보와 DAY 균형을 따르면서 서로 다른 원본 clip을 한 장씩 우선 사용하고, 고유 원본이 부족할 때만 같은 clip의 추가 프레임을 사용합니다. 기본 후보 순서는 visual quality, 후보 점수, 촬영 시각 순입니다. 선택된 프레임이 grid 용량보다 적으면 남은 셀은 어두운 배경으로 유지합니다. 누락되거나 손상된 프레임은 같은 DAY의 다음 후보로 대체합니다.
 
-`trip_intro_animation: flow`는 선택된 프레임을 최종 edit plan의 시간순으로 정렬한 뒤, 첫째 줄은 왼쪽에서 오른쪽으로, 다음 줄은 오른쪽에서 왼쪽으로 번갈아 가는 serpentine 흐름으로 바둑판을 채웁니다. 각 타일은 짧은 수평 flip/slide로 자리를 잡고, 중앙 제목과 기간은 모자이크가 충분히 드러난 후반에 반투명한 어두운 패널과 함께 나타납니다. `static`은 같은 선택 프레임으로 완성된 모자이크를 처음부터 보여주는 저동작 옵션입니다. `flow` 생성이 실패하면 static 모자이크로, usable frame이 없거나 static 생성도 실패하면 기존 제목 카드로 안전하게 fallback합니다.
+`trip_intro_animation: flow`는 선택된 프레임을 최종 edit plan의 시간순으로 정렬한 뒤, 첫째 줄은 왼쪽에서 오른쪽으로, 다음 줄은 오른쪽에서 왼쪽으로 번갈아 가는 serpentine 흐름으로 바둑판을 채웁니다. 각 타일은 짧은 수평 flip/slide로 자리를 잡고, 중앙에는 자동 추론하거나 명시한 여행지와 보정된 전체 여행기간이 모자이크가 충분히 드러난 후반에 반투명한 어두운 패널과 함께 나타납니다. `static`과 classic title-card fallback도 같은 여행지·기간을 사용합니다.
 
 특정 컷을 쓰려면 `trip_intro_candidate_ids`에 이미 plan-selected된 candidate ID를 전역 선택 우선순위로 적습니다. 같은 DAY의 ID를 여러 개 지정할 수 있지만 DAY 커버리지를 먼저 확보하며, 이 목록은 타일 위치를 정하지 않습니다. 오래됐거나 최종 plan에 선택되지 않은 ID는 무시합니다. 실제 타일은 설정 목록의 순서와 무관하게 최종 edit plan의 시간순으로 배치됩니다. `trip_intro_grid_size`는 `6`, `7`, `8`만 허용하며, `trip_intro_style: card`로 모자이크를 끌 수도 있습니다.
 

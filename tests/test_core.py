@@ -41,10 +41,14 @@ class CoreTests(unittest.TestCase):
 
     def test_render_accepts_output_overrides(self) -> None:
         args = build_parser().parse_args(
-            ["render", "--project", "trip", "--resolution", "2160p", "--episode-mode", "trip"]
+            [
+                "render", "--project", "trip", "--resolution", "2160p",
+                "--episode-mode", "trip", "--destination", "Okinawa",
+            ]
         )
         self.assertEqual(args.resolution, "2160p")
         self.assertEqual(args.episode_mode, "trip")
+        self.assertEqual(args.destination, "Okinawa")
 
     def test_planner_images_are_explicit_opt_in(self) -> None:
         parser = build_parser()
@@ -269,6 +273,16 @@ class CoreTests(unittest.TestCase):
             invalid["render"]["trip_intro_grid_size"] = grid_size
             invalid["render"]["trip_intro_animation"] = animation
             with self.subTest(grid_size=grid_size, animation=animation), self.assertRaises(VideoSummaryError):
+                _validate_config(invalid)
+
+    def test_config_validates_destination_override(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["project"]["destination"] = "Phu Quoc"
+        _validate_config(config)
+        for destination in ([], "x" * 101):
+            invalid = copy.deepcopy(DEFAULT_CONFIG)
+            invalid["project"]["destination"] = destination
+            with self.subTest(destination=destination), self.assertRaises(VideoSummaryError):
                 _validate_config(invalid)
 
     def test_subtitle_parser_supports_srt(self) -> None:

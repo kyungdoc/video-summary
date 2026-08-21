@@ -17,6 +17,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "project": {
         "name": "여행 영상",
+        "destination": "",
         "timezone": "Asia/Seoul",
         "day_start_hour": 4,
         "language": "ko",
@@ -181,6 +182,11 @@ def _validate_config(config: dict[str, Any]) -> None:
         ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as exc:
         raise VideoSummaryError(f"알 수 없는 timezone입니다: {timezone_name}") from exc
+    destination = project.get("destination", "")
+    if not isinstance(destination, str):
+        raise VideoSummaryError("destination은 문자열이어야 합니다.")
+    if len(" ".join(destination.split())) > 100:
+        raise VideoSummaryError("destination은 100자 이하여야 합니다.")
     target = _finite_number(editing.get("target_minutes_per_day"), "target_minutes_per_day")
     if not 0.1 <= target <= 180:
         raise VideoSummaryError("target_minutes_per_day는 0.1~180 사이여야 합니다.")

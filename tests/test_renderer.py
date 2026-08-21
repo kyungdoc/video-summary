@@ -194,6 +194,51 @@ class RendererTests(unittest.TestCase):
         ])
         self.assertEqual(pieces[1].day_chapter, "DAY 1 · 2026-08-19 · 서울")
 
+    def test_daily_intro_uses_destination_and_day_while_date_card_stays_unchanged(self) -> None:
+        episode = Episode(
+            "2026-08-19", 1, "DAY 1 · 서울", "2026-08-19", "첫날", 10.0, []
+        )
+        plan = EditPlan("internal-project-id", "", "local", "hash", [episode])
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        calls: list[tuple[str, str, str]] = []
+
+        def fake_card(
+            _directory: Path,
+            card_id: str,
+            title: str,
+            subtitle: str,
+            *_args,
+            **_kwargs,
+        ) -> Piece:
+            calls.append((card_id, title, subtitle))
+            return Piece(Path(f"/{card_id}.mp4"), 2.0, card_id)
+
+        with patch("video_summary.renderer.render_card_piece", side_effect=fake_card):
+            episode_pieces(
+                episode,
+                plan,
+                {},
+                {},
+                config,
+                Path("/segments"),
+                Path("/cards"),
+                Path("/overlays"),
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                True,
+                include_intro=True,
+                include_outro=False,
+                force=False,
+                intro_title="San Francisco",
+                intro_subtitle="2026-08-19",
+            )
+
+        self.assertEqual(calls[0], ("intro-day-1", "San Francisco", "2026-08-19"))
+        self.assertEqual(calls[1], ("date-day-1", "DAY 1 · 서울", "2026-08-19"))
+
     def test_episode_coalesces_only_compatible_contiguous_sources_and_keeps_day_fades(self) -> None:
         first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
         second = candidate("second", "2026-08-19T08:00:00+09:00", 5.0)
@@ -439,6 +484,50 @@ class RendererTests(unittest.TestCase):
             )
 
         self.assertNotEqual(first, second)
+
+    def test_intro_metadata_changes_render_cache_but_not_source_namespace(self) -> None:
+        plan = EditPlan("Trip", "", "local", "hash", [])
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        first_metadata = {
+            "destination": "Okinawa",
+            "period": "2026-05-07 — 2026-05-10",
+            "destination_source": "source_dir",
+        }
+        second_metadata = {**first_metadata, "destination": "오키나와", "destination_source": "config"}
+        first = render_cache_key(
+            plan,
+            [],
+            config["render"],
+            "trip",
+            False,
+            1280,
+            720,
+            30,
+            "libx264",
+            "4M",
+            version=RENDER_POLICY_VERSION,
+            intro_metadata=first_metadata,
+        )
+        second = render_cache_key(
+            plan,
+            [],
+            config["render"],
+            "trip",
+            False,
+            1280,
+            720,
+            30,
+            "libx264",
+            "4M",
+            version=RENDER_POLICY_VERSION,
+            intro_metadata=second_metadata,
+        )
+        source_before = source_cache_namespace(config, 1280, 720, 30, "libx264", "4M")
+        config["project"]["destination"] = "오키나와"
+        source_after = source_cache_namespace(config, 1280, 720, 30, "libx264", "4M")
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(source_before, source_after)
 
     def test_cached_piece_requires_exact_frames_fps_and_duration(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

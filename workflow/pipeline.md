@@ -18,6 +18,7 @@
 - 각 여행일의 모든 source 구간은 첫 장면부터 마지막 장면까지 실제 촬영 시간순입니다. `cold_open`도 이 순서를 깨지 않으며, 선택된 후보 중 가장 이른 하나만 첫 source인 `hook`이 될 수 있습니다.
 - 로컬 plan은 각 DAY의 가장 이른 후보를 시작 앵커로 보존합니다. 후보 총량이 목표보다 짧은 날은 목표를 채우기 위해 전부 선택하지 않고 기본 80%의 adaptive ceiling을 적용하며, 의미 있는 마무리와 검증된 필수 사건이 우선합니다. 화면 품질이 충분한 무대사·저대사 `scenery` 후보를 시각 앵커로 검토하므로 전사량만으로 풍경이나 야외 장면을 탈락시키지 않으며, 고립된 점수 상위 조각보다 같은 원본에서 맞닿는 후보 run을 우선합니다. 외부 planner에도 목표가 할당량이 아닌 상한임을 명시합니다.
 - 카메라 달력이 초기화된 여행은 `date_overrides`의 폴더 glob, 현지 날짜와 IANA timezone으로 보정할 수 있습니다. 폴더 날짜를 회차 경계로 쓸 때는 `day_start_hour: 0`을 사용합니다.
+- 인트로 표시명은 내부 project ID와 분리합니다. `project.destination`이 비어 있으면 source 폴더명에서 선행 날짜와 일반 영상 토큰을 제거하고 더 구체적인 지명이 남을 때만 국가 접두어도 제외해 여행지를 추론하며, 실패하면 project 이름을 사용합니다. 기간은 폴더명 숫자가 아니라 scan이 보정한 전체 `day_key`의 최솟값·최댓값이며, trip은 전체 범위, daily는 해당 DAY 날짜를 표시합니다.
 - 원본 파일은 읽기만 하며 모든 파생물은 workspace 아래에 저장합니다.
 - 전사, 시각 분석, 렌더는 기본 동시성 1입니다.
 - 완료 artifact만 atomic rename으로 공개합니다.
@@ -47,7 +48,7 @@ Planner가 반환할 수 있는 것은 프로젝트/후보 해시, 날짜별 제
 
 `trip_intro_style: mosaic`는 plan-selected source 중 정상적으로 읽을 수 있는 candidate JPEG만 대상으로 합니다. `trip_intro_grid_size`는 `6`, `7`, `8`만 허용하고 기본값 `7`은 최대 49장의 7×7 모자이크를 만듭니다. `6`은 최대 36장의 더 큰 타일, `8`은 최대 64장의 조밀한 타일 옵션입니다. 먼저 usable frame이 있는 DAY마다 한 장을 확보합니다. usable DAY가 grid 용량보다 많으면 첫날·마지막 날을 포함해 용량만큼 전체 기간에서 균등 선택합니다. 남은 칸에는 `trip_intro_candidate_ids`와 DAY별 균형을 반영하되, 서로 다른 원본 clip을 한 장씩 먼저 사용하고 고유 원본이 부족할 때만 같은 clip을 반복합니다. 자동 후보 순서는 `visual_quality desc → score desc → captured_at asc → candidate_id`입니다. 용량보다 적은 프레임은 어두운 빈 셀을 남기며, 손상·누락 JPEG는 같은 DAY의 다음 후보로 넘어갑니다.
 
-`trip_intro_animation`은 `flow` 또는 `static`만 허용합니다. 기본 `flow`는 선택 프레임을 edit-plan 시간순으로 정렬하고, 행마다 좌→우와 우→좌를 번갈아 진행하는 serpentine 순서로 cell을 채웁니다. 각 tile은 짧은 horizontal flip/slide 뒤 자리를 잡으며, 중앙 제목·기간의 반투명 어두운 panel은 모자이크가 충분히 보인 후반에 나타납니다. `static`은 같은 선택 프레임의 완성된 모자이크를 처음부터 표시합니다. flow asset 생성이 실패하면 static으로 fallback하고, usable frame이 없거나 static 생성도 실패하면 classic title card로 fallback합니다.
+`trip_intro_animation`은 `flow` 또는 `static`만 허용합니다. 기본 `flow`는 선택 프레임을 edit-plan 시간순으로 정렬하고, 행마다 좌→우와 우→좌를 번갈아 진행하는 serpentine 순서로 cell을 채웁니다. 각 tile은 짧은 horizontal flip/slide 뒤 자리를 잡으며, 중앙에는 추론된 여행지와 전체 여행기간이 반투명 어두운 panel로 후반에 나타납니다. `static`과 classic title-card fallback도 동일한 표시 메타데이터를 사용합니다. 추론 결과와 provenance는 `render-report.json.intro_metadata`에 기록하며 변경 시 카드와 assembly만 무효화하고 source segment 캐시는 재사용합니다.
 
 `trip_intro_candidate_ids`는 이미 plan-selected된 ID의 전역 선택 우선순위이며 타일 위치 목록이 아닙니다. 같은 DAY의 ID를 여러 개 포함할 수 있지만 DAY 커버리지를 먼저 확보합니다. 오래됐거나 최종 plan에 선택되지 않은 ID는 무시하며, 선택된 타일은 최종 edit plan의 시간순으로 배치합니다. `daily` 인트로에는 이 설정이 영향을 주지 않습니다.
 

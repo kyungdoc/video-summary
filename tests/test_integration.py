@@ -35,6 +35,7 @@ class PipelineIntegrationTests(unittest.TestCase):
 
             config = copy.deepcopy(DEFAULT_CONFIG)
             config["project"]["name"] = "Integration Trip"
+            config["project"]["destination"] = "테스트 여행지"
             config["editing"]["target_minutes_per_day"] = 0.2
             config["render"].update(
                 {
@@ -59,6 +60,8 @@ class PipelineIntegrationTests(unittest.TestCase):
             plan = plan_project(paths, config, planner_name="local")
             self.assertEqual(len(plan["episodes"]), 2)
             report = render_project(paths, config, draft=True)
+            self.assertEqual(report["intro_metadata"]["destination"], "테스트 여행지")
+            self.assertEqual(report["intro_metadata"]["period"], "2026-08-19 — 2026-08-20")
             self.assertEqual(len(report["outputs"]), 2)
             for output in report["outputs"]:
                 movie = Path(output["path"])
@@ -80,6 +83,7 @@ class PipelineIntegrationTests(unittest.TestCase):
             trip_config["editing"]["episode_mode"] = "trip"
             trip_report = render_project(paths, trip_config, draft=True)
             self.assertEqual(trip_report["mode"], "trip")
+            self.assertEqual(trip_report["intro_metadata"]["destination"], "테스트 여행지")
             self.assertEqual(len(trip_report["outputs"]), 1)
             self.assertEqual(Path(trip_report["outputs"][0]["path"]).name, "trip-summary-draft.mp4")
 

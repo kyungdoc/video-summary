@@ -28,6 +28,8 @@ Artifacts stay under the caller workspace:
 - `.video-summary/<project>/`: configuration, caches, internal plan, render state
 - `exports/<project>/`: daily outputs or `trip-summary.mp4` with matching VTT, chapters, detailed timeline, and description sidecars
 
+The first intro uses a destination display title, not the internal project ID. Leave `project.destination` empty to infer it from the source folder after removing a leading date, generic media tokens, and a country prefix when a more specific place remains, or pass `--destination` for an exact spelling. The travel period comes from scan-corrected DAY keys after timezone, day-start, and date overrides; trip output shows the full range and daily output shows that DAY. Inspect `render-report.json.intro_metadata` for the resolved values and provenance.
+
 ## Ordering and output contract
 
 Within each DAY, all selected source segments remain in capture-time order. With `cold_open` enabled, only the earliest selected source may be labeled `hook`; it remains after the DAY's visual date card and is not moved ahead of it.
