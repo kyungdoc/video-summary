@@ -43,8 +43,8 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 15
-SOURCE_RENDER_POLICY_VERSION = 7
+RENDER_POLICY_VERSION = 16
+SOURCE_RENDER_POLICY_VERSION = 8
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
 YOUTUBE_MIN_CHAPTERS = 3
@@ -1176,7 +1176,10 @@ def render_source_piece(
             f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
             f"atempo={segment.speed:.6f},{audio_start_pad}"
             "loudnorm=I=-16:LRA=11:TP=-1.5,"
-            "aresample=48000,"
+            # Some FFmpeg loudnorm builds emit non-finite floats for digital silence.
+            # Quantizing once prevents those values from reaching the AAC encoder.
+            "aresample=48000:osf=s16,"
+            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
             f"apad,atrim=duration={output_duration:.6f}"
             f"{audio_transition},asetpts=PTS-STARTPTS[aout]"
         )

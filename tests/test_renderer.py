@@ -20,6 +20,7 @@ from video_summary.render_assets import MOSAIC_CAPACITY
 from video_summary.renderer import (
     Piece,
     RENDER_POLICY_VERSION,
+    SOURCE_RENDER_POLICY_VERSION,
     SourceMember,
     SourceSelection,
     assemble_output,
@@ -435,6 +436,10 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(card_fade_seconds("date-day-1", 3.0), 0.5)
         self.assertEqual(card_fade_seconds("trip-outro", 0.4), 0.1)
 
+    def test_audio_sanitizing_policy_invalidates_render_and_source_caches(self) -> None:
+        self.assertEqual(RENDER_POLICY_VERSION, 16)
+        self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
+
     def test_regular_cards_use_integer_frame_durations_without_accumulated_drift(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         with (
@@ -732,8 +737,67 @@ class RendererTests(unittest.TestCase):
         self.assertIn("fade=t=out", filters)
         self.assertIn("afade=t=in", filters)
         self.assertIn("afade=t=out", filters)
+        self.assertIn(
+            "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=48000:osf=s16,"
+            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+            filters,
+        )
         self.assertIn("iw*sar", filters)
         self.assertIn("setsar=1", filters)
+
+    @unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg/FFprobe are required")
+    def test_source_piece_renders_exact_silence_without_non_finite_aac_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "silent-source.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=blue:s=320x180:r=30:d=2.2",
+                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=2.2",
+                    "-shortest", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-y", str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            item = candidate("silent", "2026-08-19T08:00:00+09:00", 0.0)
+            item.end = 2.135
+            segment = PlanSegment(item.candidate_id, "journey", "")
+            clip = Clip(
+                clip_id="clip", path=str(source), relative_path=source.name,
+                fingerprint="silent-source-fingerprint", size_bytes=source.stat().st_size,
+                duration=2.2, captured_at=item.captured_at, capture_source="filename",
+                day_key=item.day_key, travel_day=1, width=320, height=180, fps=30.0,
+                codec="h264", rotation=0, has_audio=True, audio_sample_rate=48000,
+            )
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            segments = root / "segments"
+            overlays = root / "overlays"
+            segments.mkdir()
+            overlays.mkdir()
+
+            piece = render_source_piece(
+                segment,
+                item,
+                clip,
+                segments,
+                overlays,
+                320,
+                180,
+                30,
+                "libx264",
+                "1M",
+                config,
+                location_overlay=None,
+                fade_in=True,
+                fade_out=True,
+                force=False,
+            )
+
+            self.assertTrue(piece.path.is_file())
+            self.assertEqual(source_output_timing(2.135, 30), (64, 64 / 30))
+            self.assertAlmostEqual(piece.duration, 64 / 30)
 
     @unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg/FFprobe are required")
     def test_source_piece_preserves_late_audio_start_and_normalizes_sar(self) -> None:
