@@ -60,7 +60,9 @@ Mosaic generation processes candidate JPEGs one at a time and combines them loca
 
 Overlapping or touching candidate windows from the same source are unioned before planning. Plan validation also rejects residual real-time overlap above the 1 ms tolerance from one source, including overlaps submitted by an external planner. Each rendered source is quantized to the nearest whole frame at the target fps; fps/PTS and A/V duration are normalized, padded/trimmed as needed, and validated before the cache is accepted.
 
-`transition_seconds` defaults to `0.18` and accepts 0–1 seconds. The first source of each DAY fades in from black/silence after its date card, and the last source fades to black/silence before the next date card or the trip outro. Source-to-source joins within a DAY remain clean cuts; this is not a crossfade graph. Set the value to `0` to disable boundary fades.
+The per-DAY runtime target is a soft ceiling rather than a fill quota. If a short departure or return DAY has less candidate material than the target, local planning uses an adaptive ceiling of about 80% and external planning receives the same instruction. Keep the earliest context, a meaningful closing, required events, and complete contiguous runs; omit weak repetition and fragmentary dialogue instead of padding the episode.
+
+`transition_seconds` defaults to `0.18` and accepts 0–1 seconds. Exactly contiguous selections with compatible speed, location, and caption are coalesced first. Every remaining source-group boundary and card boundary uses a short video/audio fade-through-black. This is not a multi-input crossfade graph, so durations and low-memory sequential rendering remain intact. Set the value to `0` to disable boundary fades.
 
 Intro, date, and outro cards are rendered into the MP4 frames. The matching `.chapters.txt` is timestamp text to paste into a YouTube description; it is not embedded MP4 chapter metadata, is not an upload instruction, and is not uploaded automatically. A trip summary has one chapter per DAY: DAY 1 starts at `00:00` and includes the trip intro, while later DAYs start at their date cards.
 

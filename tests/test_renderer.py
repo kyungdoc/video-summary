@@ -265,7 +265,7 @@ class RendererTests(unittest.TestCase):
         )
         self.assertEqual(
             [(call["fade_in"], call["fade_out"]) for call in render_calls],
-            [(True, False), (False, True)],
+            [(True, True), (True, True)],
         )
         self.assertEqual([member.label for member in pieces[1].source_members], ["Pier 39", "scenery"])
 

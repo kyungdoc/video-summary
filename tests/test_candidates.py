@@ -1,12 +1,43 @@
 from __future__ import annotations
 
+import copy
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from video_summary.candidates import _candidate_location, _candidate_windows, _merge_overlapping_windows
+from video_summary.candidates import (
+    VISUAL_SIGNAL_POLICY_VERSION,
+    _candidate_cache_key,
+    _candidate_location,
+    _candidate_windows,
+    _merge_overlapping_windows,
+)
 from video_summary.models import Clip, TranscriptCue
+from video_summary.project import DEFAULT_CONFIG, ProjectPaths
 
 
 class CandidateCoverageTests(unittest.TestCase):
+    def test_candidate_cache_key_tracks_visual_signal_policy(self) -> None:
+        clip = Clip(
+            clip_id="clip", path="/tmp/clip.mp4", relative_path="clip.mp4", fingerprint="fp",
+            size_bytes=1, duration=10.0, captured_at="2026-08-20T10:00:00+09:00",
+            capture_source="filename", day_key="2026-08-20", travel_day=1,
+            width=1920, height=1080, fps=30.0, codec="h264", rotation=0, has_audio=True,
+        )
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            current = _candidate_cache_key(paths, [clip], config)
+            with patch(
+                "video_summary.candidates.VISUAL_SIGNAL_POLICY_VERSION",
+                VISUAL_SIGNAL_POLICY_VERSION + 1,
+            ):
+                changed = _candidate_cache_key(paths, [clip], config)
+
+        self.assertNotEqual(current, changed)
+
     def test_candidate_location_rechecks_ordered_rules_before_scan_fallback(self) -> None:
         clip = Clip(
             clip_id="clip", path="/tmp/day-02/DJI_0002.MP4",

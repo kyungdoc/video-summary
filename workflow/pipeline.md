@@ -16,7 +16,7 @@
 ## Stable invariants
 
 - 각 여행일의 모든 source 구간은 첫 장면부터 마지막 장면까지 실제 촬영 시간순입니다. `cold_open`도 이 순서를 깨지 않으며, 선택된 후보 중 가장 이른 하나만 첫 source인 `hook`이 될 수 있습니다.
-- 로컬 plan은 각 DAY의 가장 이른 후보를 시작 앵커로 보존하고, 화면 품질이 충분한 무대사·저대사 `scenery` 후보를 시각 앵커로 우선 검토합니다. 전사량만으로 풍경이나 야외 장면을 탈락시키지 않습니다.
+- 로컬 plan은 각 DAY의 가장 이른 후보를 시작 앵커로 보존합니다. 후보 총량이 목표보다 짧은 날은 목표를 채우기 위해 전부 선택하지 않고 기본 80%의 adaptive ceiling을 적용하며, 의미 있는 마무리와 검증된 필수 사건이 우선합니다. 화면 품질이 충분한 무대사·저대사 `scenery` 후보를 시각 앵커로 검토하므로 전사량만으로 풍경이나 야외 장면을 탈락시키지 않으며, 고립된 점수 상위 조각보다 같은 원본에서 맞닿는 후보 run을 우선합니다. 외부 planner에도 목표가 할당량이 아닌 상한임을 명시합니다.
 - 카메라 달력이 초기화된 여행은 `date_overrides`의 폴더 glob, 현지 날짜와 IANA timezone으로 보정할 수 있습니다. 폴더 날짜를 회차 경계로 쓸 때는 `day_start_hour: 0`을 사용합니다.
 - 원본 파일은 읽기만 하며 모든 파생물은 workspace 아래에 저장합니다.
 - 전사, 시각 분석, 렌더는 기본 동시성 1입니다.
@@ -53,7 +53,7 @@ Planner가 반환할 수 있는 것은 프로젝트/후보 해시, 날짜별 제
 
 모자이크는 기존 candidate JPEG를 한 번에 한 장씩 로컬에서 합성하는 저메모리 render-only 파생물입니다. 모자이크를 켠 것만으로 외부 전송이 생기지는 않지만, 별도로 `--planner-images`를 쓰면 candidate frame 기반의 축소 contact sheet가 외부 플래너에 전달됩니다. style·grid·animation·선택 ID·프레임 지문·제목·기간·렌더 형식은 render cache에 포함합니다. 모자이크 레이아웃·animation·선택·제목 패널·intro 길이만 바뀌면 transcript/analyze/source segment cache를 재사용합니다. 반면 source 출력 형식이나 정확 프레임 정책이 바뀌면 source segment를 다시 렌더합니다.
 
-`transition_seconds`는 기본 `0.18`초이며 0~1초만 허용합니다. 각 DAY의 첫 source는 날짜 카드 뒤에서 블랙·무음으로부터 fade-in하고, 마지막 source는 다음 날짜 카드 또는 아웃트로를 향해 블랙·무음으로 fade-out합니다. DAY 내부 source-to-source는 clean cut이고 실제 crossfade는 사용하지 않습니다. `0`이면 경계 fade를 끕니다.
+`transition_seconds`는 기본 `0.18`초이며 0~1초만 허용합니다. 정확히 맞닿고 speed/location/caption이 같은 동일 원본 후보는 먼저 하나의 source로 합칩니다. 합쳐지지 않은 모든 DAY 내부 group 경계와 날짜 카드 경계에서는 앞 조각의 영상·음성이 블랙·무음으로 fade-out하고 다음 조각이 fade-in합니다. 실제 crossfade filter graph 없이 각 piece 길이를 그대로 보존하는 저메모리 fade-through-black이며, `0`이면 경계 fade를 끕니다.
 
 MP4의 카드는 영상 프레임에 렌더되는 시각 요소입니다. `.chapters.txt`는 MP4 embedded chapter가 아니라 YouTube 설명란에 복사할 timestamp 텍스트이고, 자동 업로드되지 않습니다. `trip`에서는 DAY마다 챕터 하나를 생성하며 DAY 1은 여행 인트로를 포함한 `00:00`, 이후 DAY는 해당 날짜 카드의 시작 시각을 사용합니다. timestamp의 오름차순·영상 범위를 검증하고, YouTube에 사용할 때는 `00:00` 시작·최소 3개·각 챕터 10초 이상 조건을 확인합니다.
 

@@ -20,6 +20,7 @@ from .utils import VideoSummaryError, file_fingerprint, print_status, read_json,
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mts", ".m2ts", ".avi", ".mkv"}
 _CAPTURE_TIME_POLICY_VERSION = 3
+VISUAL_SIGNAL_POLICY_VERSION = 2
 _FILENAME_PATTERNS = (
     re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])[_-]?([0-2]\d)([0-5]\d)([0-5]\d)(?!\d)"),
     re.compile(r"(?<!\d)(20\d{2})[-_](0[1-9]|1[0-2])[-_]([0-2]\d|3[01])[ T_-]([0-2]\d)[-_:]?([0-5]\d)[-_:]?([0-5]\d)(?!\d)"),
@@ -310,7 +311,13 @@ def analyze_visual_signals(
     force: bool = False,
 ) -> list[dict[str, float]]:
     cache_path = paths.signals / f"{clip.clip_id}.json"
-    cache_key = stable_hash({"version": 1, "fingerprint": clip.fingerprint, "interval": interval})
+    cache_key = stable_hash(
+        {
+            "version": VISUAL_SIGNAL_POLICY_VERSION,
+            "fingerprint": clip.fingerprint,
+            "interval": interval,
+        }
+    )
     if not force and cache_path.exists():
         payload = read_json(cache_path)
         if payload.get("cache_key") == cache_key:
@@ -323,30 +330,76 @@ def analyze_visual_signals(
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,format=gray"
     )
+    hardware_args = _visual_signal_ffmpeg_args(clip.path, vf, hardware_decode=True)
+    samples, return_code, hardware_error = _decode_visual_signal_frames(
+        hardware_args,
+        frame_size=frame_size,
+        interval=interval,
+    )
+    if return_code != 0:
+        software_args = _visual_signal_ffmpeg_args(clip.path, vf, hardware_decode=False)
+        samples, return_code, software_error = _decode_visual_signal_frames(
+            software_args,
+            frame_size=frame_size,
+            interval=interval,
+        )
+        if return_code != 0:
+            details = software_error.strip() or f"exit {return_code}"
+            if hardware_error.strip():
+                details = f"hardware: {hardware_error.strip()}\nsoftware: {details}"
+            raise VideoSummaryError(f"프레임 분석 실패 ({Path(clip.path).name}): {details}")
+
+    write_json(
+        cache_path,
+        {
+            "version": VISUAL_SIGNAL_POLICY_VERSION,
+            "cache_key": cache_key,
+            "samples": samples,
+        },
+    )
+    return samples
+
+
+def _visual_signal_ffmpeg_args(path: str, vf: str, *, hardware_decode: bool) -> list[str]:
     args = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-threads",
-        "1",
-        "-i",
-        clip.path,
-        "-an",
-        "-vf",
-        vf,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "gray",
-        "pipe:1",
     ]
+    if hardware_decode:
+        args.extend(["-hwaccel", "auto"])
+    args.extend(
+        [
+            "-threads",
+            "1",
+            "-i",
+            path,
+            "-an",
+            "-vf",
+            vf,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "pipe:1",
+        ]
+    )
+    return args
+
+
+def _decode_visual_signal_frames(
+    args: list[str],
+    *,
+    frame_size: int,
+    interval: float,
+) -> tuple[list[dict[str, float]], int, str]:
     samples: list[dict[str, float]] = []
     previous: bytes | None = None
     with tempfile.TemporaryFile() as error_log:
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=error_log)
-        assert process.stdout is not None
         try:
+            assert process.stdout is not None
             index = 0
             while True:
                 frame = process.stdout.read(frame_size)
@@ -370,7 +423,8 @@ def analyze_visual_signals(
                 previous = frame
                 index += 1
         except BaseException:
-            process.stdout.close()
+            if process.stdout is not None:
+                process.stdout.close()
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -379,18 +433,14 @@ def analyze_visual_signals(
                 process.wait()
             raise
         finally:
-            if not process.stdout.closed:
+            if process.stdout is not None and not process.stdout.closed:
                 process.stdout.close()
         return_code = process.wait()
         error_log.seek(0, os.SEEK_END)
         error_size = error_log.tell()
         error_log.seek(max(0, error_size - 8192))
         stderr = error_log.read().decode("utf-8", errors="replace")
-    if return_code != 0:
-        raise VideoSummaryError(f"프레임 분석 실패 ({Path(clip.path).name}): {stderr.strip()}")
-
-    write_json(cache_path, {"version": 1, "cache_key": cache_key, "samples": samples})
-    return samples
+    return samples, return_code, stderr
 
 
 def extract_frame(clip: Clip, at: float, output: Path) -> None:

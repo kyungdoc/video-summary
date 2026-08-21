@@ -42,7 +42,7 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 13
+RENDER_POLICY_VERSION = 14
 SOURCE_RENDER_POLICY_VERSION = 7
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
@@ -461,7 +461,7 @@ def episode_pieces(
             render_source_piece(
                 segment, candidate, clip_by_id[candidate.clip_id], segments_dir, overlays_dir,
                 width, height, fps, encoder, bitrate, config, location_overlay=show_location, force=force,
-                fade_in=group_index == 0, fade_out=group_index == len(groups) - 1,
+                fade_in=True, fade_out=True,
                 coalesced_selections=tuple(group), member_labels=tuple(member_labels),
                 legacy_segments_dirs=legacy_segments_dirs,
             )

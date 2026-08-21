@@ -6,13 +6,18 @@ from pathlib import Path
 
 from video_summary.models import Candidate
 from video_summary.planner import (
+    SHORT_DAY_KEEP_RATIO,
+    _adaptive_day_target_seconds,
+    _select_day_candidates,
     _planner_candidates_payload,
     _prompt_role_weights,
     _sample_contact_sheets,
+    build_planner_request,
     local_plan,
+    planner_schema,
     validate_and_normalize_plan,
 )
-from video_summary.project import DEFAULT_CONFIG
+from video_summary.project import DEFAULT_CONFIG, ProjectPaths
 from video_summary.utils import VideoSummaryError
 
 
@@ -186,6 +191,12 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn("transcript", exported)
         self.assertLessEqual(len(exported["transcript_excerpt"]), 240)
 
+    def test_planner_schema_const_fields_also_declare_their_json_type(self) -> None:
+        schema = planner_schema()
+        self.assertEqual(schema["properties"]["version"], {"type": "integer", "const": 1})
+        segment_schema = schema["properties"]["episodes"]["items"]["properties"]["segments"]["items"]
+        self.assertEqual(set(segment_schema["required"]), set(segment_schema["properties"]))
+
     def test_contact_sheet_sampling_spans_the_full_trip(self) -> None:
         sheets = [Path(f"sheet-{index:03d}.jpg") for index in range(1, 31)]
 
@@ -243,6 +254,54 @@ class PlannerTests(unittest.TestCase):
         plan = local_plan(self.config, "자연스러운 시간순 여행", candidates, "hash")
 
         self.assertEqual([segment.candidate_id for segment in plan.episodes[0].segments], ["a", "c"])
+
+    def test_local_selection_prefers_a_contiguous_run_over_an_isolated_score_edge(self) -> None:
+        items = [
+            candidate("early", "2026-11-01T08:00:00-05:00", 0.0),
+            candidate("run_a", "2026-11-01T09:00:00-05:00", 0.0),
+            candidate("run_b", "2026-11-01T09:00:05-05:00", 5.0),
+            candidate("isolated", "2026-11-01T10:00:00-05:00", 0.0),
+            candidate("late", "2026-11-01T11:00:00-05:00", 0.0),
+        ]
+        items[1].clip_id = items[2].clip_id = "continuous"
+        items[0].score = items[4].score = 0.05
+        items[1].score = 0.79
+        items[2].score = 0.74
+        items[3].score = 0.82
+
+        selected = _select_day_candidates(items, 20.0)
+
+        self.assertEqual([item.candidate_id for item in selected], ["early", "run_a", "run_b", "late"])
+
+    def test_short_day_uses_an_adaptive_ceiling_instead_of_every_candidate(self) -> None:
+        items = [
+            candidate(f"c{index}", f"2026-11-01T{8 + index:02d}:00:00-05:00")
+            for index in range(5)
+        ]
+
+        adaptive_target = _adaptive_day_target_seconds(items, 60.0)
+        selected = _select_day_candidates(items, 60.0)
+
+        self.assertEqual(adaptive_target, 25.0 * SHORT_DAY_KEEP_RATIO)
+        self.assertLess(len(selected), len(items))
+        self.assertLessEqual(sum(item.duration for item in selected), adaptive_target)
+        self.assertEqual(selected[0].candidate_id, "c0")
+        self.assertEqual(selected[-1].candidate_id, "c4")
+
+    def test_external_request_calls_the_day_target_a_soft_ceiling(self) -> None:
+        request = build_planner_request(
+            ProjectPaths(Path("/tmp"), "project"),
+            self.config,
+            "짧고 자연스럽게",
+            self.candidates,
+            "hash",
+        )
+
+        self.assertIn("채워야 하는 할당량이 아니라 상한", request)
+        self.assertIn("usable candidate total: 10.0s", request)
+        self.assertIn("recommended selection ceiling: 10.0s", request)
+        self.assertIn("target_duration 필드는 12.0으로 유지", request)
+        self.assertIn("location/caption은 null, speed는 1.0", request)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .media import analyze_visual_signals, extract_frame, load_clips, resolve_location
+from .media import VISUAL_SIGNAL_POLICY_VERSION, analyze_visual_signals, extract_frame, load_clips, resolve_location
 from .models import Candidate, Clip, TranscriptCue
 from .project import ProjectPaths
 from .state import StateStore
@@ -157,7 +157,8 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 9,
+            "version": 10,
+            "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "project": config["project"]["name"],
             "clips": [
                 (

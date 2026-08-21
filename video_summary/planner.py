@@ -22,6 +22,7 @@ ALLOWED_ROLES = {"hook", "journey", "fun", "food", "scenery", "dialogue", "trans
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
 MAX_CODEX_CONTACT_SHEETS = 20
 CONTACT_SHEET_CANDIDATES = 12
+SHORT_DAY_KEEP_RATIO = 0.80
 
 
 def plan_project(
@@ -52,7 +53,7 @@ def plan_project(
     plan_file_key = file_fingerprint(plan_file_path) if plan_file_path and plan_file_path.exists() else None
     cache_key = stable_hash(
         {
-            "version": 9,
+            "version": 11,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "prompt": editing_prompt,
@@ -356,6 +357,11 @@ def build_planner_request(
         "각 날짜의 모든 segment는 role=hook을 포함해 captured_at 오름차순을 유지하세요. hook은 선택된 후보 중 가장 이른 첫 segment에만 허용됩니다.",
         "같은 원본 clip_id에서 source 시간(start/end)이 겹치는 candidate를 함께 선택하지 마세요.",
         "각 날짜의 시간상 가장 이른 후보를 포함해 출발 맥락을 보존하고, 여유가 있으면 가장 늦은 후보도 포함하세요.",
+        "날짜별 목표 시간은 채워야 하는 할당량이 아니라 상한입니다. 후보 총량이 목표보다 짧은 날은 약한 장면까지 전부 선택하지 마세요.",
+        f"짧은 날은 최초·마무리·필수 사건과 완결된 연속 장면을 우선하고 후보 총량의 약 {SHORT_DAY_KEEP_RATIO:.0%}만 권장 분량으로 사용하세요.",
+        "각 날짜를 출발/도입 → 탐색/이동 → 핵심 경험 → 마무리의 4단계 이야기로 구성하되 실제 촬영 순서를 바꾸지 마세요.",
+        "점수가 조금 높은 고립된 조각 여러 개보다 같은 원본에서 맞닿아 이어지는 후보 묶음을 우선해 대화와 동작이 자연스럽게 완결되게 하세요.",
+        "같은 원본의 중간을 건너뛰고 다시 들어가는 jump cut은 꼭 필요한 경우가 아니면 피하고, 선택한다면 앞뒤 맥락이 완결된 구간을 고르세요.",
         "대사가 적거나 없어도 scenery 역할이거나 visual_quality가 높은 안정적인 화면은 날짜별 시각 앵커로 포함하세요.",
         "여정의 시작·이동·주요 장소·음식·사람들의 반응·마무리가 균형 있게 드러나야 합니다.",
         "비슷한 장면을 반복하지 말고, 재미있는 대화와 리액션을 우선하되 날짜별 맥락을 보존하세요.",
@@ -371,9 +377,20 @@ def build_planner_request(
         "## 후보 목록",
         "전체 구조화 데이터는 `candidates.json`에 있고, 아래는 요약입니다.",
     ]
+    configured_target = float(config["editing"]["target_minutes_per_day"]) * 60.0
     for day_key, values in sorted(days.items()):
-        lines.extend(["", f"### {day_key} / DAY {values[0].travel_day}"])
-        for candidate in sorted(values, key=_candidate_sort_key):
+        ordered_values = sorted(values, key=_candidate_sort_key)
+        deduped_values = _dedupe_candidates(ordered_values)
+        available_seconds = used_duration(deduped_values)
+        recommended_seconds = _adaptive_day_target_seconds(deduped_values, configured_target)
+        lines.extend(
+            [
+                "",
+                f"### {day_key} / DAY {values[0].travel_day}",
+                f"- usable candidate total: {available_seconds:.1f}s; recommended selection ceiling: {recommended_seconds:.1f}s",
+            ]
+        )
+        for candidate in ordered_values:
             transcript = re.sub(r"\s+", " ", candidate.transcript).strip()
             if len(transcript) > 180:
                 transcript = transcript[:177] + "..."
@@ -391,7 +408,8 @@ def build_planner_request(
             f"- project는 {config['project']['name']}",
             f"- candidate_set_hash는 {candidate_set_hash}",
             "- 모든 날짜를 episodes에 정확히 한 번씩 포함",
-            "- segment에는 candidate_id, role, reason을 포함; location/caption/speed는 선택",
+            f"- 각 episode의 target_duration 필드는 {configured_target:.1f}으로 유지하고, 위 recommended ceiling은 segment 실제 합계에만 적용",
+            "- segment에는 candidate_id, role, reason, location, caption, speed를 모두 포함; 표시값이 없으면 location/caption은 null, speed는 1.0",
         ]
     )
     return "\n".join(lines).strip() + "\n"
@@ -620,7 +638,7 @@ def planner_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "required": ["version", "project", "candidate_set_hash", "episodes"],
         "properties": {
-            "version": {"const": 1},
+            "version": {"type": "integer", "const": 1},
             "project": text,
             "candidate_set_hash": text,
             "episodes": {
@@ -643,7 +661,7 @@ def planner_schema() -> dict[str, Any]:
                             "items": {
                                 "type": "object",
                                 "additionalProperties": False,
-                                "required": ["candidate_id", "role", "reason"],
+                                "required": ["candidate_id", "role", "reason", "location", "caption", "speed"],
                                 "properties": {
                                     "candidate_id": text,
                                     "role": {"type": "string", "enum": sorted(ALLOWED_ROLES)},
@@ -694,14 +712,19 @@ def _select_day_candidates(
     prompt_role_weights: dict[str, float] | None = None,
 ) -> list[Candidate]:
     deduped = _dedupe_candidates(candidates)
-    if sum(item.duration for item in deduped) <= target_seconds:
-        return sorted(deduped, key=_candidate_sort_key)
+    target_seconds = _adaptive_day_target_seconds(deduped, target_seconds)
+    if not deduped:
+        return []
     buckets = max(3, min(8, int(target_seconds // 30)))
     positions = {item.candidate_id: index / max(1, len(deduped) - 1) for index, item in enumerate(deduped)}
+    candidate_indices = {item.candidate_id: index for index, item in enumerate(deduped)}
     # A score-only summary can accidentally begin after the actual departure.
     # Pin the first usable candidate for narrative continuity, and the last one
     # when it fits, before filling the middle by quality and coverage.
     selected: list[Candidate] = [deduped[0]]
+
+    if deduped[-1] not in selected and used_duration(selected) + deduped[-1].duration <= target_seconds:
+        selected.append(deduped[-1])
 
     visual_candidates = [
         item
@@ -721,8 +744,6 @@ def _select_day_candidates(
         if visual_anchor not in selected and used_duration(selected) + visual_anchor.duration <= target_seconds:
             selected.append(visual_anchor)
 
-    if deduped[-1] not in selected and used_duration(selected) + deduped[-1].duration <= target_seconds:
-        selected.append(deduped[-1])
     covered_roles: set[str] = set().union(*(set(item.roles) for item in selected))
     covered_buckets = {
         min(buckets - 1, int(positions[item.candidate_id] * buckets))
@@ -742,7 +763,8 @@ def _select_day_candidates(
             boundary = 0.10 if bucket in {0, buckets - 1} and bucket not in covered_buckets else 0.0
             efficiency = min(0.08, 0.08 * 8.0 / max(4.0, item.duration))
             prompt_bonus = sum((prompt_role_weights or {}).get(role, 0.0) for role in set(item.roles))
-            return item.score + diversity + boundary + efficiency + prompt_bonus, -item.duration
+            continuity = _selection_continuity_bonus(item, selected, deduped, candidate_indices)
+            return item.score + diversity + boundary + efficiency + prompt_bonus + continuity, -item.duration
 
         chosen = max(affordable, key=gain)
         selected.append(chosen)
@@ -757,6 +779,56 @@ def _select_day_candidates(
 
 def used_duration(candidates: list[Candidate]) -> float:
     return sum(item.duration for item in candidates)
+
+
+def _adaptive_day_target_seconds(candidates: list[Candidate], configured_target: float) -> float:
+    """Treat a day target as a ceiling instead of padding a short day with every cue."""
+    available = used_duration(candidates)
+    if not candidates or available >= configured_target:
+        return configured_target
+    if len(candidates) <= 2:
+        return available
+    boundary_anchors = candidates[0].duration
+    if candidates[-1].candidate_id != candidates[0].candidate_id:
+        boundary_anchors += candidates[-1].duration
+    return min(configured_target, max(boundary_anchors, available * SHORT_DAY_KEEP_RATIO))
+
+
+def _selection_continuity_bonus(
+    candidate: Candidate,
+    selected: list[Candidate],
+    ordered: list[Candidate],
+    indices: dict[str, int],
+) -> float:
+    """Prefer complete source runs without letting continuity defeat timeline coverage."""
+    index = indices[candidate.candidate_id]
+    selected_ids = {item.candidate_id for item in selected}
+    neighboring: list[Candidate] = []
+    if index > 0:
+        neighboring.append(ordered[index - 1])
+    if index + 1 < len(ordered):
+        neighboring.append(ordered[index + 1])
+    potential = 0.0
+    for neighbor in neighboring:
+        if neighbor.clip_id != candidate.clip_id:
+            continue
+        source_gap = max(
+            candidate.start - neighbor.end,
+            neighbor.start - candidate.end,
+            0.0,
+        )
+        if neighbor.candidate_id in selected_ids:
+            if source_gap <= MAX_SOURCE_OVERLAP_SECONDS:
+                return 0.30
+            if source_gap <= 2.0:
+                return 0.12
+        elif source_gap <= MAX_SOURCE_OVERLAP_SECONDS:
+            potential = max(potential, 0.12)
+    if potential:
+        return potential
+    if any(item.clip_id == candidate.clip_id for item in selected):
+        return -0.06
+    return 0.0
 
 
 def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
