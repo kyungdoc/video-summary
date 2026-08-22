@@ -43,7 +43,7 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 17
+RENDER_POLICY_VERSION = 18
 SOURCE_RENDER_POLICY_VERSION = 8
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
@@ -94,6 +94,7 @@ def render_cache_key(
     font_signature: list[dict[str, str]] | None = None,
     trip_intro_signature: list[dict[str, str]] | None = None,
     intro_metadata: dict[str, Any] | None = None,
+    moment_coverage: dict[str, Any] | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "version": version,
@@ -116,6 +117,8 @@ def render_cache_key(
         }
     if version >= 15:
         payload["intro_metadata"] = intro_metadata or {}
+    if version >= 18:
+        payload["moment_coverage"] = moment_coverage or {}
     return stable_hash(payload, length=32)
 
 
@@ -179,6 +182,94 @@ def report_outputs_exist(report: dict[str, Any]) -> bool:
     )
 
 
+def family_interview_coverage(
+    candidates_payload: dict[str, Any],
+    candidates: list[Candidate],
+    plan: EditPlan,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Build privacy-minimal, auditable coverage for mandatory interview events."""
+    selected_ids = {
+        segment.candidate_id
+        for episode in plan.episodes
+        for segment in episode.segments
+    }
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    raw_events = candidates_payload.get("required_events", [])
+    if not enabled:
+        return {
+            "status": "disabled",
+            "detected_event_count": 0,
+            "required_candidate_count": 0,
+            "selected_candidate_count": 0,
+            "events": [],
+        }
+    if not isinstance(raw_events, list):
+        raise VideoSummaryError("candidates.json의 required_events가 잘못되었습니다.")
+
+    events: list[dict[str, Any]] = []
+    required_ids: set[str] = set()
+    selected_required_ids: set[str] = set()
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            raise VideoSummaryError("candidates.json의 가족 인터뷰 이벤트가 잘못되었습니다.")
+        event_id = str(raw_event.get("event_id", "")).strip()
+        candidate_ids_value = raw_event.get("candidate_ids", [])
+        if (
+            not event_id
+            or not isinstance(candidate_ids_value, list)
+            or any(not isinstance(value, str) or not value.strip() for value in candidate_ids_value)
+        ):
+            raise VideoSummaryError("candidates.json의 가족 인터뷰 이벤트가 잘못되었습니다.")
+        candidate_ids = list(dict.fromkeys(value.strip() for value in candidate_ids_value))
+        missing_catalog = [value for value in candidate_ids if value not in candidate_by_id]
+        if missing_catalog:
+            raise VideoSummaryError(
+                f"가족 인터뷰 이벤트가 알 수 없는 후보를 참조합니다: {event_id}"
+            )
+        selected_event_ids = [value for value in candidate_ids if value in selected_ids]
+        missing_selected = [value for value in candidate_ids if value not in selected_ids]
+        if missing_selected:
+            raise VideoSummaryError(
+                "필수 가족 인터뷰 후보가 최종 plan에서 누락되었습니다: "
+                + ", ".join(missing_selected)
+            )
+        required_ids.update(candidate_ids)
+        selected_required_ids.update(selected_event_ids)
+        signals_value = raw_event.get("signals", [])
+        signals = (
+            [str(value) for value in signals_value if isinstance(value, str)]
+            if isinstance(signals_value, list)
+            else []
+        )
+        confidence_value = raw_event.get("confidence")
+        confidence = (
+            round(float(confidence_value), 3)
+            if isinstance(confidence_value, (int, float)) and not isinstance(confidence_value, bool)
+            else None
+        )
+        events.append(
+            {
+                "event_id": event_id,
+                "day_key": str(raw_event.get("day_key", "")),
+                "source": "local_transcript",
+                "confidence": confidence,
+                "signals": signals,
+                "candidate_ids": candidate_ids,
+                "selected_candidate_ids": selected_event_ids,
+            }
+        )
+
+    return {
+        "status": "satisfied" if events else "not_detected",
+        "detected_event_count": len(events),
+        "required_candidate_count": len(required_ids),
+        "selected_candidate_count": len(selected_required_ids),
+        "events": events,
+    }
+
+
 def render_project(
     paths: ProjectPaths,
     config: dict[str, Any],
@@ -214,6 +305,14 @@ def render_project(
         manifest,
         (episode.day_key for episode in ordered_episodes),
     )
+    moment_coverage = {
+        "family_interviews": family_interview_coverage(
+            candidates_payload,
+            candidates,
+            validated,
+            enabled=bool(config["editing"].get("preserve_family_interviews", True)),
+        )
+    }
     trip_intro_signature: list[dict[str, str]] | None = None
     if mode == "trip" and render_config.get("trip_intro_style") == "mosaic":
         grid_size = configured_mosaic_grid_size(render_config)
@@ -237,6 +336,7 @@ def render_project(
         font_signature=render_font_signature(config),
         trip_intro_signature=trip_intro_signature,
         intro_metadata=intro_metadata.to_dict(),
+        moment_coverage=moment_coverage,
     )
     legacy_cache_key = render_cache_key(
         validated, clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
@@ -383,7 +483,7 @@ def render_project(
                 )
             )
         report = {
-            "version": 3,
+            "version": 4,
             "cache_key": cache_key,
             "project": validated.project,
             "planner": validated.planner,
@@ -393,6 +493,7 @@ def render_project(
             "mode": mode,
             "draft": draft,
             "intro_metadata": intro_metadata.to_dict(),
+            "moment_coverage": moment_coverage,
             "outputs": outputs,
         }
         if trip_intro_report is not None:
@@ -514,8 +615,20 @@ def normalized_optional_text(value: str | None) -> str | None:
     return normalized or None
 
 
+def is_required_event_candidate(candidate: Candidate) -> bool:
+    return bool(candidate.required_event_ids)
+
+
 def effective_source_location(segment: PlanSegment, candidate: Candidate) -> str | None:
+    if is_required_event_candidate(candidate):
+        return None
     return normalized_optional_text(segment.location or candidate.location)
+
+
+def effective_source_caption(segment: PlanSegment, candidate: Candidate) -> str | None:
+    if is_required_event_candidate(candidate):
+        return None
+    return normalized_optional_text(segment.caption)
 
 
 def source_selections_are_contiguous(
@@ -531,8 +644,8 @@ def source_selections_are_contiguous(
         and previous.segment.speed == current.segment.speed
         and effective_source_location(previous.segment, previous.candidate)
         == effective_source_location(current.segment, current.candidate)
-        and normalized_optional_text(previous.segment.caption)
-        == normalized_optional_text(current.segment.caption)
+        and effective_source_caption(previous.segment, previous.candidate)
+        == effective_source_caption(current.segment, current.candidate)
     )
 
 
@@ -1703,7 +1816,7 @@ def write_vtt(path: Path, pieces: list[Piece], paths: ProjectPaths) -> None:
         for member in piece_source_members(piece):
             candidate = member.candidate
             speed = member.segment.speed
-            caption = normalized_optional_text(member.segment.caption)
+            caption = effective_source_caption(member.segment, candidate)
             if caption:
                 start = timeline + member.offset
                 end = min(

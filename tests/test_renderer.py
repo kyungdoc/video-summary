@@ -28,6 +28,7 @@ from video_summary.renderer import (
     card_fade_seconds,
     coalesce_source_selections,
     episode_pieces,
+    family_interview_coverage,
     legacy_segment_directories,
     render_cache_key,
     render_card_piece,
@@ -315,6 +316,67 @@ class RendererTests(unittest.TestCase):
         )
         self.assertEqual([member.label for member in pieces[1].source_members], ["Pier 39", "scenery"])
 
+    def test_episode_coalesces_required_interview_without_internal_fades_or_metadata(self) -> None:
+        first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
+        second = candidate("second", "2026-08-19T08:00:00+09:00", 5.0)
+        first.location = "Hotel lobby"
+        second.location = "Beach"
+        first.required_event_ids = ["family_interview_1"]
+        second.required_event_ids = ["family_interview_1"]
+        segments = [
+            PlanSegment(first.candidate_id, "interview", "", caption="First planner caption"),
+            PlanSegment(second.candidate_id, "interview", "", caption="Second planner caption"),
+        ]
+        episode = Episode("2026-08-19", 1, "DAY 1", "", "", 10.0, segments)
+        plan = EditPlan("Trip", "", "local", "hash", [episode])
+        clip = Clip(
+            clip_id="clip", path="/tmp/clip.mp4", relative_path="clip.mp4", fingerprint="fp",
+            size_bytes=1, duration=20.0, captured_at=first.captured_at, capture_source="filename",
+            day_key=episode.day_key, travel_day=1, width=1920, height=1080, fps=30.0,
+            codec="h264", rotation=0, has_audio=True,
+        )
+        render_calls: list[dict[str, object]] = []
+
+        def fake_card(_directory: Path, card_id: str, *_args, **_kwargs) -> Piece:
+            return Piece(Path(f"/{card_id}.mp4"), 2.0, card_id)
+
+        def fake_source(segment: PlanSegment, item: Candidate, *_args, **kwargs) -> Piece:
+            render_calls.append(kwargs)
+            return Piece(Path(f"/{item.candidate_id}.mp4"), 10.0, segment.role, item, segment)
+
+        with (
+            patch("video_summary.renderer.render_card_piece", side_effect=fake_card),
+            patch("video_summary.renderer.render_source_piece", side_effect=fake_source),
+        ):
+            pieces = episode_pieces(
+                episode,
+                plan,
+                {item.candidate_id: item for item in (first, second)},
+                {clip.clip_id: clip},
+                copy.deepcopy(DEFAULT_CONFIG),
+                Path("/segments"),
+                Path("/cards"),
+                Path("/overlays"),
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                True,
+                include_intro=False,
+                include_outro=False,
+                force=False,
+            )
+
+        self.assertEqual(len(pieces), 2)  # date card + one continuous interview source
+        self.assertEqual(len(render_calls), 1)
+        self.assertEqual(
+            [selection.candidate.candidate_id for selection in render_calls[0]["coalesced_selections"]],
+            ["first", "second"],
+        )
+        self.assertIsNone(render_calls[0]["location_overlay"])
+        self.assertEqual((render_calls[0]["fade_in"], render_calls[0]["fade_out"]), (True, True))
+
     def test_coalescing_rejects_any_incompatible_source_property(self) -> None:
         first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
         second = candidate("second", "2026-08-19T08:00:00+09:00", 5.001)
@@ -437,8 +499,92 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(card_fade_seconds("trip-outro", 0.4), 0.1)
 
     def test_audio_assembly_policy_invalidates_completed_render_but_reuses_sources(self) -> None:
-        self.assertEqual(RENDER_POLICY_VERSION, 17)
+        self.assertEqual(RENDER_POLICY_VERSION, 18)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
+
+    def test_family_interview_coverage_is_satisfied_or_not_detected(self) -> None:
+        interview = candidate("interview", "2026-08-19T10:00:00+09:00", 0.0)
+        interview.required_event_ids = ["interview_1"]
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [
+                Episode(
+                    interview.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    30.0,
+                    [PlanSegment("interview", "interview", "가족 여행 소감")],
+                )
+            ],
+        )
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "interview_1",
+                    "day_key": interview.day_key,
+                    "confidence": 0.94,
+                    "signals": ["ko_trip_review_question", "spoken_answer"],
+                    "candidate_ids": ["interview"],
+                }
+            ]
+        }
+
+        coverage = family_interview_coverage(payload, [interview], plan, enabled=True)
+        self.assertEqual(coverage["status"], "satisfied")
+        self.assertEqual(coverage["detected_event_count"], 1)
+        self.assertEqual(coverage["selected_candidate_count"], 1)
+        self.assertEqual(coverage["events"][0]["source"], "local_transcript")
+        self.assertNotIn("transcript", coverage["events"][0])
+        self.assertEqual(
+            family_interview_coverage({"required_events": []}, [], plan, enabled=True)["status"],
+            "not_detected",
+        )
+
+    def test_family_interview_coverage_rejects_a_missing_required_candidate(self) -> None:
+        interview = candidate("interview", "2026-08-19T10:00:00+09:00", 0.0)
+        plan = EditPlan("Trip", "", "file", "hash", [])
+        with self.assertRaisesRegex(VideoSummaryError, "최종 plan에서 누락"):
+            family_interview_coverage(
+                {
+                    "required_events": [
+                        {"event_id": "interview_1", "candidate_ids": ["interview"]}
+                    ]
+                },
+                [interview],
+                plan,
+                enabled=True,
+            )
+
+    def test_moment_coverage_changes_render_cache_but_not_source_namespace(self) -> None:
+        plan = EditPlan("Trip", "", "local", "hash", [])
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        base = {"family_interviews": {"status": "not_detected", "events": []}}
+        changed = {
+            "family_interviews": {
+                "status": "satisfied",
+                "events": [{"event_id": "interview_1", "candidate_ids": ["c1"]}],
+            }
+        }
+        first = render_cache_key(
+            plan, [], config["render"], "trip", False,
+            1280, 720, 30, "libx264", "4M",
+            version=RENDER_POLICY_VERSION,
+            moment_coverage=base,
+        )
+        second = render_cache_key(
+            plan, [], config["render"], "trip", False,
+            1280, 720, 30, "libx264", "4M",
+            version=RENDER_POLICY_VERSION,
+            moment_coverage=changed,
+        )
+        namespace = source_cache_namespace(config, 1280, 720, 30, "libx264", "4M")
+        self.assertNotEqual(first, second)
+        self.assertEqual(namespace, source_cache_namespace(config, 1280, 720, 30, "libx264", "4M"))
 
     def test_regular_cards_use_integer_frame_durations_without_accumulated_drift(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)

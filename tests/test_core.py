@@ -20,7 +20,7 @@ from video_summary.media import (
 )
 from video_summary.cli import build_parser, parse_target_minutes
 from video_summary.models import Clip, TranscriptCue
-from video_summary.pipeline import _help_has_flag
+from video_summary.pipeline import _help_has_flag, analyze_project
 from video_summary.project import DEFAULT_CONFIG, _validate_config, project_paths
 from video_summary.state import StateStore
 from video_summary.transcribe import (
@@ -35,6 +35,39 @@ from video_summary.utils import VideoSummaryError
 
 
 class CoreTests(unittest.TestCase):
+    def test_family_interview_preservation_config_requires_boolean(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        self.assertTrue(config["editing"]["preserve_family_interviews"])
+        config["editing"]["preserve_family_interviews"] = "yes"
+        with self.assertRaisesRegex(VideoSummaryError, "preserve_family_interviews"):
+            _validate_config(config)
+
+    def test_analyze_rejects_skipped_transcription_when_interviews_are_preserved(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        paths = project_paths("/tmp", "interview-skip-test")
+        with self.assertRaisesRegex(VideoSummaryError, "가족 인터뷰"):
+            analyze_project(paths, config, skip_transcribe=True)
+
+    def test_analyze_allows_skipped_transcription_after_explicit_interview_opt_out(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["editing"]["preserve_family_interviews"] = False
+        paths = project_paths("/tmp", "interview-skip-opt-out-test")
+        with (
+            patch("video_summary.pipeline.load_clips", return_value=[]),
+            patch(
+                "video_summary.pipeline.transcribe_project",
+                return_value={"backend": "skip", "clip_count": 0},
+            ) as transcribe,
+            patch(
+                "video_summary.pipeline.build_candidates",
+                return_value={"count": 0},
+            ),
+        ):
+            result = analyze_project(paths, config, skip_transcribe=True)
+
+        self.assertEqual(result["transcription"]["backend"], "skip")
+        self.assertTrue(transcribe.call_args.kwargs["skip"])
+
     def test_prompt_runtime_range_is_inferred(self) -> None:
         self.assertEqual(parse_target_minutes("날짜별 4~6분으로 만들어줘"), 5.0)
         self.assertEqual(parse_target_minutes("약 1시간으로"), 60.0)

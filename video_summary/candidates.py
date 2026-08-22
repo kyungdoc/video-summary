@@ -4,6 +4,7 @@ import math
 import os
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,220 @@ SCENERY_WORDS = {
     "beach", "mountain", "sunset", "view", "street", "market", "pool",
 }
 MAX_CANDIDATE_DURATION_SECONDS = 18.0
+INTERVIEW_DETECTION_POLICY_VERSION = 2
+INTERVIEW_ANSWER_WAIT_SECONDS = 15.0
+INTERVIEW_CONTINUATION_GAP_SECONDS = 12.0
+INTERVIEW_EVENT_MAX_SPAN_SECONDS = 180.0
+INTERVIEW_CONTEXT_EVENT_MAX_DISTANCE_SECONDS = 90.0
+
+
+@dataclass(frozen=True, slots=True)
+class _InterviewEvent:
+    event_id: str
+    clip_id: str
+    start: float
+    end: float
+    confidence: float
+    signals: tuple[str, ...]
+    anchor_event_id: str | None = None
+
+
+_INTERVIEW_QUESTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "ko_trip_review_question",
+        re.compile(
+            r"(?:이번\s*)?(?:여행|여행지|휴가|오늘|하루|호텔|숙소|리조트|수영장|체험|관광|일정)"
+            r".{0,28}?(?:어땠(?:습니까|나요|어요|어)?|어때(?:요)?|어떠(?:셨|했))"
+        ),
+    ),
+    (
+        "ko_enjoyment_question",
+        re.compile(
+            r"(?:여행|여행지|휴가|오늘|하루|호텔|숙소|리조트|수영장|체험|관광|일정)"
+            r".{0,28}?(?:재밌었|재미있었|좋았|즐거웠|맛있었|신났)"
+            r"(?:나요|니|습니까|어\s*[?？]|어요\s*[?？])"
+        ),
+    ),
+    (
+        "ko_evaluation_question",
+        re.compile(
+            r"어땠(?:나요|습니까)(?:\s*[?？])?"
+            r"|어땠(?:어요|어)\s*[?？]"
+        ),
+    ),
+    (
+        "ko_favorite_question",
+        re.compile(
+            r"(?:뭐|무엇|어디|어떤|누가|언제).{0,32}?(?:제일|가장).{0,32}?"
+            r"(?:좋|재밌|재미|기억|맛있|인상|신나|행복|추천)"
+            r"|(?:제일|가장).{0,32}?(?:뭐|무엇|어디|어떤).{0,32}?"
+            r"(?:좋|재밌|재미|기억|맛있|인상|신나|행복|추천)?"
+            r"|(?:뭐|무엇|어디|어떤)(?:가|이|를|을)?.{0,20}?"
+            r"(?:좋았|재밌었|재미있었|기억에\s*남|맛있었|인상적)"
+        ),
+    ),
+    (
+        "ko_trip_memory_question",
+        re.compile(
+            r"(?:여행|휴가|오늘|이번).{0,36}?(?:기억에\s*남|좋았|재밌었|재미있었|인상적)"
+            r".{0,24}?(?:뭐|무엇|어디|어떤)"
+            r"|(?:이번\s*)?(?:여행|휴가)(?:에서|중|의|은|는)?\s*.{0,24}?"
+            r"기억에\s*남는\s*(?:건|것(?:은|이)?|게)(?:\s*[?？])?"
+        ),
+    ),
+    (
+        "ko_reflection_question",
+        re.compile(
+            r"(?:소감|느낌).{0,24}?(?:어때|어땠|말해|들려|한마디|뭐|어떤)"
+            r"|(?:(?:이번\s*)?(?:여행|휴가)(?:에서|의|은|는)?\s*)?"
+            r"(?:소감|느낌)(?:은|이|도)?\s*[?？]"
+            r"|(?:한\s*마디|한마디)\s*(?:해|말해)\s*(?:주(?:세요|십시오)|줘)"
+            r"|(?:몇\s*점|점수).{0,20}?(?:줄|줘|인가|이야|입니까)"
+            r"|(?:다시|또).{0,24}?(?:오고|가고|하고|먹고).{0,16}?"
+            r"(?:싶(?:니|나요|습니까)|(?:싶어|싶어요)\s*[?？])"
+        ),
+    ),
+    (
+        "ko_stay_or_return_question",
+        re.compile(
+            r"(?:며칠|얼마나).{0,24}?(?:더\s*)?(?:있고|머물고).{0,12}?싶(?:나요|니|습니까)"
+            r"|(?:가고|오고|있고|머물고|돌아가고).{0,12}?싶(?:나요|니|습니까)"
+        ),
+    ),
+    (
+        "en_trip_review_question",
+        re.compile(
+            r"\bhow\s+(?:was|is|did\s+you\s+like)\s+"
+            r"(?:(?:your|the|this|our)\s+)?"
+            r"(?:trip|travel|vacation|holiday|day|hotel|resort|pool|tour|experience|flight)\b"
+        ),
+    ),
+    (
+        "en_favorite_question",
+        re.compile(
+            r"\bwhat\b.{0,42}?\b(?:favorite|favourite|best|most\s+fun|liked\s+most|remember\s+most)\b"
+            r"|\b(?:favorite|favourite|best)\s+(?:part|thing|place|food|memory).{0,24}?\bwhat\b"
+        ),
+    ),
+    (
+        "en_reflection_question",
+        re.compile(
+            r"\b(?:did\s+you\s+enjoy|would\s+you\s+(?:come\s+back|visit\s+again|recommend))\b"
+        ),
+    ),
+    (
+        "en_open_reflection_question",
+        re.compile(
+            r"\btell\s+(?:us|me).{0,28}?\b(?:favorite|favourite|best|thoughts?)\b"
+        ),
+    ),
+)
+
+_EN_DESTINATION_REVIEW_PATTERN = re.compile(
+    r"\b[Hh]ow\s+(?:was|is)\s+"
+    r"[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){0,3}\s*[?？]"
+)
+
+_INTERVIEW_FOLLOWUP_QUESTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "ko_reason_followup",
+        re.compile(
+            r"^(?:(?:그건|그게)\s*)?왜(?:\s+그렇게)?"
+            r"(?:\s+(?:생각|느끼|느껴|좋|재밌|재미있)[^?？]*)?"
+            r"\s*(?:요)?\s*[?？]"
+        ),
+    ),
+    (
+        "en_reason_followup",
+        re.compile(
+            r"^why(?:\s+(?:do|did)\s+you\s+(?:think|feel)\s+(?:so|that))?\s*[?？]"
+            r"|^what\s+(?:made|makes)\s+you\s+(?:say|think|feel)\s+that\s*[?？]"
+        ),
+    ),
+)
+
+_INTERVIEW_CONTEXT_PATTERN = re.compile(
+    r"(?:인터뷰|소감|한마디|카메라\s*보고|interview|on\s+camera)",
+)
+
+_INTERVIEW_CONTINUATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "ko_evaluation_answer",
+        re.compile(
+            r"(?:제일|가장|와서|가서|해서|보니까|먹어\s*보니까).{0,42}?"
+            r"(?:재밌었|재미있었|좋았|맛있었|기억에\s*남|최고였|즐거웠|행복했|신났)"
+            r"|(?:재밌었|재미있었|좋았|맛있었|기억에\s*남|최고였|즐거웠|행복했|신났)"
+            r".{0,28}?(?:여행|휴가|하루|곳|장소|음식|체험|끝)"
+            r"|(?:또|다시).{0,24}?(?:오고|가고|하고|먹고).{0,16}?싶"
+        ),
+    ),
+    (
+        "en_evaluation_answer",
+        re.compile(
+            r"\b(?:my\s+(?:favorite|favourite)|the\s+best)\b.{0,36}?\bwas\b"
+            r"|\bi\s+(?:really\s+)?(?:liked|loved|enjoyed)\b"
+            r"|\bit\s+was\s+(?:really\s+)?(?:fun|great|amazing|awesome|memorable)\b"
+            r"|\b(?:come\s+back|visit\s+again|do\s+it\s+again)\b"
+        ),
+    ),
+)
+
+_NON_ANSWER_TEXTS = {
+    "어",
+    "어어",
+    "음",
+    "으음",
+    "네",
+    "예",
+    "응",
+    "아",
+    "글쎄",
+    "모르겠어",
+    "모르겠어요",
+    "yes",
+    "yeah",
+    "yep",
+    "ok",
+    "okay",
+    "um",
+    "uh",
+    "hmm",
+}
+
+_AFFIRMATIVE_ANSWER_TEXTS = {
+    "네",
+    "예",
+    "응",
+    "yes",
+    "yeah",
+    "yep",
+}
+
+_PERSONAL_SHORT_ANSWER_TEXTS = {
+    "모르겠어",
+    "모르겠어요",
+    "i don't know",
+    "i don’t know",
+    "not sure",
+}
+
+_AFFIRMATIVE_QUESTION_SIGNALS = {
+    "ko_trip_review_question",
+    "ko_enjoyment_question",
+    "ko_evaluation_question",
+    "ko_stay_or_return_question",
+    "en_trip_review_question",
+    "en_reflection_question",
+    "en_destination_review_question",
+}
+
+_UNCERTAINTY_QUESTION_SIGNALS = _AFFIRMATIVE_QUESTION_SIGNALS | {
+    "ko_favorite_question",
+    "ko_trip_memory_question",
+    "ko_reflection_question",
+    "en_favorite_question",
+    "en_open_reflection_question",
+}
 
 
 def build_candidates(
@@ -54,16 +269,43 @@ def build_candidates(
     state.mark_running("candidates", cache_key)
     try:
         candidates: list[Candidate] = []
+        required_interview_events: list[tuple[Clip, _InterviewEvent]] = []
+        preserve_family_interviews = _preserve_family_interviews(config)
+        cues_by_clip = {
+            clip.clip_id: load_transcript(paths, clip.clip_id)
+            for clip in clips
+            if clip.duration > 0
+        }
+        interview_events_by_clip = (
+            _detect_family_interview_events(clips, cues_by_clip)
+            if preserve_family_interviews
+            else {}
+        )
         for index, clip in enumerate(clips, start=1):
             if clip.duration <= 0:
                 continue
             print_status(f"candidates {index}/{len(clips)}: {Path(clip.path).name}")
-            cues = load_transcript(paths, clip.clip_id)
+            cues = cues_by_clip[clip.clip_id]
             signals = analyze_visual_signals(paths, clip, interval, force=force)
-            windows = _candidate_windows(clip, cues, signals, max_per_clip)
+            interview_events = interview_events_by_clip.get(clip.clip_id, [])
+            required_interview_events.extend((clip, event) for event in interview_events)
+            windows = _candidate_windows(
+                clip,
+                cues,
+                signals,
+                max_per_clip,
+                required_events=interview_events,
+            )
             for start, end, origin in windows:
                 text = _window_transcript(cues, start, end)
                 roles = _roles(text, clip, start, end, origin)
+                required_event_ids = [
+                    event.event_id
+                    for event in interview_events
+                    if _ranges_overlap(start, end, event.start, event.end)
+                ]
+                if required_event_ids:
+                    roles = unique_preserving_order(["interview", *roles])
                 motion, quality = _window_signals(signals, start, end)
                 speech_duration = sum(
                     max(0.0, min(cue.end, end) - max(cue.start, start))
@@ -107,23 +349,33 @@ def build_candidates(
                         visual_quality=round(quality, 5),
                         location=location,
                         frame_path=str(frame_path.relative_to(paths.root)),
+                        required_event_ids=required_event_ids,
                     )
                 )
 
         candidates.sort(key=lambda item: (_candidate_timestamp(item), item.candidate_id))
         if not candidates:
             raise VideoSummaryError("편집 후보를 만들지 못했습니다.")
+        required_events = _required_events_payload(required_interview_events, candidates)
         payload = {
-            "version": 1,
+            "version": 2,
             "project": config["project"]["name"],
             "cache_key": cache_key,
             "candidate_set_hash": stable_hash([candidate.to_dict() for candidate in candidates], length=32),
             "count": len(candidates),
             "days": _day_summary(candidates),
+            "required_events": required_events,
             "candidates": [candidate.to_dict() for candidate in candidates],
         }
         write_json(paths.candidates, payload)
-        state.mark_complete("candidates", cache_key, {"candidate_count": len(candidates)})
+        state.mark_complete(
+            "candidates",
+            cache_key,
+            {
+                "candidate_count": len(candidates),
+                "required_event_count": len(required_events),
+            },
+        )
         return payload
     except BaseException as exc:
         state.mark_failed("candidates", cache_key, str(exc))
@@ -157,8 +409,12 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 10,
+            "version": 11,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
+            "family_interview_detection": {
+                "policy": INTERVIEW_DETECTION_POLICY_VERSION,
+                "preserve": _preserve_family_interviews(config),
+            },
             "project": config["project"]["name"],
             "clips": [
                 (
@@ -187,11 +443,628 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
     )
 
 
+def _preserve_family_interviews(config: dict[str, Any]) -> bool:
+    return config.get("editing", {}).get("preserve_family_interviews", True) is True
+
+
+def _detect_family_interview_events(
+    clips: list[Clip],
+    cues_by_clip: dict[str, list[TranscriptCue]],
+) -> dict[str, list[_InterviewEvent]]:
+    events_by_clip = {
+        clip.clip_id: _detect_interview_events(clip, cues_by_clip.get(clip.clip_id, []))
+        for clip in clips
+        if clip.duration > 0
+    }
+    anchors = [
+        (clip, event)
+        for clip in clips
+        for event in events_by_clip.get(clip.clip_id, [])
+    ]
+    ordered_clips = sorted(clips, key=_clip_start_timestamp)
+    for clip in ordered_clips:
+        if clip.duration <= 0 or clip.duration > 90.0 or events_by_clip.get(clip.clip_id):
+            continue
+        clip_start = _clip_start_timestamp(clip)
+        nearby_anchors = [
+            (anchor_clip, anchor_event)
+            for anchor_clip, anchor_event in anchors
+            if anchor_clip.day_key == clip.day_key
+            and _clip_start_timestamp(anchor_clip) < clip_start
+            and -5.0
+            <= clip_start - (_clip_start_timestamp(anchor_clip) + anchor_clip.duration)
+            <= 120.0
+        ]
+        if not nearby_anchors:
+            continue
+        _, anchor_event = max(
+            nearby_anchors,
+            key=lambda item: _clip_start_timestamp(item[0]),
+        )
+        continuation = _detect_interview_continuation(
+            clip,
+            cues_by_clip.get(clip.clip_id, []),
+            anchor_event,
+        )
+        if continuation is not None:
+            events_by_clip[clip.clip_id] = [continuation]
+    return events_by_clip
+
+
+def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_InterviewEvent]:
+    """Find high-confidence travel-review Q&A without identifying any speaker."""
+    ordered = sorted(
+        (cue for cue in cues if cue.end > cue.start and cue.text.strip()),
+        key=lambda cue: (cue.start, cue.end),
+    )
+    events: list[_InterviewEvent] = []
+    for question_index, question_cue in enumerate(ordered):
+        questions = _interview_questions(question_cue.text)
+        if not questions:
+            continue
+        question_signal, _, question_match_end = questions[-1]
+        answer_index: int | None = None
+        for option_index, (signal, _, match_end) in enumerate(questions):
+            next_question_start = (
+                questions[option_index + 1][1]
+                if option_index + 1 < len(questions)
+                else None
+            )
+            same_cue_answer = _answer_after_question(
+                question_cue.text,
+                match_end,
+                stop_at=next_question_start,
+            )
+            if _is_substantive_interview_answer(
+                same_cue_answer,
+                allow_affirmative=_allows_affirmative_answer(signal),
+                allow_uncertainty=_allows_uncertainty_answer(signal),
+            ):
+                question_signal = signal
+                question_match_end = match_end
+                answer_index = question_index
+                break
+        if answer_index is None:
+            for index in range(question_index + 1, len(ordered)):
+                answer_cue = ordered[index]
+                if answer_cue.start - question_cue.end > INTERVIEW_ANSWER_WAIT_SECONDS:
+                    break
+                if _looks_like_question(answer_cue.text):
+                    continue
+                if _is_substantive_interview_answer(
+                    answer_cue.text,
+                    allow_affirmative=_allows_affirmative_answer(question_signal),
+                    allow_uncertainty=_allows_uncertainty_answer(question_signal),
+                ):
+                    answer_index = index
+                    break
+        if answer_index is None:
+            continue
+
+        answer_cue = ordered[answer_index]
+        anchor_end = max(question_cue.end, answer_cue.end)
+        start = max(0.0, question_cue.start - 0.35)
+        next_question_start = question_cue.start
+        for previous in reversed(ordered[:question_index]):
+            if next_question_start - previous.end > INTERVIEW_CONTINUATION_GAP_SECONDS:
+                break
+            if not _looks_like_question(previous.text):
+                break
+            proposed_start = max(0.0, previous.start - 0.35)
+            if anchor_end - proposed_start > INTERVIEW_EVENT_MAX_SPAN_SECONDS:
+                break
+            start = proposed_start
+            next_question_start = previous.start
+        event_end = anchor_end
+        span_limit = start + INTERVIEW_EVENT_MAX_SPAN_SECONDS
+        last_cue = answer_cue
+        followup_signals: list[str] = []
+        unrelated_question_start: float | None = None
+        continuation_index = answer_index + 1
+        while continuation_index < len(ordered):
+            continuation = ordered[continuation_index]
+            if continuation.start >= span_limit:
+                break
+            if continuation.start - last_cue.end > INTERVIEW_CONTINUATION_GAP_SECONDS:
+                break
+            if _looks_like_question(continuation.text):
+                followup = _interview_followup_question(continuation.text)
+                if followup is None:
+                    unrelated_question_start = continuation.start
+                    break
+                followup_signal, followup_match_end = followup
+                followup_answer_index: int | None = None
+                same_cue_followup_answer = _answer_after_question(
+                    continuation.text,
+                    followup_match_end,
+                )
+                if _is_substantive_interview_answer(same_cue_followup_answer):
+                    followup_answer_index = continuation_index
+                else:
+                    for index in range(continuation_index + 1, len(ordered)):
+                        possible_answer = ordered[index]
+                        if possible_answer.start >= span_limit:
+                            break
+                        if (
+                            possible_answer.start - continuation.end
+                            > INTERVIEW_ANSWER_WAIT_SECONDS
+                        ):
+                            break
+                        if _looks_like_question(possible_answer.text):
+                            break
+                        if _is_substantive_interview_answer(possible_answer.text):
+                            followup_answer_index = index
+                            break
+                if followup_answer_index is None:
+                    unrelated_question_start = continuation.start
+                    break
+                followup_answer = ordered[followup_answer_index]
+                event_end = max(event_end, continuation.end, followup_answer.end)
+                last_cue = followup_answer
+                followup_signals.extend(
+                    ["multi_turn_followup", followup_signal, "spoken_followup_answer"]
+                )
+                continuation_index = followup_answer_index + 1
+                continue
+            event_end = max(event_end, continuation.end)
+            last_cue = continuation
+            continuation_index += 1
+
+        end = min(
+            clip.duration,
+            event_end + 0.75,
+            start + INTERVIEW_EVENT_MAX_SPAN_SECONDS,
+            max(event_end, unrelated_question_start)
+            if unrelated_question_start is not None
+            else clip.duration,
+        )
+        if end - start < 0.75:
+            continue
+        signals = [question_signal, "spoken_answer", *followup_signals]
+        if answer_index == question_index:
+            signals.append("same_cue_answer")
+        nearby_context = " ".join(
+            cue.text.casefold()
+            for cue in ordered[max(0, question_index - 1) : min(len(ordered), answer_index + 2)]
+        )
+        if _INTERVIEW_CONTEXT_PATTERN.search(nearby_context):
+            signals.append("interview_context")
+        confidence = min(
+            0.99,
+            0.90
+            + (0.04 if "interview_context" in signals else 0.0)
+            + (0.03 if "same_cue_answer" in signals else 0.0),
+        )
+        event_id = "interview_" + stable_hash(
+            {
+                "policy": INTERVIEW_DETECTION_POLICY_VERSION,
+                "clip_id": clip.clip_id,
+                "fingerprint": clip.fingerprint,
+                "start": round(start, 2),
+                "end": round(end, 2),
+            },
+            length=18,
+        )
+        events.append(
+            _InterviewEvent(
+                event_id=event_id,
+                clip_id=clip.clip_id,
+                start=round(start, 3),
+                end=round(end, 3),
+                confidence=round(confidence, 3),
+                signals=tuple(unique_preserving_order(signals)),
+            )
+        )
+    merged = _merge_interview_events(clip, events)
+    return _expand_explicit_interview_clip(clip, ordered, merged)
+
+
+def _detect_interview_continuation(
+    clip: Clip,
+    cues: list[TranscriptCue],
+    anchor_event: _InterviewEvent,
+) -> _InterviewEvent | None:
+    ordered = sorted(
+        (cue for cue in cues if cue.end > cue.start and cue.text.strip()),
+        key=lambda cue: (cue.start, cue.end),
+    )
+    for answer_index, answer_cue in enumerate(ordered):
+        normalized = " ".join(answer_cue.text.casefold().split())
+        signal = next(
+            (
+                name
+                for name, pattern in _INTERVIEW_CONTINUATION_PATTERNS
+                if pattern.search(normalized) is not None
+            ),
+            None,
+        )
+        if signal is None or not _is_substantive_interview_answer(answer_cue.text):
+            continue
+        start = max(0.0, answer_cue.start - 0.35)
+        event_end = answer_cue.end
+        last_cue = answer_cue
+        for continuation in ordered[answer_index + 1 :]:
+            if _looks_like_question(continuation.text):
+                break
+            if continuation.start - last_cue.end > INTERVIEW_CONTINUATION_GAP_SECONDS:
+                break
+            event_end = max(event_end, continuation.end)
+            last_cue = continuation
+        end = min(clip.duration, event_end + 0.75)
+        if end - start < 0.75:
+            return None
+        event_id = "interview_" + stable_hash(
+            {
+                "policy": INTERVIEW_DETECTION_POLICY_VERSION,
+                "clip_id": clip.clip_id,
+                "fingerprint": clip.fingerprint,
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "anchor_event_id": anchor_event.event_id,
+            },
+            length=18,
+        )
+        return _InterviewEvent(
+            event_id=event_id,
+            clip_id=clip.clip_id,
+            start=round(start, 3),
+            end=round(end, 3),
+            confidence=0.9,
+            signals=("cross_clip_continuation", signal, "spoken_answer"),
+            anchor_event_id=anchor_event.event_id,
+        )
+    return None
+
+
+def _interview_question(text: str) -> tuple[str, int] | None:
+    questions = _interview_questions(text)
+    if not questions:
+        return None
+    signal, _, end = questions[0]
+    return signal, end
+
+
+def _interview_questions(text: str) -> list[tuple[str, int, int]]:
+    case_preserving = " ".join(text.split())
+    normalized = case_preserving.casefold()
+    matches = sorted(
+        [
+            (signal, match.start(), match.end())
+            for signal, pattern in _INTERVIEW_QUESTION_PATTERNS
+            for match in pattern.finditer(normalized)
+        ]
+        + [
+            ("en_destination_review_question", match.start(), match.end())
+            for match in _EN_DESTINATION_REVIEW_PATTERN.finditer(case_preserving)
+        ],
+        key=lambda item: (item[2] - item[1], item[1], item[2]),
+    )
+    selected: list[tuple[str, int, int]] = []
+    for candidate in matches:
+        if any(
+            min(candidate[2], current[2]) - max(candidate[1], current[1]) > 0
+            for current in selected
+        ):
+            continue
+        selected.append(candidate)
+    return sorted(selected, key=lambda item: (item[1], item[2], item[0]))
+
+
+def _answer_after_question(
+    text: str,
+    match_end: int,
+    *,
+    stop_at: int | None = None,
+) -> str:
+    normalized = " ".join(text.casefold().split())
+    question_mark = min(
+        (
+            index
+            for index in (normalized.find("?", match_end), normalized.find("？", match_end))
+            if index >= 0 and (stop_at is None or index < stop_at)
+        ),
+        default=-1,
+    )
+    answer_start = question_mark + 1 if question_mark >= 0 else match_end
+    answer_end = len(normalized) if stop_at is None else stop_at
+    return normalized[answer_start:answer_end].strip(" \t\r\n,.;:!?？~-—")
+
+
+def _looks_like_question(text: str) -> bool:
+    normalized = " ".join(text.casefold().split()).strip()
+    return (
+        _interview_question(normalized) is not None
+        or "?" in normalized
+        or "？" in normalized
+        or re.search(r"(?:나요|니|습니까|까요)\s*[.!…]*$", normalized) is not None
+    )
+
+
+def _interview_followup_question(text: str) -> tuple[str, int] | None:
+    normalized = " ".join(text.casefold().split()).strip()
+    for signal, pattern in _INTERVIEW_FOLLOWUP_QUESTION_PATTERNS:
+        match = pattern.search(normalized)
+        if match is not None:
+            return signal, match.end()
+    return None
+
+
+def _allows_affirmative_answer(question_signal: str) -> bool:
+    return question_signal in _AFFIRMATIVE_QUESTION_SIGNALS
+
+
+def _allows_uncertainty_answer(question_signal: str) -> bool:
+    return question_signal in _UNCERTAINTY_QUESTION_SIGNALS
+
+
+def _is_substantive_interview_answer(
+    text: str,
+    *,
+    allow_affirmative: bool = False,
+    allow_uncertainty: bool = False,
+) -> bool:
+    normalized = " ".join(text.casefold().split()).strip(" \t\r\n,.;:!?？~-—")
+    if not normalized:
+        return False
+    if normalized in _AFFIRMATIVE_ANSWER_TEXTS:
+        return allow_affirmative
+    if normalized in _PERSONAL_SHORT_ANSWER_TEXTS:
+        return allow_uncertainty
+    if normalized in _NON_ANSWER_TEXTS:
+        return False
+    if _looks_like_question(normalized):
+        return False
+    compact = re.sub(r"[^0-9a-z가-힣]", "", normalized)
+    if not compact:
+        return False
+    if re.fullmatch(r"(?:ㅋ+|ㅎ+|ha(?:ha)*|heh(?:e)*)", compact):
+        return False
+    return True
+
+
+def _merge_interview_events(clip: Clip, events: list[_InterviewEvent]) -> list[_InterviewEvent]:
+    groups: list[list[_InterviewEvent]] = []
+    for event in sorted(events, key=lambda item: (item.start, item.end, item.event_id)):
+        if (
+            not groups
+            or event.start - max(item.end for item in groups[-1]) > 1.25
+            or event.end - min(item.start for item in groups[-1])
+            > INTERVIEW_EVENT_MAX_SPAN_SECONDS
+        ):
+            groups.append([event])
+        else:
+            groups[-1].append(event)
+
+    merged: list[_InterviewEvent] = []
+    for group in groups:
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        start = min(event.start for event in group)
+        end = max(event.end for event in group)
+        event_id = "interview_" + stable_hash(
+            {
+                "policy": INTERVIEW_DETECTION_POLICY_VERSION,
+                "clip_id": clip.clip_id,
+                "fingerprint": clip.fingerprint,
+                "start": round(start, 2),
+                "end": round(end, 2),
+            },
+            length=18,
+        )
+        merged.append(
+            _InterviewEvent(
+                event_id=event_id,
+                clip_id=clip.clip_id,
+                start=start,
+                end=end,
+                confidence=max(event.confidence for event in group),
+                signals=tuple(
+                    unique_preserving_order(
+                        signal
+                        for event in group
+                        for signal in event.signals
+                    )
+                ),
+            )
+        )
+    return merged
+
+
+def _expand_explicit_interview_clip(
+    clip: Clip,
+    cues: list[TranscriptCue],
+    events: list[_InterviewEvent],
+) -> list[_InterviewEvent]:
+    if not events:
+        return events
+    clip_text = " ".join(cue.text.casefold() for cue in cues)
+    if _INTERVIEW_CONTEXT_PATTERN.search(clip_text) is None:
+        return events
+    if clip.duration > 90.0:
+        components: list[list[TranscriptCue]] = []
+        for cue in cues:
+            if (
+                not components
+                or cue.start - components[-1][-1].end
+                > INTERVIEW_CONTINUATION_GAP_SECONDS
+            ):
+                components.append([cue])
+            else:
+                components[-1].append(cue)
+
+        expanded: list[_InterviewEvent] = []
+        for event in events:
+            component = next(
+                (
+                    group
+                    for group in components
+                    if any(
+                        _ranges_overlap(event.start, event.end, cue.start, cue.end)
+                        for cue in group
+                    )
+                ),
+                None,
+            )
+            if component is None:
+                expanded.append(event)
+                continue
+            context_cues = [
+                cue
+                for cue in component
+                if _INTERVIEW_CONTEXT_PATTERN.search(cue.text.casefold()) is not None
+                and max(0.0, event.start - cue.end, cue.start - event.end)
+                <= INTERVIEW_CONTEXT_EVENT_MAX_DISTANCE_SECONDS
+                and max(event.end, cue.end) - min(event.start, cue.start)
+                <= INTERVIEW_EVENT_MAX_SPAN_SECONDS
+            ]
+            if not context_cues:
+                expanded.append(event)
+                continue
+            context_cue = min(
+                context_cues,
+                key=lambda cue: (
+                    max(0.0, event.start - cue.end, cue.start - event.end),
+                    abs(((cue.start + cue.end) / 2.0) - ((event.start + event.end) / 2.0)),
+                    cue.start,
+                ),
+            )
+            component_start = max(0.0, component[0].start - 0.35)
+            component_end = min(clip.duration, component[-1].end + 0.75)
+            seed_start = min(event.start, context_cue.start)
+            seed_end = max(event.end, context_cue.end)
+            remaining = max(
+                0.0,
+                INTERVIEW_EVENT_MAX_SPAN_SECONDS - (seed_end - seed_start),
+            )
+            start = max(component_start, seed_start - (remaining / 2.0))
+            end = min(component_end, start + INTERVIEW_EVENT_MAX_SPAN_SECONDS)
+            if end < seed_end:
+                end = seed_end
+                start = max(
+                    component_start,
+                    end - INTERVIEW_EVENT_MAX_SPAN_SECONDS,
+                )
+            if end - start < INTERVIEW_EVENT_MAX_SPAN_SECONDS:
+                start = max(
+                    component_start,
+                    end - INTERVIEW_EVENT_MAX_SPAN_SECONDS,
+                )
+                end = min(
+                    component_end,
+                    start + INTERVIEW_EVENT_MAX_SPAN_SECONDS,
+                )
+            event_id = "interview_" + stable_hash(
+                {
+                    "policy": INTERVIEW_DETECTION_POLICY_VERSION,
+                    "clip_id": clip.clip_id,
+                    "fingerprint": clip.fingerprint,
+                    "start": round(start, 2),
+                    "end": round(end, 2),
+                    "scope": "explicit_contiguous_run",
+                },
+                length=18,
+            )
+            expanded.append(
+                _InterviewEvent(
+                    event_id=event_id,
+                    clip_id=clip.clip_id,
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    confidence=max(0.96, event.confidence),
+                    signals=tuple(
+                        unique_preserving_order(
+                            [
+                                "explicit_interview_context",
+                                "contiguous_interview_run",
+                                *event.signals,
+                            ]
+                        )
+                    ),
+                    anchor_event_id=event.anchor_event_id,
+                )
+            )
+        return _merge_interview_events(clip, expanded)
+
+    event_id = "interview_" + stable_hash(
+        {
+            "policy": INTERVIEW_DETECTION_POLICY_VERSION,
+            "clip_id": clip.clip_id,
+            "fingerprint": clip.fingerprint,
+            "start": 0.0,
+            "end": round(clip.duration, 2),
+            "scope": "explicit_full_clip",
+        },
+        length=18,
+    )
+    return [
+        _InterviewEvent(
+            event_id=event_id,
+            clip_id=clip.clip_id,
+            start=0.0,
+            end=round(clip.duration, 3),
+            confidence=max(0.96, *(event.confidence for event in events)),
+            signals=tuple(
+                unique_preserving_order(
+                    [
+                        "explicit_interview_context",
+                        "full_clip_interview",
+                        *(signal for event in events for signal in event.signals),
+                    ]
+                )
+            ),
+        )
+    ]
+
+
+def _ranges_overlap(start: float, end: float, other_start: float, other_end: float) -> bool:
+    return min(end, other_end) - max(start, other_start) > 0.001
+
+
+def _required_events_payload(
+    events: list[tuple[Clip, _InterviewEvent]],
+    candidates: list[Candidate],
+) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for clip, event in events:
+        candidate_ids = [
+            candidate.candidate_id
+            for candidate in candidates
+            if event.event_id in candidate.required_event_ids
+        ]
+        if not candidate_ids:
+            raise VideoSummaryError(
+                f"필수 가족 인터뷰 후보를 만들지 못했습니다: {event.event_id}"
+            )
+        payload.append(
+            {
+                "event_id": event.event_id,
+                "kind": "family_interview",
+                "clip_id": clip.clip_id,
+                "day_key": clip.day_key,
+                "travel_day": clip.travel_day,
+                "start": event.start,
+                "end": event.end,
+                "confidence": event.confidence,
+                "signals": list(event.signals),
+                "candidate_ids": candidate_ids,
+                **(
+                    {"anchor_event_id": event.anchor_event_id}
+                    if event.anchor_event_id is not None
+                    else {}
+                ),
+            }
+        )
+    return payload
+
+
 def _candidate_windows(
     clip: Clip,
     cues: list[TranscriptCue],
     signals: list[dict[str, float]],
     max_per_clip: int,
+    *,
+    required_events: list[_InterviewEvent] | None = None,
 ) -> list[tuple[float, float, str]]:
     windows: list[tuple[float, float, str]] = []
     for group in _group_cues(cues):
@@ -228,7 +1101,12 @@ def _candidate_windows(
         _append_window(windows, (start, min(clip.duration, start + duration), "visual"))
     if not windows:
         windows.append((0.0, min(clip.duration, 6.0), "visual"))
-    return _merge_overlapping_windows(_select_windows(windows, clip, cues, signals, max(1, max_per_clip)))
+    selected = _select_windows(windows, clip, cues, signals, max(1, max_per_clip))
+    selected.extend(
+        (event.start, event.end, "interview")
+        for event in required_events or []
+    )
+    return _merge_overlapping_windows(selected)
 
 
 def _merge_overlapping_windows(
@@ -270,7 +1148,7 @@ def _merged_window_origin(
         return "opener"
     if part_index == part_count - 1 and any(origin == "closer" for _, _, origin in component):
         return "closer"
-    priority = {"speech": 3, "visual": 2, "opener": 1, "closer": 1}
+    priority = {"interview": 4, "speech": 3, "visual": 2, "opener": 1, "closer": 1}
     return max(
         component,
         key=lambda item: (
@@ -419,6 +1297,7 @@ def _score_candidate(
     clip_duration: float,
 ) -> float:
     role_bonus = {
+        "interview": 0.30,
         "fun": 0.22,
         "food": 0.15,
         "journey": 0.12,
@@ -462,3 +1341,7 @@ def _day_summary(candidates: list[Candidate]) -> list[dict[str, Any]]:
 
 def _candidate_timestamp(candidate: Candidate) -> float:
     return datetime.fromisoformat(candidate.captured_at).astimezone(timezone.utc).timestamp()
+
+
+def _clip_start_timestamp(clip: Clip) -> float:
+    return datetime.fromisoformat(clip.captured_at).astimezone(timezone.utc).timestamp()

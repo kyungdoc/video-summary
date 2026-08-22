@@ -27,7 +27,8 @@ class PipelineIntegrationTests(unittest.TestCase):
             self._make_video(first, portrait=False, audio=True, color="0x315d8a")
             self._make_video(second, portrait=True, audio=False, color="0xc06c4e")
             first.with_suffix(".srt").write_text(
-                "1\n00:00:00,200 --> 00:00:01,600\n우와 정말 맛있다!\n\n", encoding="utf-8"
+                "1\n00:00:00,200 --> 00:00:01,600\n이번 여행 어땠나요? 정말 좋았어요!\n\n",
+                encoding="utf-8",
             )
             second.with_suffix(".srt").write_text(
                 "1\n00:00:00,100 --> 00:00:01,500\n드디어 바다에 도착했다.\n\n", encoding="utf-8"
@@ -62,6 +63,13 @@ class PipelineIntegrationTests(unittest.TestCase):
             report = render_project(paths, config, draft=True)
             self.assertEqual(report["intro_metadata"]["destination"], "테스트 여행지")
             self.assertEqual(report["intro_metadata"]["period"], "2026-08-19 — 2026-08-20")
+            interview_coverage = report["moment_coverage"]["family_interviews"]
+            self.assertEqual(interview_coverage["status"], "satisfied")
+            self.assertEqual(interview_coverage["detected_event_count"], 1)
+            self.assertEqual(
+                interview_coverage["required_candidate_count"],
+                interview_coverage["selected_candidate_count"],
+            )
             self.assertEqual(len(report["outputs"]), 2)
             for output in report["outputs"]:
                 movie = Path(output["path"])

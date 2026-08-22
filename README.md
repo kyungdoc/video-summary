@@ -91,6 +91,8 @@ uv run --frozen video-summary render \
 
 로컬 플래너는 각 DAY의 가장 이른 장면을 여정 시작점으로 보존하고, 여유가 있으면 마지막 장면도 남깁니다. 목표보다 후보 총량이 짧은 출발일·귀국일은 목표를 억지로 채우지 않고 기본적으로 후보 분량의 약 80%를 상한으로 삼아 약한 반복 화면과 단편 대화를 덜어냅니다. 대사가 적거나 없어도 `scenery`로 분류되거나 밝기·대비 등 화면 품질이 좋은 안정적인 장면은 날짜별 시각 앵커로 우선 검토하므로, 풍경과 야외 장면이 전사 점수 때문에 빠지지 않습니다. 점수가 조금 높은 고립 장면보다 같은 원본에서 맞닿아 이어지는 후보 묶음에 가중치를 주어 대화와 동작의 흐름도 보존합니다. 외부 플래너 요청 역시 목표 시간을 채워야 하는 할당량이 아닌 상한으로 취급하고, 도입 → 탐색 → 핵심 경험 → 마무리의 시간순 이야기와 연속 source run을 우선하도록 제한합니다.
 
+여행 중간이나 마지막에 가족이 한 명씩 여행 소감·가장 좋았던 순간 등을 묻고 답하는 인터뷰가 전사에서 확실하게 탐지되면, `preserve_family_interviews: true` 기본값이 그 답변 묶음을 필수 모먼트로 지정합니다. 목표 길이가 빠듯하거나 후보 점수가 낮아도 완결된 연속 구간을 모두 선택하며, local뿐 아니라 Codex/Claude/file 플랜도 누락하거나 배속하면 검증에서 거부합니다. 인터뷰가 탐지되지 않으면 기존 방식으로 정상 진행합니다. 얼굴 인식이나 화자 분리를 하지 않으므로 실제 가족 구성원 수를 판별하는 기능은 아니며, 질문·답변이 이어지는 source 구간을 개인 인터뷰 단위로 보존합니다. 이 보장을 사용할 때는 전사가 필요하므로 `--skip-transcribe`를 함께 쓸 수 없습니다.
+
 `episode_mode: trip`의 MP4 시각 순서는 다음과 같습니다.
 
 1. 여행 전체 인트로 모자이크(대표 프레임이 없으면 제목 카드)
@@ -104,6 +106,7 @@ uv run --frozen video-summary render \
 ```yaml
 editing:
   cold_open: true
+  preserve_family_interviews: true  # 탐지된 가족 회고 인터뷰는 반드시 원속도로 포함
   episode_mode: trip
 
 render:
@@ -203,6 +206,8 @@ date_overrides:
 
 외부 요청은 실행별 격리 폴더에서 동작하며, `--planner-images`가 없는 요청 폴더에는 contact sheet를 만들지 않습니다. 모자이크 모드를 켠 것만으로 candidate JPEG가 전송되지는 않습니다. 다만 `--planner-images`를 명시하면 candidate frame에서 만든 축소 contact sheet의 시각 내용이 외부 플래너에 전달됩니다. 파이프라인은 원본 MP4를 플래너에 직접 첨부하지 않습니다. 외부 CLI 프로세스 자체의 파일 접근 범위는 각 도구의 sandbox에 따르므로, 처리와 보관 정책은 사용 중인 Codex/Claude 계정 정책을 따릅니다. 민감한 여행에는 `local` 플래너를 사용하세요.
 
+가족 인터뷰로 탐지된 후보도 같은 개인정보 경계를 따릅니다. Codex/Claude에는 답변의 제한된 전사 발췌가 전달될 수 있고, `--planner-images`를 켜면 가족 얼굴이 축소 contact sheet에 포함될 수 있습니다. 인터뷰 탐지와 필수 포함 여부 검증 자체는 항상 로컬에서 수행합니다.
+
 외부 플래너가 생성한 JSON은 그대로 실행되지 않습니다. 후보 ID, 날짜, 시간 범위, 순서, 중복, 길이, 허용 필드뿐 아니라 각 DAY의 가장 이른 후보가 첫 장면인지 검증한 뒤 프로그램이 안전한 FFmpeg 인자를 다시 생성합니다.
 
 ## 출력
@@ -220,7 +225,7 @@ WORKSPACE/
 │   ├── planner/
 │   ├── edit-plan.json
 │   ├── render/
-│   └── render-report.json
+│   └── render-report.json       # intro metadata와 필수 모먼트 포함 여부
 └── exports/okinawa-2026/
     ├── 2026-08-19-day-01.mp4
     ├── 2026-08-19-day-01.vtt
@@ -230,6 +235,8 @@ WORKSPACE/
 ```
 
 기본 `episode_mode: daily`는 날짜별 파일을 만들고, `trip`은 `trip-summary.mp4` 하나와 같은 이름의 `.vtt`, `.chapters.txt`, `.timeline.txt`, `.description.md`를 만듭니다. `render.music_file`에 합법적으로 사용할 수 있는 음악을 지정하면 대화 구간에서 자동 ducking합니다. YouTube 저작권 확인 책임은 사용자에게 있습니다.
+
+`render-report.json`의 `moment_coverage.family_interviews`는 인터뷰가 있으면 `satisfied`, 없으면 `not_detected`를 기록하고, 필수·선택 candidate 수와 개인정보를 최소화한 탐지 근거를 남깁니다. 명시적으로 보존 기능을 끈 경우에는 `disabled`입니다.
 
 MP4의 인트로·날짜·아웃트로 카드는 영상 프레임에 직접 렌더되는 시각 요소입니다. 반면 `.chapters.txt`는 YouTube 설명란에 복사할 timestamp 텍스트이며 MP4에 embedded chapter metadata로 넣지 않습니다. 파일이 자동으로 YouTube에 업로드되지도 않습니다.
 

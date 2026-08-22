@@ -21,7 +21,13 @@ from video_summary.project import DEFAULT_CONFIG, ProjectPaths
 from video_summary.utils import VideoSummaryError
 
 
-def candidate(candidate_id: str, captured_at: str, start: float = 0.0) -> Candidate:
+def candidate(
+    candidate_id: str,
+    captured_at: str,
+    start: float = 0.0,
+    *,
+    required_event_ids: list[str] | None = None,
+) -> Candidate:
     return Candidate(
         candidate_id=candidate_id,
         clip_id=f"clip_{candidate_id}",
@@ -38,6 +44,7 @@ def candidate(candidate_id: str, captured_at: str, start: float = 0.0) -> Candid
         visual_quality=0.7,
         location="뉴욕",
         frame_path=f"frames/{candidate_id}.jpg",
+        required_event_ids=list(required_event_ids or []),
     )
 
 
@@ -167,6 +174,46 @@ class PlannerTests(unittest.TestCase):
             ["early", "view", "late"],
         )
 
+    def test_local_plan_pins_all_detected_interview_candidates_past_a_tight_target(self) -> None:
+        self.config["editing"]["target_minutes_per_day"] = 5.0 / 60.0
+        items = [
+            candidate("early", "2026-11-01T08:00:00-05:00"),
+            candidate(
+                "interview_a",
+                "2026-11-01T09:00:00-05:00",
+                required_event_ids=["family_interview_1"],
+            ),
+            candidate(
+                "interview_b",
+                "2026-11-01T10:00:00-05:00",
+                required_event_ids=["family_interview_2"],
+            ),
+            candidate("late", "2026-11-01T11:00:00-05:00"),
+        ]
+        for item in items[1:3]:
+            item.roles = ["interview", "dialogue"]
+
+        plan = local_plan(self.config, "가족 인터뷰와 여행 흐름", items, "hash")
+        segments = plan.episodes[0].segments
+
+        self.assertEqual(
+            [item.candidate_id for item in segments],
+            ["early", "interview_a", "interview_b"],
+        )
+        self.assertEqual([item.role for item in segments], ["hook", "interview", "interview"])
+        self.assertTrue(all(item.speed == 1.0 for item in segments[1:]))
+        self.assertTrue(all(item.caption is None for item in segments[1:]))
+        self.assertTrue(all(item.location is None for item in segments[1:]))
+
+    def test_local_plan_is_unchanged_when_no_interview_is_detected(self) -> None:
+        plan = local_plan(self.config, "여행 흐름", self.candidates, "hash")
+
+        self.assertEqual(
+            [item.candidate_id for item in plan.episodes[0].segments],
+            ["c1", "c2"],
+        )
+        self.assertNotIn("interview", {item.role for item in plan.episodes[0].segments})
+
     def test_chronology_uses_absolute_time_across_dst_fold(self) -> None:
         fold_candidates = [
             candidate("c1", "2026-11-01T01:15:00-05:00"),
@@ -190,12 +237,40 @@ class PlannerTests(unittest.TestCase):
         exported = payload["candidates"][0]
         self.assertNotIn("transcript", exported)
         self.assertLessEqual(len(exported["transcript_excerpt"]), 240)
+        self.assertEqual(exported["required_event_ids"], [])
+
+    def test_external_candidate_payload_and_request_expose_the_interview_contract(self) -> None:
+        interview = candidate(
+            "interview",
+            "2026-11-01T10:00:00-05:00",
+            required_event_ids=["family_interview_1", "family_interview_2"],
+        )
+        interview.roles = ["interview", "dialogue"]
+
+        payload = _planner_candidates_payload([self.candidates[0], interview], "hash")
+        request = build_planner_request(
+            ProjectPaths(Path("/tmp"), "project"),
+            self.config,
+            "가족 인터뷰를 보존해줘",
+            [self.candidates[0], interview],
+            "hash",
+        )
+
+        self.assertEqual(
+            payload["candidates"][1]["required_event_ids"],
+            ["family_interview_1", "family_interview_2"],
+        )
+        self.assertIn("mandatory family interview candidates: interview", request)
+        self.assertIn("family_interview_1,family_interview_2", request)
+        self.assertIn("목표 시간을 넘더라도", request)
+        self.assertIn("speed=1.0, location=null, caption=null, role=interview", request)
 
     def test_planner_schema_const_fields_also_declare_their_json_type(self) -> None:
         schema = planner_schema()
         self.assertEqual(schema["properties"]["version"], {"type": "integer", "const": 1})
         segment_schema = schema["properties"]["episodes"]["items"]["properties"]["segments"]["items"]
         self.assertEqual(set(segment_schema["required"]), set(segment_schema["properties"]))
+        self.assertIn("interview", segment_schema["properties"]["role"]["enum"])
 
     def test_contact_sheet_sampling_spans_the_full_trip(self) -> None:
         sheets = [Path(f"sheet-{index:03d}.jpg") for index in range(1, 31)]
@@ -302,6 +377,63 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("recommended selection ceiling: 10.0s", request)
         self.assertIn("target_duration 필드는 12.0으로 유지", request)
         self.assertIn("location/caption은 null, speed는 1.0", request)
+
+    def test_plan_rejects_a_missing_required_interview_candidate(self) -> None:
+        self.candidates[1].required_event_ids = ["family_interview_1"]
+        self.candidates[1].roles = ["interview", "dialogue"]
+        payload = self.valid_payload()
+        payload["episodes"][0]["segments"] = [payload["episodes"][0]["segments"][0]]
+
+        with self.assertRaisesRegex(VideoSummaryError, "필수 가족 인터뷰 후보.*c2"):
+            validate_and_normalize_plan(
+                payload, self.config, "x", self.candidates, "hash", "file"
+            )
+
+    def test_plan_rejects_speed_or_caption_changes_to_a_required_interview(self) -> None:
+        self.candidates[1].required_event_ids = ["family_interview_1"]
+        self.candidates[1].roles = ["interview", "dialogue"]
+        payload = self.valid_payload()
+        payload["episodes"][0]["segments"][1].update(
+            {"role": "interview", "speed": 1.25}
+        )
+        with self.assertRaisesRegex(VideoSummaryError, "speed=1.0"):
+            validate_and_normalize_plan(
+                payload, self.config, "x", self.candidates, "hash", "file"
+            )
+
+        payload["episodes"][0]["segments"][1].update(
+            {"speed": 1.0, "caption": "요약된 소감"}
+        )
+        with self.assertRaisesRegex(VideoSummaryError, "caption은 null"):
+            validate_and_normalize_plan(
+                payload, self.config, "x", self.candidates, "hash", "file"
+            )
+
+        payload["episodes"][0]["segments"][1].update(
+            {"caption": None, "location": "인터뷰 장소"}
+        )
+        with self.assertRaisesRegex(VideoSummaryError, "location은 null"):
+            validate_and_normalize_plan(
+                payload, self.config, "x", self.candidates, "hash", "file"
+            )
+
+    def test_required_interview_runtime_can_extend_the_normal_plan_limit(self) -> None:
+        self.candidates[1].required_event_ids = ["family_interview_1"]
+        self.candidates[1].roles = ["interview", "dialogue"]
+        self.candidates[1].end = self.candidates[1].start + 200.0
+        payload = self.valid_payload()
+        payload["episodes"][0]["segments"][1].update(
+            {"role": "interview", "speed": 1.0, "caption": None}
+        )
+
+        plan = validate_and_normalize_plan(
+            payload, self.config, "x", self.candidates, "hash", "file"
+        )
+
+        self.assertEqual(
+            [item.candidate_id for item in plan.episodes[0].segments],
+            ["c1", "c2"],
+        )
 
 
 if __name__ == "__main__":

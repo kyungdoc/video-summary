@@ -74,6 +74,7 @@ bash /absolute/path/to/this-skill/scripts/run-video-summary.sh run \
 - Treat `trip_intro_candidate_ids` as global selection preferences, not tile positions. Multiple reviewed IDs may come from one DAY, while stale or unselected IDs are ignored; display the final selection in edit-plan chronological order. Daily videos keep the classic title intro.
 - Merge overlapping or touching candidate windows from one source before planning, and reject residual same-source time overlap above the 1 ms tolerance during plan validation.
 - Treat the requested per-DAY runtime as a ceiling, not a quota. When a departure or return DAY has less usable material than the target, prefer roughly 80% of its candidate duration and omit weak repetition or fragments while preserving the earliest context, meaningful closing, required events, and complete source runs.
+- With `editing.preserve_family_interviews: true` (default), treat every locally detected high-confidence family travel-review Q&A run as mandatory-if-present. Keep every tagged candidate chronological at `speed=1.0`, even when it exceeds the soft duration ceiling; reject external/file plans that omit or speed up one. If no interview is detected, continue normally. Detection is transcript-based, not face recognition or speaker identification, so it preserves distinct Q&A runs rather than proving each family member's identity. Do not use `--skip-transcribe` while this guarantee is enabled.
 - Quantize every rendered source duration to an exact target-fps frame count and validate fps, frame count, and A/V durations before reusing it. Mosaic-only changes preserve source caches; output-format or exact-frame-policy changes require source rerendering.
 - Recommend `intro_seconds: 6.0` for a multi-day flow intro, `date_card_seconds: 3.0`, `outro_seconds: 5.0`, and `transition_seconds: 0.18` unless the user requests different pacing. Coalesce exactly contiguous compatible selections first, then use a short video/audio fade-through-black at every remaining source-group and card boundary. This preserves duration and low-memory sequential rendering without a multi-input crossfade graph. Set it to `0` to disable the fades.
 - Intro/date/outro cards are rendered into the MP4 frames. `.chapters.txt` is timestamp text for the YouTube description, not embedded MP4 metadata or an automatic upload.
@@ -84,6 +85,7 @@ bash /absolute/path/to/this-skill/scripts/run-video-summary.sh run \
 
 - `local` planner sends nothing to an external model.
 - Codex/Claude receive the editing prompt and bounded candidate transcript excerpts/metadata in an isolated request directory.
+- Those bounded excerpts can contain family interview answers. `--planner-images` can also place family faces in reduced contact sheets; use an external planner only with that privacy boundary understood.
 - `--planner-images` explicitly adds reduced contact sheets derived from candidate frames to the external planner request.
 - Trip-intro mosaic frames are processed one at a time and combined locally during render to keep memory bounded. Mosaic mode alone never adds them to an external planner request, and layout/animation-only changes reuse transcript, analysis, and source-segment caches.
 - The pipeline does not explicitly attach raw MP4 files, but the external CLI process can read local files according to its sandbox and account policy.
@@ -95,3 +97,4 @@ bash /absolute/path/to/this-skill/scripts/run-video-summary.sh run \
 - If dates are wrong, inspect capture provenance and add `date_overrides` instead of manually reordering the plan.
 - If locations are missing, add `locations` rules by filename, date, or transcript keyword.
 - If pacing is wrong, adjust the prompt or `target_minutes_per_day`; cached analysis should remain reusable.
+- Inspect `render-report.json.moment_coverage.family_interviews`: it must be `satisfied` when interview groups were detected, `not_detected` when none were found, or `disabled` only when `preserve_family_interviews: false` was explicitly configured.

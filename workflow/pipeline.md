@@ -11,12 +11,13 @@
 5. `plan`: local 규칙 또는 Codex/Claude가 날짜별 후보 ID를 선택
 6. `validate`: candidate ID, 날짜, 시간순, 중복·같은 원본 시간 겹침, 길이와 allowlist를 검증
 7. `render`: 한 세그먼트씩 동일 규격으로 렌더하고 concat stream-copy로 날짜별 영상 조립
-8. `package`: VTT, YouTube 설명란용 chapters, description 초안과 render report 생성
+8. `package`: VTT, YouTube 설명란용 chapters, description 초안과 `moment_coverage`를 포함한 render report 생성
 
 ## Stable invariants
 
 - 각 여행일의 모든 source 구간은 첫 장면부터 마지막 장면까지 실제 촬영 시간순입니다. `cold_open`도 이 순서를 깨지 않으며, 선택된 후보 중 가장 이른 하나만 첫 source인 `hook`이 될 수 있습니다.
 - 로컬 plan은 각 DAY의 가장 이른 후보를 시작 앵커로 보존합니다. 후보 총량이 목표보다 짧은 날은 목표를 채우기 위해 전부 선택하지 않고 기본 80%의 adaptive ceiling을 적용하며, 의미 있는 마무리와 검증된 필수 사건이 우선합니다. 화면 품질이 충분한 무대사·저대사 `scenery` 후보를 시각 앵커로 검토하므로 전사량만으로 풍경이나 야외 장면을 탈락시키지 않으며, 고립된 점수 상위 조각보다 같은 원본에서 맞닿는 후보 run을 우선합니다. 외부 planner에도 목표가 할당량이 아닌 상한임을 명시합니다.
+- `editing.preserve_family_interviews: true`이면 로컬 전사에서 고신뢰 여행 회고 질문·답변으로 탐지된 모든 인터뷰 source run을 필수 사건으로 고정합니다. 해당 후보는 원속도·촬영시간순으로 모두 선택하며 adaptive ceiling보다 우선합니다. 외부/file planner의 누락이나 배속은 validate에서 거부하고, 탐지 결과가 0개면 기존 선택을 그대로 수행합니다. 얼굴 인식·화자 분리는 하지 않으므로 사람 수가 아니라 별도의 Q&A run을 인터뷰 단위로 취급합니다.
 - 카메라 달력이 초기화된 여행은 `date_overrides`의 폴더 glob, 현지 날짜와 IANA timezone으로 보정할 수 있습니다. 폴더 날짜를 회차 경계로 쓸 때는 `day_start_hour: 0`을 사용합니다.
 - 인트로 표시명은 내부 project ID와 분리합니다. `project.destination`이 비어 있으면 source 폴더명에서 선행 날짜와 일반 영상 토큰을 제거하고 더 구체적인 지명이 남을 때만 국가 접두어도 제외해 여행지를 추론하며, 실패하면 project 이름을 사용합니다. 기간은 폴더명 숫자가 아니라 scan이 보정한 전체 `day_key`의 최솟값·최댓값이며, trip은 전체 범위, daily는 해당 DAY 날짜를 표시합니다.
 - 원본 파일은 읽기만 하며 모든 파생물은 workspace 아래에 저장합니다.
@@ -31,13 +32,14 @@
 ## Failure and resume
 
 - 손상된 영상, 잘못된 날짜/설정, 후보 없음, out-of-bounds plan은 즉시 실패합니다.
+- 가족 인터뷰 보존을 켠 상태에서 `--skip-transcribe`를 요청하면 조용히 놓치지 않고 즉시 실패합니다.
 - 성공한 클립 전사·신호·프레임·렌더 세그먼트는 보존합니다.
 - 같은 명령을 다시 실행하면 `state.sqlite3`와 artifact cache key를 이용해 미완료 지점부터 이어갑니다.
 - 외부 planner의 실행·JSON·검증이 실패하고 strict 모드가 아니면 그 실행만 local fallback으로 완주하되, fallback을 영구 cache hit로 취급하지 않습니다.
 
 ## Planner boundary
 
-Planner가 반환할 수 있는 것은 프로젝트/후보 해시, 날짜별 제목·요약, candidate ID와 편집 메타데이터(role/reason 및 선택적 location/caption/speed)뿐입니다. `role=hook`은 해당 DAY의 첫 번째 source이자 선택된 후보 중 실제 촬영 시각이 가장 이른 후보에만 허용됩니다. 원본 경로·시간 범위·FFmpeg 인자는 반환할 수 없으며 renderer가 검증된 catalog에서 다시 조회합니다.
+Planner가 반환할 수 있는 것은 프로젝트/후보 해시, 날짜별 제목·요약, candidate ID와 편집 메타데이터(role/reason 및 선택적 location/caption/speed)뿐입니다. `role=hook`은 해당 DAY의 첫 번째 source이자 선택된 후보 중 실제 촬영 시각이 가장 이른 후보에만 허용됩니다. 탐지된 필수 인터뷰 후보는 `role=interview`(첫 hook 예외), `speed=1.0`으로 모두 포함해야 합니다. 원본 경로·시간 범위·FFmpeg 인자는 반환할 수 없으며 renderer가 검증된 catalog에서 다시 조회합니다.
 
 ## Output modes
 

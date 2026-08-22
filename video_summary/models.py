@@ -69,6 +69,7 @@ class Candidate:
     visual_quality: float
     location: str | None
     frame_path: str
+    required_event_ids: list[str] = field(default_factory=list)
 
     @property
     def duration(self) -> float:

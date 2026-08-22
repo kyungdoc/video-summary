@@ -18,7 +18,18 @@ from .state import StateStore
 from .utils import VideoSummaryError, atomic_write_text, command_exists, file_fingerprint, print_status, read_json, run_command, stable_hash, write_json
 
 
-ALLOWED_ROLES = {"hook", "journey", "fun", "food", "scenery", "dialogue", "transition", "closing", "moment"}
+ALLOWED_ROLES = {
+    "hook",
+    "journey",
+    "fun",
+    "food",
+    "scenery",
+    "dialogue",
+    "interview",
+    "transition",
+    "closing",
+    "moment",
+}
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
 MAX_CODEX_CONTACT_SHEETS = 20
 CONTACT_SHEET_CANDIDATES = 12
@@ -53,7 +64,7 @@ def plan_project(
     plan_file_key = file_fingerprint(plan_file_path) if plan_file_path and plan_file_path.exists() else None
     cache_key = stable_hash(
         {
-            "version": 11,
+            "version": 12,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "prompt": editing_prompt,
@@ -153,8 +164,20 @@ def local_plan(
         segments: list[PlanSegment] = []
         use_earliest_hook = bool(config["editing"].get("cold_open", True)) and bool(selected) and "fun" in selected[0].roles
         for index, candidate in enumerate(selected):
-            role = "hook" if index == 0 and use_earliest_hook else _primary_role(candidate.roles)
-            if role != "hook" and index == len(selected) - 1 and ("closer" in candidate.roles or "journey" in candidate.roles):
+            required_interview = _is_required_interview(candidate)
+            role = (
+                "hook"
+                if index == 0 and use_earliest_hook
+                else "interview"
+                if required_interview
+                else _primary_role(candidate.roles)
+            )
+            if (
+                role != "hook"
+                and not required_interview
+                and index == len(selected) - 1
+                and ("closer" in candidate.roles or "journey" in candidate.roles)
+            ):
                 role = "closing"
             segments.append(
                 PlanSegment(
@@ -165,7 +188,9 @@ def local_plan(
                         if role == "hook"
                         else _selection_reason(candidate)
                     ),
-                    location=candidate.location,
+                    location=None if required_interview else candidate.location,
+                    caption=None,
+                    speed=1.0,
                 )
             )
         travel_day = day_candidates[0].travel_day
@@ -249,7 +274,7 @@ def validate_and_normalize_plan(
         if len(raw_segments) > 300:
             raise VideoSummaryError("episode의 segment가 너무 많습니다.")
         segments: list[PlanSegment] = []
-        chronology: list[str] = []
+        chronology: list[tuple[float, float, str]] = []
         selected_ranges: dict[str, list[Candidate]] = defaultdict(list)
         runtime = 0.0
         for index, raw_segment in enumerate(raw_segments):
@@ -285,21 +310,46 @@ def validate_and_normalize_plan(
             speed = float(speed_value)
             if not math.isfinite(speed) or not 0.75 <= speed <= 1.5:
                 raise VideoSummaryError("speed는 0.75~1.5의 유한한 숫자여야 합니다.")
+            caption = _optional_text(raw_segment.get("caption"), 160)
+            requested_location = _optional_text(raw_segment.get("location"), 100)
+            if _is_required_interview(candidate):
+                if speed != 1.0:
+                    raise VideoSummaryError(
+                        f"필수 가족 인터뷰 후보는 speed=1.0이어야 합니다: {candidate_id}"
+                    )
+                allowed_interview_roles = {"interview"}
+                if index == 0:
+                    allowed_interview_roles.add("hook")
+                if role not in allowed_interview_roles:
+                    raise VideoSummaryError(
+                        f"필수 가족 인터뷰 후보는 role=interview여야 합니다: {candidate_id}"
+                    )
+                if caption is not None:
+                    raise VideoSummaryError(
+                        f"필수 가족 인터뷰 후보의 caption은 null이어야 합니다: {candidate_id}"
+                    )
+                if requested_location is not None:
+                    raise VideoSummaryError(
+                        f"필수 가족 인터뷰 후보의 location은 null이어야 합니다: {candidate_id}"
+                    )
             used_candidates.add(candidate_id)
-            chronology.append(candidate.captured_at)
+            chronology.append(_candidate_sort_key(candidate))
             runtime += candidate.duration / speed
             segments.append(
                 PlanSegment(
                     candidate_id=candidate_id,
                     role=role,
                     reason=_safe_text(raw_segment["reason"], "reason", 400),
-                    location=_optional_text(raw_segment.get("location") or candidate.location, 100),
-                    caption=_optional_text(raw_segment.get("caption"), 160),
+                    location=(
+                        None
+                        if _is_required_interview(candidate)
+                        else requested_location or _optional_text(candidate.location, 100)
+                    ),
+                    caption=caption,
                     speed=speed,
                 )
             )
-        chronology_keys = [datetime.fromisoformat(value).astimezone(timezone.utc).timestamp() for value in chronology]
-        if chronology_keys != sorted(chronology_keys):
+        if chronology != sorted(chronology):
             raise VideoSummaryError(f"{day_key}의 영상 순서가 촬영 시간순이 아닙니다.")
         expected_earliest = min(grouped[day_key], key=_candidate_sort_key)
         if segments[0].candidate_id != expected_earliest.candidate_id:
@@ -313,7 +363,9 @@ def validate_and_normalize_plan(
             raise VideoSummaryError("target_duration이 잘못되었습니다.")
         if not configured_target * 0.75 <= requested_target <= configured_target * 1.25:
             raise VideoSummaryError("target_duration이 프로젝트 목표에서 25% 이상 벗어났습니다.")
-        if runtime > max(configured_target * 1.75, configured_target + 120):
+        mandatory_runtime = used_duration(_mandatory_day_candidates(grouped[day_key]))
+        runtime_limit = max(configured_target * 1.75, configured_target + 120, mandatory_runtime)
+        if runtime > runtime_limit:
             raise VideoSummaryError(f"{day_key} 선택 길이가 목표보다 지나치게 깁니다.")
         episodes.append(
             Episode(
@@ -329,6 +381,16 @@ def validate_and_normalize_plan(
     if seen_days != expected_days:
         missing = sorted(expected_days - seen_days)
         raise VideoSummaryError(f"플래너가 일부 날짜를 누락했습니다: {missing}")
+    required_candidates = {
+        candidate.candidate_id
+        for candidate in candidates
+        if _is_required_interview(candidate)
+    }
+    missing_required = sorted(required_candidates - used_candidates)
+    if missing_required:
+        raise VideoSummaryError(
+            "플래너가 필수 가족 인터뷰 후보를 누락했습니다: " + ", ".join(missing_required)
+        )
     episodes.sort(key=lambda episode: (episode.travel_day, episode.day_key))
     return EditPlan(
         project=str(config["project"]["name"]),
@@ -357,6 +419,8 @@ def build_planner_request(
         "각 날짜의 모든 segment는 role=hook을 포함해 captured_at 오름차순을 유지하세요. hook은 선택된 후보 중 가장 이른 첫 segment에만 허용됩니다.",
         "같은 원본 clip_id에서 source 시간(start/end)이 겹치는 candidate를 함께 선택하지 마세요.",
         "각 날짜의 시간상 가장 이른 후보를 포함해 출발 맥락을 보존하고, 여유가 있으면 가장 늦은 후보도 포함하세요.",
+        "required_event_ids가 하나라도 있는 후보는 감지된 가족 인터뷰의 필수 구간입니다. 목표 시간을 넘더라도 해당 candidate_id를 모두 빠짐없이 선택하세요.",
+        "필수 가족 인터뷰 후보는 원래 순서를 유지하고 speed=1.0, location=null, caption=null, role=interview로 사용하세요. 단, 그 날짜의 첫 후보라면 role=hook도 허용됩니다.",
         "날짜별 목표 시간은 채워야 하는 할당량이 아니라 상한입니다. 후보 총량이 목표보다 짧은 날은 약한 장면까지 전부 선택하지 마세요.",
         f"짧은 날은 최초·마무리·필수 사건과 완결된 연속 장면을 우선하고 후보 총량의 약 {SHORT_DAY_KEEP_RATIO:.0%}만 권장 분량으로 사용하세요.",
         "각 날짜를 출발/도입 → 탐색/이동 → 핵심 경험 → 마무리의 4단계 이야기로 구성하되 실제 촬영 순서를 바꾸지 마세요.",
@@ -382,7 +446,11 @@ def build_planner_request(
         ordered_values = sorted(values, key=_candidate_sort_key)
         deduped_values = _dedupe_candidates(ordered_values)
         available_seconds = used_duration(deduped_values)
-        recommended_seconds = _adaptive_day_target_seconds(deduped_values, configured_target)
+        recommended_seconds = max(
+            _adaptive_day_target_seconds(deduped_values, configured_target),
+            used_duration(_mandatory_day_candidates(deduped_values)),
+        )
+        required_values = [item for item in deduped_values if _is_required_interview(item)]
         lines.extend(
             [
                 "",
@@ -390,6 +458,14 @@ def build_planner_request(
                 f"- usable candidate total: {available_seconds:.1f}s; recommended selection ceiling: {recommended_seconds:.1f}s",
             ]
         )
+        if required_values:
+            lines.append(
+                "- mandatory family interview candidates: "
+                + ", ".join(
+                    f"{item.candidate_id} ({','.join(_required_event_ids(item))})"
+                    for item in required_values
+                )
+            )
         for candidate in ordered_values:
             transcript = re.sub(r"\s+", " ", candidate.transcript).strip()
             if len(transcript) > 180:
@@ -398,6 +474,7 @@ def build_planner_request(
                 f"- {candidate.candidate_id} | {candidate.captured_at} | {candidate.duration:.1f}s | "
                 f"source={candidate.clip_id}:{candidate.start:.3f}-{candidate.end:.3f} | "
                 f"roles={','.join(candidate.roles)} | score={candidate.score:.2f} | "
+                f"required_event_ids={','.join(_required_event_ids(candidate)) or '-'} | "
                 f"location={candidate.location or '-'} | transcript={transcript or '[silent]'}"
             )
     lines.extend(
@@ -410,6 +487,7 @@ def build_planner_request(
             "- 모든 날짜를 episodes에 정확히 한 번씩 포함",
             f"- 각 episode의 target_duration 필드는 {configured_target:.1f}으로 유지하고, 위 recommended ceiling은 segment 실제 합계에만 적용",
             "- segment에는 candidate_id, role, reason, location, caption, speed를 모두 포함; 표시값이 없으면 location/caption은 null, speed는 1.0",
+            "- required_event_ids가 비어 있지 않은 candidate_id는 전부 포함; speed=1.0, location=null, caption=null, role=interview (날짜의 첫 segment만 hook 허용)",
         ]
     )
     return "\n".join(lines).strip() + "\n"
@@ -432,6 +510,7 @@ def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash:
                 "duration": item.duration,
                 "transcript_excerpt": _transcript_excerpt(item.transcript, 240),
                 "roles": item.roles,
+                "required_event_ids": list(_required_event_ids(item)),
                 "score": item.score,
                 "speech_ratio": item.speech_ratio,
                 "motion_score": item.motion_score,
@@ -715,13 +794,15 @@ def _select_day_candidates(
     target_seconds = _adaptive_day_target_seconds(deduped, target_seconds)
     if not deduped:
         return []
+    mandatory = _mandatory_day_candidates(deduped)
+    target_seconds = max(target_seconds, used_duration(mandatory))
     buckets = max(3, min(8, int(target_seconds // 30)))
     positions = {item.candidate_id: index / max(1, len(deduped) - 1) for index, item in enumerate(deduped)}
     candidate_indices = {item.candidate_id: index for index, item in enumerate(deduped)}
     # A score-only summary can accidentally begin after the actual departure.
     # Pin the first usable candidate for narrative continuity, and the last one
     # when it fits, before filling the middle by quality and coverage.
-    selected: list[Candidate] = [deduped[0]]
+    selected: list[Candidate] = list(mandatory)
 
     if deduped[-1] not in selected and used_duration(selected) + deduped[-1].duration <= target_seconds:
         selected.append(deduped[-1])
@@ -832,7 +913,11 @@ def _selection_continuity_bonus(
 
 
 def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
-    ranked = sorted(candidates, key=lambda item: (item.score, item.duration), reverse=True)
+    ranked = sorted(
+        candidates,
+        key=lambda item: (_is_required_interview(item), item.score, item.duration),
+        reverse=True,
+    )
     kept: list[Candidate] = []
     for candidate in ranked:
         duplicate = False
@@ -861,6 +946,7 @@ def _prompt_role_weights(prompt: str) -> dict[str, float]:
         "scenery": ("풍경", "경치", "바다", "자연", "scenery", "view"),
         "journey": ("여정", "이동", "출발", "도착", "journey", "travel"),
         "dialogue": ("대화", "사람", "가족", "친구", "dialogue", "people"),
+        "interview": ("인터뷰", "소감", "interview", "favorite", "review"),
     }
     return {role: 0.16 for role, words in groups.items() if any(word in lowered for word in words)}
 
@@ -871,7 +957,7 @@ def _candidate_sort_key(candidate: Candidate) -> tuple[float, float, str]:
 
 
 def _primary_role(roles: list[str]) -> str:
-    for role in ("fun", "food", "journey", "dialogue", "scenery", "moment"):
+    for role in ("interview", "fun", "food", "journey", "dialogue", "scenery", "moment"):
         if role in roles:
             return role
     return "moment"
@@ -880,6 +966,7 @@ def _primary_role(roles: list[str]) -> str:
 def _selection_reason(candidate: Candidate) -> str:
     role = _primary_role(candidate.roles)
     reasons = {
+        "interview": "가족이 직접 들려주는 여행 소감과 기억을 보존하는 장면",
         "fun": "재미있는 반응이나 감탄이 살아 있는 장면",
         "food": "여행의 식사 흐름과 현장감을 보여주는 장면",
         "journey": "이동과 여정의 진행을 설명하는 장면",
@@ -901,7 +988,31 @@ def _role_summary(segments: list[PlanSegment]) -> str:
         parts.append("먹거리")
     if "scenery" in roles:
         parts.append("풍경")
+    if "interview" in roles:
+        parts.append("가족 인터뷰")
     return ", ".join(parts) + "을 담았습니다." if parts else "소중한 순간을 담았습니다."
+
+
+def _required_event_ids(candidate: Candidate) -> tuple[str, ...]:
+    values = getattr(candidate, "required_event_ids", []) or []
+    return tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _is_required_interview(candidate: Candidate) -> bool:
+    return bool(_required_event_ids(candidate))
+
+
+def _mandatory_day_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    if not candidates:
+        return []
+    ordered = sorted(candidates, key=_candidate_sort_key)
+    mandatory_ids = {ordered[0].candidate_id}
+    mandatory_ids.update(
+        item.candidate_id
+        for item in ordered
+        if _is_required_interview(item)
+    )
+    return [item for item in ordered if item.candidate_id in mandatory_ids]
 
 
 def _safe_text(value: Any, field: str, maximum: int) -> str:

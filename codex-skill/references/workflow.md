@@ -36,6 +36,8 @@ Within each DAY, all selected source segments remain in capture-time order. With
 
 The local planner preserves the earliest candidate as the DAY's journey anchor and reserves room for a visually strong low- or no-speech scenery candidate when one is available. Visual quality and stable outdoor context remain valid selection signals even without transcript text.
 
+Family travel-review interviews are mandatory-if-detected by default. Local transcript analysis identifies high-confidence question-and-answer runs, tags every candidate needed to keep each answer complete, and requires local, Codex, Claude, and file plans to include them chronologically at normal speed. A project with no detected interview proceeds normally. This is not face recognition or speaker identification; separate Q&A runs are the auditable unit. Keep `editing.preserve_family_interviews: true` and do not combine it with `--skip-transcribe` when this guarantee is required.
+
 The combined trip sequence is: global mosaic intro (or a classic title-card fallback) → DAY date card → all chronological source segments for that DAY, including the optional earliest hook → repeat for later DAYs → global outro.
 
 For readable pacing, keep these recommended defaults unless the user asks otherwise:
@@ -87,3 +89,5 @@ bash /absolute/path/to/this-skill/scripts/run-video-summary.sh render \
 ```
 
 The external planner is optional and requires the user's explicit opt-in. `local` is fully local; `codex` and `claude` send prompt/bounded candidate excerpts and metadata from an isolated request directory, with reduced contact sheets only when `--planner-images` is supplied.
+
+Family interview answers may appear in those bounded excerpts, and family faces may appear in contact sheets when `--planner-images` is enabled. After rendering, verify `render-report.json.moment_coverage.family_interviews` is `satisfied`, `not_detected` when no interview was found, or `disabled` only after an explicit `preserve_family_interviews: false` opt-out.
