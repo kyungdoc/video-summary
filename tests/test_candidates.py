@@ -171,6 +171,70 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertEqual(events, [])
 
+    def test_recording_direction_without_a_review_answer_does_not_trigger(self) -> None:
+        events = _detect_interview_events(
+            _clip("direction-without-answer", duration=18.285),
+            [
+                TranscriptCue(1.55, 3.55, "그라운 프라저에서 어땠나요?"),
+                TranscriptCue(3.55, 5.55, "여기 호텔 어땠나요?"),
+                TranscriptCue(5.55, 7.55, "여기요."),
+                TranscriptCue(7.55, 9.55, "여기 보고 얘기해주세요."),
+                TranscriptCue(9.55, 11.55, "엄마 차 보는거에요?"),
+                TranscriptCue(11.55, 13.55, "네."),
+                TranscriptCue(15.55, 17.55, "이제 다음 호텔로 갑시다."),
+            ],
+        )
+
+        self.assertEqual(events, [])
+
+    def test_phuquoc_recording_direction_keeps_the_complete_required_answer(self) -> None:
+        clip = _clip("clip_dda1039f30cd9e79", duration=18.285)
+        cues = [
+            TranscriptCue(1.55, 3.55, "그라운 프라저에서 어땠나요?"),
+            TranscriptCue(3.55, 5.55, "여기 호텔 어땠나요?"),
+            TranscriptCue(5.55, 7.55, "여기요."),
+            TranscriptCue(7.55, 9.55, "여기 보고 얘기해주세요."),
+            TranscriptCue(9.55, 11.55, "엄마 차 보는거에요?"),
+            TranscriptCue(11.55, 13.55, "네."),
+            TranscriptCue(13.55, 15.55, "좋았어요."),
+            TranscriptCue(15.55, 17.55, "이제 다음 호텔로 갑시다."),
+        ]
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["project"]["name"] = "phuquoc-direction-test"
+        config["editing"]["preserve_family_interviews"] = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            with (
+                patch("video_summary.candidates.load_transcript", return_value=cues),
+                patch("video_summary.candidates.analyze_visual_signals", return_value=[]),
+                patch("video_summary.candidates.extract_frame"),
+            ):
+                payload = build_candidates(paths, [clip], config)
+
+        self.assertEqual(len(payload["required_events"]), 1)
+        event = payload["required_events"][0]
+        self.assertEqual((event["start"], event["end"]), (1.2, 15.55))
+        self.assertIn("interview_recording_direction", event["signals"])
+        tagged = [
+            candidate
+            for candidate in payload["candidates"]
+            if event["event_id"] in candidate["required_event_ids"]
+        ]
+        self.assertEqual(
+            event["candidate_ids"],
+            [candidate["candidate_id"] for candidate in tagged],
+        )
+        self.assertLessEqual(tagged[0]["start"], event["start"])
+        self.assertGreaterEqual(tagged[-1]["end"], event["end"])
+        self.assertTrue(
+            all(
+                left["end"] == right["start"]
+                for left, right in zip(tagged, tagged[1:])
+            )
+        )
+
     def test_casual_present_tense_questions_do_not_trigger(self) -> None:
         events = _detect_interview_events(
             _clip(),

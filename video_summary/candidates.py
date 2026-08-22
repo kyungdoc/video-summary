@@ -34,7 +34,7 @@ SCENERY_WORDS = {
     "beach", "mountain", "sunset", "view", "street", "market", "pool",
 }
 MAX_CANDIDATE_DURATION_SECONDS = 18.0
-INTERVIEW_DETECTION_POLICY_VERSION = 2
+INTERVIEW_DETECTION_POLICY_VERSION = 3
 INTERVIEW_ANSWER_WAIT_SECONDS = 15.0
 INTERVIEW_CONTINUATION_GAP_SECONDS = 12.0
 INTERVIEW_EVENT_MAX_SPAN_SECONDS = 180.0
@@ -168,6 +168,21 @@ _INTERVIEW_FOLLOWUP_QUESTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] =
 
 _INTERVIEW_CONTEXT_PATTERN = re.compile(
     r"(?:인터뷰|소감|한마디|카메라\s*보고|interview|on\s+camera)",
+)
+
+_INTERVIEW_RECORDING_DIRECTION_PATTERN = re.compile(
+    r"(?:카메라|렌즈|여기|저기|이쪽|저쪽).{0,12}?"
+    r"(?:보고|보면서|봐).{0,18}?(?:말|얘기|이야기|대답)"
+    r"|\b(?:look|face).{0,18}\b(?:camera|lens)\b",
+)
+
+_INTERVIEW_SETUP_BRIDGE_PATTERN = re.compile(
+    r"^(?:여기|저기|이쪽|저쪽|이거|저거)(?:를|을|요)?$",
+)
+
+_INTERVIEW_SEQUENCE_END_PATTERN = re.compile(
+    r"^(?:자\s*[,，]?\s*)?(?:이제|그럼|그러면).{0,30}?"
+    r"(?:갑시다|가자|출발|이동|마치|끝내|종료)",
 )
 
 _INTERVIEW_CONTINUATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -504,6 +519,7 @@ def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_Int
             continue
         question_signal, _, question_match_end = questions[-1]
         answer_index: int | None = None
+        answer_followed_recording_direction = False
         for option_index, (signal, _, match_end) in enumerate(questions):
             next_question_start = (
                 questions[option_index + 1][1]
@@ -525,11 +541,34 @@ def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_Int
                 answer_index = question_index
                 break
         if answer_index is None:
+            recording_direction_seen = False
             for index in range(question_index + 1, len(ordered)):
                 answer_cue = ordered[index]
                 if answer_cue.start - question_cue.end > INTERVIEW_ANSWER_WAIT_SECONDS:
                     break
+                if _is_interview_sequence_end(answer_cue.text):
+                    break
+                if _is_interview_recording_direction(answer_cue.text):
+                    recording_direction_seen = True
+                    continue
                 if _looks_like_question(answer_cue.text):
+                    continue
+                if (
+                    not recording_direction_seen
+                    and _is_interview_setup_bridge(answer_cue.text)
+                    and index + 1 < len(ordered)
+                    and ordered[index + 1].start - answer_cue.end
+                    <= INTERVIEW_CONTINUATION_GAP_SECONDS
+                    and _is_interview_recording_direction(
+                        ordered[index + 1].text
+                    )
+                ):
+                    continue
+                if (
+                    recording_direction_seen
+                    and _normalized_interview_text(answer_cue.text)
+                    in _AFFIRMATIVE_ANSWER_TEXTS
+                ):
                     continue
                 if _is_substantive_interview_answer(
                     answer_cue.text,
@@ -537,6 +576,7 @@ def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_Int
                     allow_uncertainty=_allows_uncertainty_answer(question_signal),
                 ):
                     answer_index = index
+                    answer_followed_recording_direction = recording_direction_seen
                     break
         if answer_index is None:
             continue
@@ -566,6 +606,9 @@ def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_Int
             if continuation.start >= span_limit:
                 break
             if continuation.start - last_cue.end > INTERVIEW_CONTINUATION_GAP_SECONDS:
+                break
+            if _is_interview_sequence_end(continuation.text):
+                unrelated_question_start = continuation.start
                 break
             if _looks_like_question(continuation.text):
                 followup = _interview_followup_question(continuation.text)
@@ -621,6 +664,8 @@ def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_Int
         if end - start < 0.75:
             continue
         signals = [question_signal, "spoken_answer", *followup_signals]
+        if answer_followed_recording_direction:
+            signals.append("interview_recording_direction")
         if answer_index == question_index:
             signals.append("same_cue_answer")
         nearby_context = " ".join(
@@ -777,6 +822,37 @@ def _looks_like_question(text: str) -> bool:
         or "?" in normalized
         or "？" in normalized
         or re.search(r"(?:나요|니|습니까|까요)\s*[.!…]*$", normalized) is not None
+    )
+
+
+def _normalized_interview_text(text: str) -> str:
+    return " ".join(text.casefold().split()).strip(" \t\r\n,.;:!?？~-—")
+
+
+def _is_interview_recording_direction(text: str) -> bool:
+    return (
+        _INTERVIEW_RECORDING_DIRECTION_PATTERN.search(
+            _normalized_interview_text(text)
+        )
+        is not None
+    )
+
+
+def _is_interview_setup_bridge(text: str) -> bool:
+    return (
+        _INTERVIEW_SETUP_BRIDGE_PATTERN.fullmatch(
+            _normalized_interview_text(text)
+        )
+        is not None
+    )
+
+
+def _is_interview_sequence_end(text: str) -> bool:
+    return (
+        _INTERVIEW_SEQUENCE_END_PATTERN.search(
+            _normalized_interview_text(text)
+        )
+        is not None
     )
 
 
