@@ -21,7 +21,7 @@ from video_summary.media import (
 from video_summary.cli import build_parser, parse_target_minutes
 from video_summary.models import Clip, TranscriptCue
 from video_summary.pipeline import _help_has_flag, analyze_project
-from video_summary.project import DEFAULT_CONFIG, _validate_config, project_paths
+from video_summary.project import DEFAULT_CONFIG, _validate_config, load_config, project_paths
 from video_summary.state import StateStore
 from video_summary.transcribe import (
     WhisperCppTranscriber,
@@ -278,6 +278,31 @@ class CoreTests(unittest.TestCase):
         config["editing"]["target_minutes_per_day"] = math.nan
         with self.assertRaises(VideoSummaryError):
             _validate_config(config)
+
+    def test_soft_maximum_defaults_to_ten_minutes_and_is_validated(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["editing"]["soft_max_minutes_per_day"], 10.0)
+        for value in (math.nan, 0, 181, True, "10"):
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config["editing"]["soft_max_minutes_per_day"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(
+                VideoSummaryError,
+                "soft_max_minutes_per_day",
+            ):
+                _validate_config(config)
+
+    def test_legacy_config_without_soft_maximum_loads_with_the_new_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = project_paths(tmpdir, "legacy")
+            paths.ensure()
+            paths.config.write_text(
+                "version: 1\nediting:\n  target_minutes_per_day: 6.0\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(paths)
+
+        self.assertEqual(config["editing"]["target_minutes_per_day"], 6.0)
+        self.assertEqual(config["editing"]["soft_max_minutes_per_day"], 10.0)
 
     def test_config_validates_date_override_contract(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)

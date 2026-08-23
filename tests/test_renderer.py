@@ -20,6 +20,7 @@ from video_summary.render_assets import MOSAIC_CAPACITY
 from video_summary.renderer import (
     Piece,
     RENDER_POLICY_VERSION,
+    RENDER_REPORT_VERSION,
     SOURCE_RENDER_POLICY_VERSION,
     SourceMember,
     SourceSelection,
@@ -499,9 +500,32 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(card_fade_seconds("date-day-1", 3.0), 0.5)
         self.assertEqual(card_fade_seconds("trip-outro", 0.4), 0.1)
 
-    def test_audio_assembly_policy_invalidates_completed_render_but_reuses_sources(self) -> None:
-        self.assertEqual(RENDER_POLICY_VERSION, 19)
+    def test_meal_story_policy_invalidates_completed_render_but_reuses_sources(self) -> None:
+        plan = EditPlan("Trip", "", "local", "hash", [])
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        coverage = {
+            "meals": {
+                "status": "satisfied",
+                "events": [{"event_id": "meal_1", "context_groups": []}],
+            }
+        }
+        previous = render_cache_key(
+            plan, [], config["render"], "trip", False,
+            1280, 720, 30, "libx264", "4M",
+            version=19,
+            moment_coverage=coverage,
+        )
+        current = render_cache_key(
+            plan, [], config["render"], "trip", False,
+            1280, 720, 30, "libx264", "4M",
+            version=RENDER_POLICY_VERSION,
+            moment_coverage=coverage,
+        )
+
+        self.assertEqual(RENDER_POLICY_VERSION, 20)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
+        self.assertEqual(RENDER_REPORT_VERSION, 6)
+        self.assertNotEqual(previous, current)
 
     def test_family_interview_coverage_is_satisfied_or_not_detected(self) -> None:
         interview = candidate("interview", "2026-08-19T10:00:00+09:00", 0.0)
@@ -562,8 +586,10 @@ class RendererTests(unittest.TestCase):
             )
 
     def test_meal_event_coverage_accepts_one_selected_option(self) -> None:
+        setup = candidate("meal-setup", "2026-08-19T11:55:00+09:00", 0.0)
         first = candidate("meal-a", "2026-08-19T12:00:00+09:00", 0.0)
         second = candidate("meal-b", "2026-08-19T12:05:00+09:00", 0.0)
+        closure = candidate("meal-closure", "2026-08-19T12:10:00+09:00", 0.0)
         plan = EditPlan(
             "Trip",
             "",
@@ -577,7 +603,11 @@ class RendererTests(unittest.TestCase):
                     "",
                     "",
                     30.0,
-                    [PlanSegment("meal-b", "food", "실제 점심 장면")],
+                    [
+                        PlanSegment("meal-setup", "food", "점심 먹으러 가는 장면"),
+                        PlanSegment("meal-b", "food", "실제 점심 장면"),
+                        PlanSegment("meal-closure", "food", "점심 후 반응"),
+                    ],
                 )
             ],
         )
@@ -592,19 +622,113 @@ class RendererTests(unittest.TestCase):
                     "confidence": 0.93,
                     "signals": ["meal_setup", "inferred_meal_body"],
                     "candidate_ids": ["meal-a", "meal-b"],
+                    "context_groups": [
+                        {
+                            "context_id": "meal_1:setup",
+                            "stage": "setup",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-setup"],
+                        },
+                        {
+                            "context_id": "meal_1:closure",
+                            "stage": "closure",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-closure"],
+                        },
+                    ],
                 }
             ]
         }
 
-        coverage = meal_event_coverage(payload, [first, second], plan, enabled=True)
+        coverage = meal_event_coverage(
+            payload,
+            [setup, first, second, closure],
+            plan,
+            enabled=True,
+        )
 
         self.assertEqual(coverage["status"], "satisfied")
         self.assertEqual(coverage["detected_event_count"], 1)
         self.assertEqual(coverage["option_candidate_count"], 2)
         self.assertEqual(coverage["selected_event_count"], 1)
         self.assertEqual(coverage["selected_candidate_count"], 1)
+        self.assertEqual(coverage["context_group_count"], 2)
+        self.assertEqual(coverage["selected_context_group_count"], 2)
+        self.assertEqual(coverage["context_candidate_count"], 2)
+        self.assertEqual(coverage["selected_context_candidate_count"], 2)
         self.assertEqual(coverage["events"][0]["selected_candidate_ids"], ["meal-b"])
+        self.assertEqual(
+            coverage["events"][0]["context_groups"],
+            [
+                {
+                    "context_id": "meal_1:setup",
+                    "stage": "setup",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal-setup"],
+                    "selected_candidate_ids": ["meal-setup"],
+                },
+                {
+                    "context_id": "meal_1:closure",
+                    "stage": "closure",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal-closure"],
+                    "selected_candidate_ids": ["meal-closure"],
+                },
+            ],
+        )
         self.assertNotIn("transcript", coverage["events"][0])
+
+    def test_meal_event_coverage_rejects_a_missing_context_group(self) -> None:
+        setup = candidate("meal-setup", "2026-08-19T11:55:00+09:00", 0.0)
+        meal = candidate("meal", "2026-08-19T12:00:00+09:00", 0.0)
+        closure = candidate("meal-closure", "2026-08-19T12:10:00+09:00", 0.0)
+        plan = EditPlan(
+            "Trip",
+            "",
+            "file",
+            "hash",
+            [
+                Episode(
+                    meal.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    30.0,
+                    [
+                        PlanSegment("meal-setup", "food", "식사 전 서사"),
+                        PlanSegment("meal", "food", "실제 식사"),
+                    ],
+                )
+            ],
+        )
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal"],
+                    "context_groups": [
+                        {
+                            "context_id": "meal_1:setup",
+                            "stage": "setup",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-setup"],
+                        },
+                        {
+                            "context_id": "meal_1:closure",
+                            "stage": "closure",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-closure"],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(VideoSummaryError, "meal_1:closure"):
+            meal_event_coverage(payload, [setup, meal, closure], plan, enabled=True)
 
     def test_meal_event_coverage_rejects_an_unselected_event(self) -> None:
         meal = candidate("meal", "2026-08-19T12:00:00+09:00", 0.0)

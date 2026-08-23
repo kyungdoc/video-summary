@@ -71,6 +71,7 @@ class Candidate:
     frame_path: str
     required_event_ids: list[str] = field(default_factory=list)
     required_meal_event_ids: list[str] = field(default_factory=list)
+    required_meal_context_ids: list[str] = field(default_factory=list)
 
     @property
     def duration(self) -> float:

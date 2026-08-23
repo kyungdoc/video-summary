@@ -19,7 +19,8 @@ from .utils import VideoSummaryError, file_fingerprint, print_status, read_json,
 
 JOURNEY_WORDS = {
     "출발", "도착", "공항", "비행기", "기차", "버스", "택시", "렌터카", "이동", "체크인", "체크아웃",
-    "숙소", "호텔", "리조트", "귀가", "집으로", "departure", "arrival", "airport", "train", "bus", "hotel",
+    "숙소", "호텔", "리조트", "주차", "귀가", "집으로", "departure", "arrival", "airport", "train", "bus",
+    "hotel", "parking",
 }
 FUN_WORDS = {
     "웃", "ㅋㅋ", "ㅎㅎ", "대박", "헐", "우와", "미쳤", "신나", "재밌", "최고", "놀라", "웃기",
@@ -39,9 +40,8 @@ JOURNEY_TRANSITION_DEDUPE_SECONDS = 60.0
 PARTY_TRANSITION_CONTEXT_POLICY_VERSION = 1
 PARTY_TRANSITION_CONTEXT_MAX_SECONDS = 12.0
 PARTY_TRANSITION_CONTEXT_MAX_CUES = 3
-MEAL_EVENT_POLICY_VERSION = 2
+MEAL_EVENT_POLICY_VERSION = 5
 MEAL_OPTION_MAX_DURATION_SECONDS = 12.0
-MEAL_SETUP_CLUSTER_SECONDS = 45.0 * 60.0
 MEAL_SETUP_HORIZON_SECONDS = 3.0 * 60.0 * 60.0
 MEAL_DIRECT_CLUSTER_SECONDS = 30.0 * 60.0
 MEAL_INFER_AFTER_SETUP_SECONDS = 60.0 * 60.0
@@ -300,6 +300,31 @@ _MEAL_SETUP_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"|\b(?:arrived|made\s+it|we(?:'re|\s+are)\s+here)\b.{0,24}\b(?:restaurant|diner|cafe)\b"
         ),
     ),
+    (
+        "meal_setup_order",
+        re.compile(
+            r"(?:메뉴|음식|요리|밥|식사|아침|점심|저녁|피자|라멘|라면|초밥|스시|고기|"
+            r"아이스크림|디저트|케이크|커피|주스)(?:이|가|은|는|도|을|를)?\s*"
+            r"(?:주문(?:했습니다|했어요|했어|했|하는\s*중)|시켰습니다|시켰어요|시켰어)"
+            r"|(?:주문(?:했습니다|했어요|했어|했|하는\s*중)|시켰습니다|시켰어요|시켰어)"
+            r".{0,18}?(?:메뉴|음식|요리|밥|식사|아침|점심|저녁|피자|라멘|라면|초밥|스시|고기|"
+            r"아이스크림|디저트|케이크|커피|주스)"
+            r"|\b(?:ordered|placed\s+(?:our|the|an?)\s+order)\b.{0,24}"
+            r"\b(?:food|meal|breakfast|lunch|dinner|pizza|ramen|sushi|dessert|coffee)\b"
+        ),
+    ),
+)
+
+_MEAL_CLOSURE_REACTION_PATTERN = re.compile(
+    r"(?:밥|식사|아침|점심|저녁|음식|요리|메뉴|피자|라멘|라면|초밥|스시|고기|빵|"
+    r"아이스크림|디저트|케이크|커피|주스).{0,20}?"
+    r"(?:정말|진짜|너무|엄청|아주)?\s*(?:맛있었어요|맛있었습니다|맛있었어|좋았어요|좋았습니다|"
+    r"최고였어요|최고였습니다)"
+    r"|(?:맛있었어요|맛있었습니다|맛있었어|좋았어요|좋았습니다|최고였어요|최고였습니다)"
+    r".{0,20}?(?:밥|식사|아침|점심|저녁|음식|요리|메뉴|피자|라멘|라면|초밥|스시|고기|빵|"
+    r"아이스크림|디저트|케이크|커피|주스)"
+    r"|\b(?:food|meal|breakfast|lunch|dinner|pizza|ramen|sushi|dessert|cake|coffee)\b"
+    r".{0,24}?\b(?:was|were)\s+(?:really\s+|so\s+|very\s+)?(?:delicious|tasty|good|great|amazing)\b"
 )
 
 _MEAL_CLOSURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -315,6 +340,10 @@ _MEAL_CLOSURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "meal_closure_thanks",
         re.compile(r"잘\s*먹었습니다|잘\s*먹었어요|\bthanks?\s+for\s+the\s+(?:meal|food)\b"),
+    ),
+    (
+        "meal_closure_reaction",
+        _MEAL_CLOSURE_REACTION_PATTERN,
     ),
 )
 
@@ -375,6 +404,14 @@ _MEAL_DRINK_PATTERN = re.compile(
     r"(?:커피|주스|음료|차를?\s*(?:마시|먹))"
     r"|\b(?:coffee|juice|drink|tea)\b"
 )
+_OPAQUE_MEAL_LOW_INFORMATION_PATTERN = re.compile(
+    r"(?:(?:안녕(?:하세요)?|고맙습니다|감사합니다|빠+파|파+파|짠|건배|"
+    r"네|예|응|와|우와|음|어|아|대성공)(?:\s+|[.!~]*)?)+"
+    r"|(?:\d{1,2}시에\s+와서\s+)?대성공"
+    r"|맛있게\s+(?:드세요|먹어|먹어요|먹자)"
+    r"|(?:(?:hello|hi|thanks|thank\s+you|cheers|yes|yeah|okay|ok|wow|yay)"
+    r"(?:\s+|[.!~]*)?)+|enjoy\s+your\s+meal"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +450,8 @@ class _MealEvent:
     confidence: float
     signals: tuple[str, ...]
     options: tuple[_MealOption, ...]
+    setup_options: tuple[_MealOption, ...] = ()
+    closure_options: tuple[_MealOption, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +462,7 @@ class _MealEvidence:
     direct_options: tuple[_MealOption, ...]
     subtype: str
     virtual_context: bool
+    inferred_body_eligible: bool
 
 
 _INTERVIEW_QUESTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -676,9 +716,21 @@ def build_candidates(
             else []
         )
         meal_options_by_clip: dict[str, list[tuple[_MealEvent, _MealOption]]] = defaultdict(list)
+        meal_context_by_clip: dict[
+            str,
+            list[tuple[_MealEvent, str, _MealOption]],
+        ] = defaultdict(list)
         for meal_event in meal_events:
             for option in meal_event.options:
                 meal_options_by_clip[option.clip_id].append((meal_event, option))
+            for stage, options in (
+                ("setup", meal_event.setup_options),
+                ("closure", meal_event.closure_options),
+            ):
+                for option in options:
+                    meal_context_by_clip[option.clip_id].append(
+                        (meal_event, stage, option)
+                    )
         for index, clip in enumerate(clips, start=1):
             if clip.duration <= 0:
                 continue
@@ -689,6 +741,7 @@ def build_candidates(
             required_interview_events.extend((clip, event) for event in interview_events)
             transition_windows = _detect_journey_transition_windows(clip, cues)
             clip_meal_options = meal_options_by_clip.get(clip.clip_id, [])
+            clip_meal_context = meal_context_by_clip.get(clip.clip_id, [])
             windows = _candidate_windows(
                 clip,
                 cues,
@@ -699,6 +752,10 @@ def build_candidates(
                 meal_windows=[
                     (option.start, option.end, "meal")
                     for _, option in clip_meal_options
+                ]
+                + [
+                    (option.start, option.end, f"meal_{stage}")
+                    for _, stage, option in clip_meal_context
                 ],
             )
             for start, end, origin in windows:
@@ -717,6 +774,13 @@ def build_candidates(
                     if _ranges_overlap(start, end, option.start, option.end)
                 )
                 if required_meal_event_ids:
+                    roles = unique_preserving_order(["food", *roles])
+                required_meal_context_ids = unique_preserving_order(
+                    _meal_context_id(event.event_id, stage)
+                    for event, stage, option in clip_meal_context
+                    if _ranges_overlap(start, end, option.start, option.end)
+                )
+                if required_meal_context_ids:
                     roles = unique_preserving_order(["food", *roles])
                 motion, quality = _window_signals(signals, start, end)
                 speech_duration = sum(
@@ -763,6 +827,7 @@ def build_candidates(
                         frame_path=str(frame_path.relative_to(paths.root)),
                         required_event_ids=required_event_ids,
                         required_meal_event_ids=required_meal_event_ids,
+                        required_meal_context_ids=required_meal_context_ids,
                     )
                 )
 
@@ -774,7 +839,7 @@ def build_candidates(
             *_required_meal_events_payload(meal_events, candidates),
         ]
         payload = {
-            "version": 3,
+            "version": 4,
             "project": config["project"]["name"],
             "cache_key": cache_key,
             "policy_versions": {
@@ -829,7 +894,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 13,
+            "version": 14,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "journey_transition_detection": {
                 "policy": JOURNEY_TRANSITION_POLICY_VERSION,
@@ -883,7 +948,7 @@ def _detect_meal_events(
     clips: list[Clip],
     cues_by_clip: dict[str, list[TranscriptCue]],
 ) -> list[_MealEvent]:
-    """Detect filmed meal bodies while leaving setup and closure narration optional."""
+    """Detect filmed meal bodies and compact setup/closure narrative beats."""
     evidences = [
         _meal_evidence(clip, cues_by_clip.get(clip.clip_id, []))
         for clip in clips
@@ -896,164 +961,274 @@ def _detect_meal_events(
     events: list[_MealEvent] = []
     for day_evidences in grouped.values():
         day_evidences.sort(key=lambda item: (_clip_start_timestamp(item.clip), item.clip.clip_id))
-        consumed_closures: set[int] = set()
-        consumed_direct: set[tuple[str, float, float]] = set()
+        claimed_setup: set[tuple[int, _MealMarker]] = set()
+        claimed_closure: set[tuple[int, _MealMarker]] = set()
+        direct_runs = _direct_meal_runs(day_evidences)
 
-        # A setup may be recorded more than once while the party is moving.
-        # Prefer the last consecutive setup before the first possible body.
+        # Explicit filmed food always wins over an opaque adjacent clip. Build
+        # each nearby same-subtype run once, then attach the nearest compatible
+        # setup and closure without crossing another direct meal run.
+        for run_index, run in enumerate(direct_runs):
+            run_start, run_end = _direct_run_bounds(run)
+            previous_run_end = (
+                _direct_run_bounds(direct_runs[run_index - 1])[1]
+                if run_index > 0
+                else float("-inf")
+            )
+            next_run_start = (
+                _direct_run_bounds(direct_runs[run_index + 1])[0]
+                if run_index + 1 < len(direct_runs)
+                else float("inf")
+            )
+            prior_closures = [
+                _meal_marker_timestamp(evidence, marker, use_end=False)
+                for evidence in day_evidences
+                for marker in evidence.closure_markers
+                if previous_run_end
+                < _meal_marker_timestamp(evidence, marker, use_end=False)
+                < run_start
+            ]
+            setup_floor = max(previous_run_end, max(prior_closures, default=float("-inf")))
+            setup_candidates = [
+                (evidence_index, evidence, marker)
+                for evidence_index, evidence in enumerate(day_evidences)
+                for marker in evidence.setup_markers
+                if setup_floor
+                < _meal_marker_timestamp(evidence, marker, use_end=True)
+                <= run_start
+                and run_start - _meal_marker_timestamp(evidence, marker, use_end=True)
+                <= MEAL_SETUP_HORIZON_SECONDS
+                and _setup_matches_direct_run(evidence, marker, run)
+            ]
+            setup_match = (
+                max(
+                    setup_candidates,
+                    key=lambda item: _meal_marker_timestamp(item[1], item[2], use_end=True),
+                )
+                if setup_candidates
+                else None
+            )
+            claimed_setup.update((index, marker) for index, _, marker in setup_candidates)
+
+            future_setups = [
+                _meal_marker_timestamp(evidence, marker, use_end=False)
+                for evidence in day_evidences
+                for marker in evidence.setup_markers
+                if run_end
+                < _meal_marker_timestamp(evidence, marker, use_end=False)
+                < next_run_start
+            ]
+            closure_ceiling = min(next_run_start, min(future_setups, default=float("inf")))
+            closure_horizon = (
+                MEAL_SETUP_HORIZON_SECONDS
+                if setup_match is not None
+                else MEAL_INFER_BEFORE_CLOSURE_SECONDS
+            )
+            closure_candidates = [
+                (evidence_index, evidence, marker)
+                for evidence_index, evidence in enumerate(day_evidences)
+                for marker in evidence.closure_markers
+                if run_end
+                <= _meal_marker_timestamp(evidence, marker, use_end=False)
+                < closure_ceiling
+                and _meal_marker_timestamp(evidence, marker, use_end=False) - run_end
+                <= closure_horizon
+                and _closure_matches_direct_run(evidence, run)
+            ]
+            closure_match = (
+                min(
+                    closure_candidates,
+                    key=lambda item: _meal_marker_timestamp(item[1], item[2], use_end=False),
+                )
+                if closure_candidates
+                else None
+            )
+            claimed_closure.update((index, marker) for index, _, marker in closure_candidates)
+
+            options = [option for _, option in run]
+            events.append(
+                _make_meal_event(
+                    run[0][0].clip,
+                    options,
+                    subtype=run[0][0].subtype,
+                    signals=[
+                        "direct_actual",
+                        *([setup_match[2].signal] if setup_match is not None else []),
+                        *(signal for option in options for signal in option.signals),
+                        *([closure_match[2].signal] if closure_match is not None else []),
+                    ],
+                    setup_options=(
+                        [_meal_context_option(setup_match[1], setup_match[2], stage="setup")]
+                        if setup_match is not None
+                        else []
+                    ),
+                    closure_options=(
+                        [_meal_context_option(closure_match[1], closure_match[2], stage="closure")]
+                        if closure_match is not None
+                        else []
+                    ),
+                )
+            )
+
+        direct_evidence_indexes = {
+            evidence_index
+            for evidence_index, evidence in enumerate(day_evidences)
+            if evidence.direct_options
+        }
+
+        # If no compatible explicit body exists, a setup can still recover the
+        # immediately following silent/allowlisted visual clip. A later setup
+        # before any body supersedes an earlier approach narration.
         for index, evidence in enumerate(day_evidences):
-            if not evidence.setup_markers:
+            available_setup = [
+                marker
+                for marker in evidence.setup_markers
+                if (index, marker) not in claimed_setup
+            ]
+            if not available_setup or index + 1 >= len(day_evidences):
                 continue
-            if index + 1 < len(day_evidences):
-                following = day_evidences[index + 1]
-                if (
-                    following.setup_markers
-                    and _clip_gap_seconds(evidence.clip, following.clip)
-                    <= MEAL_SETUP_CLUSTER_SECONDS
-                ):
-                    continue
-
             horizon_end = _clip_start_timestamp(evidence.clip) + MEAL_SETUP_HORIZON_SECONDS
-            closure_index = next(
+            later_setup_index = next(
                 (
                     candidate_index
                     for candidate_index in range(index + 1, len(day_evidences))
-                    if day_evidences[candidate_index].closure_markers
-                    and _clip_start_timestamp(day_evidences[candidate_index].clip) <= horizon_end
+                    if _clip_start_timestamp(day_evidences[candidate_index].clip) <= horizon_end
+                    and day_evidences[candidate_index].setup_markers
+                    and not any(
+                        boundary in direct_evidence_indexes
+                        or day_evidences[boundary].closure_markers
+                        for boundary in range(index + 1, candidate_index)
+                    )
                 ),
                 None,
             )
-            search_end = closure_index if closure_index is not None else len(day_evidences) - 1
-            direct_options = [
-                option
-                for candidate_index in range(index + 1, search_end + 1)
-                if _clip_start_timestamp(day_evidences[candidate_index].clip) <= horizon_end
-                for option in day_evidences[candidate_index].direct_options
-            ]
-
-            options: list[_MealOption] = []
-            next_evidence = day_evidences[index + 1] if index + 1 < len(day_evidences) else None
-            has_bracket = (
-                closure_index is not None
-                or any(marker.signal == "restaurant_arrival" for marker in evidence.setup_markers)
-                or bool(next_evidence and next_evidence.direct_options)
-            )
-            if next_evidence is not None and has_bracket:
-                inferred = _inferred_meal_body_option(
-                    evidence,
-                    next_evidence,
-                    signal="inferred_body_after_setup",
-                    maximum_gap=MEAL_INFER_AFTER_SETUP_SECONDS,
-                    confidence=0.91 if closure_index is not None else 0.88,
-                )
-                if inferred is not None:
-                    _append_unique_meal_option(options, inferred)
-            if not options:
+            if later_setup_index is not None:
+                claimed_setup.update((index, marker) for marker in available_setup)
                 continue
 
-            if closure_index is not None:
-                consumed_closures.add(closure_index)
-            consumed_direct.update(_meal_option_key(option) for option in options)
-            if next_evidence is not None and options and options[0].clip_id == next_evidence.clip.clip_id:
-                body_timestamp = _clip_start_timestamp(next_evidence.clip)
-                consumed_direct.update(
-                    _meal_option_key(option)
-                    for option in direct_options
-                    if abs(
-                        _clip_start_timestamp(
-                            next(
-                                candidate.clip
-                                for candidate in day_evidences
-                                if candidate.clip.clip_id == option.clip_id
-                            )
-                        )
-                        - body_timestamp
-                    )
-                    <= MEAL_SETUP_CLUSTER_SECONDS
+            closure_index: int | None = None
+            for candidate_index in range(index + 1, len(day_evidences)):
+                candidate = day_evidences[candidate_index]
+                if _clip_start_timestamp(candidate.clip) > horizon_end:
+                    break
+                if candidate_index in direct_evidence_indexes or candidate.setup_markers:
+                    break
+                available_closure = [
+                    marker
+                    for marker in candidate.closure_markers
+                    if (candidate_index, marker) not in claimed_closure
+                ]
+                if available_closure:
+                    closure_index = candidate_index
+                    break
+
+            next_evidence = day_evidences[index + 1]
+            if index + 1 in direct_evidence_indexes or next_evidence.setup_markers:
+                continue
+            has_strong_setup = any(
+                marker.signal in {"restaurant_arrival", "meal_setup_order"}
+                for marker in available_setup
+            )
+            if closure_index is None and not has_strong_setup:
+                continue
+            inferred = _inferred_meal_body_option(
+                evidence,
+                next_evidence,
+                signal="inferred_body_after_setup",
+                maximum_gap=MEAL_INFER_AFTER_SETUP_SECONDS,
+                confidence=0.91 if closure_index is not None else 0.88,
+            )
+            if inferred is None:
+                continue
+            setup_marker = max(available_setup, key=lambda marker: marker.end)
+            closure_marker = (
+                min(
+                    (
+                        marker
+                        for marker in day_evidences[closure_index].closure_markers
+                        if (closure_index, marker) not in claimed_closure
+                    ),
+                    key=lambda marker: marker.start,
                 )
-            event_signals = [marker.signal for marker in evidence.setup_markers]
-            if closure_index is not None:
-                event_signals.extend(
-                    marker.signal
+                if closure_index is not None
+                else None
+            )
+            claimed_setup.update((index, marker) for marker in available_setup)
+            if closure_marker is not None and closure_index is not None:
+                claimed_closure.update(
+                    (closure_index, marker)
                     for marker in day_evidences[closure_index].closure_markers
                 )
-            event_signals.extend(signal for option in options for signal in option.signals)
             events.append(
                 _make_meal_event(
                     evidence.clip,
-                    options,
-                    subtype=_meal_event_subtype(
-                        evidence.subtype,
-                        *(day_evidences[candidate_index].subtype for candidate_index in range(index + 1, search_end + 1)),
+                    [inferred],
+                    subtype=_meal_event_subtype(evidence.subtype, next_evidence.subtype),
+                    signals=[
+                        setup_marker.signal,
+                        inferred.signals[0],
+                        *([closure_marker.signal] if closure_marker is not None else []),
+                    ],
+                    setup_options=[
+                        _meal_context_option(evidence, setup_marker, stage="setup")
+                    ],
+                    closure_options=(
+                        [
+                            _meal_context_option(
+                                day_evidences[closure_index],
+                                closure_marker,
+                                stage="closure",
+                            )
+                        ]
+                        if closure_marker is not None and closure_index is not None
+                        else []
                     ),
-                    signals=event_signals,
                 )
             )
 
-        # A post-meal statement can reveal an otherwise silent filmed meal in
-        # the immediately preceding clip. The closure clip itself is never an
-        # option, so narration such as "먹고 나왔는데" remains non-mandatory.
+        # A remaining post-meal statement can reveal only the immediately
+        # preceding silent/allowlisted body. Direct body runs were already
+        # emitted and consumed above, so they can never form duplicate events.
         for index, evidence in enumerate(day_evidences):
-            if index in consumed_closures or not evidence.closure_markers or index == 0:
+            available_closure = [
+                marker
+                for marker in evidence.closure_markers
+                if (index, marker) not in claimed_closure
+            ]
+            if not available_closure or index == 0 or index - 1 in direct_evidence_indexes:
                 continue
             previous = day_evidences[index - 1]
-            options = []
-            if previous.direct_options:
-                for option in previous.direct_options:
-                    _append_unique_meal_option(options, option)
-            else:
-                inferred = _inferred_meal_body_option(
-                    previous,
-                    previous,
-                    signal="inferred_body_before_closure",
-                    maximum_gap=MEAL_INFER_BEFORE_CLOSURE_SECONDS,
-                    confidence=0.90,
-                    following=evidence,
-                )
-                if inferred is not None:
-                    _append_unique_meal_option(options, inferred)
-            if not options:
+            inferred = _inferred_meal_body_option(
+                previous,
+                previous,
+                signal="inferred_body_before_closure",
+                maximum_gap=MEAL_INFER_BEFORE_CLOSURE_SECONDS,
+                confidence=0.90,
+                following=evidence,
+            )
+            if inferred is None:
                 continue
-            consumed_direct.update(_meal_option_key(option) for option in previous.direct_options)
+            closure_marker = min(available_closure, key=lambda marker: marker.start)
+            claimed_closure.update((index, marker) for marker in available_closure)
             events.append(
                 _make_meal_event(
                     previous.clip,
-                    options[:3],
+                    [inferred],
                     subtype=_meal_event_subtype(previous.subtype, evidence.subtype),
-                    signals=[
-                        *(marker.signal for marker in evidence.closure_markers),
-                        *(signal for option in options for signal in option.signals),
+                    signals=[closure_marker.signal, inferred.signals[0]],
+                    closure_options=[
+                        _meal_context_option(evidence, closure_marker, stage="closure")
                     ],
                 )
             )
 
-        # Direct filmed evidence needs no setup/closure pair. Nearby cues are
-        # alternative views of one meal, capped at three conservative options.
-        remaining: list[tuple[_MealEvidence, _MealOption]] = [
-            (evidence, option)
-            for evidence in day_evidences
-            for option in evidence.direct_options
-            if _meal_option_key(option) not in consumed_direct
-        ]
-        cluster: list[tuple[_MealEvidence, _MealOption]] = []
-        for item in remaining:
-            if (
-                cluster
-                and (
-                    item[0].subtype != cluster[-1][0].subtype
-                    or _meal_option_timestamp(*item)
-                    - _meal_option_timestamp(*cluster[-1])
-                    > MEAL_DIRECT_CLUSTER_SECONDS
-                )
-            ):
-                events.extend(_direct_meal_events(cluster))
-                cluster = []
-            cluster.append(item)
-        events.extend(_direct_meal_events(cluster))
-
-    deduplicated: dict[tuple[tuple[str, float, float], ...], _MealEvent] = {}
+    deduplicated: dict[tuple[Any, ...], _MealEvent] = {}
     for event in events:
-        signature = tuple(_meal_option_key(option) for option in event.options)
+        signature = (
+            tuple(_meal_option_key(option) for option in event.options),
+            tuple(_meal_option_key(option) for option in event.setup_options),
+            tuple(_meal_option_key(option) for option in event.closure_options),
+        )
         existing = deduplicated.get(signature)
         if existing is None or (event.confidence, len(event.signals)) > (
             existing.confidence,
@@ -1086,19 +1261,26 @@ def _meal_evidence(clip: Clip, cues: list[TranscriptCue]) -> _MealEvidence:
     direct_options: list[_MealOption] = []
     if not virtual_context:
         for group in _group_cues(ordered):
-            text = " ".join(cue.text.strip() for cue in group).casefold()
-            setup_signal = _matching_meal_signal(_MEAL_SETUP_PATTERNS, text)
-            closure_signal = _matching_meal_signal(_MEAL_CLOSURE_PATTERNS, text)
-            if setup_signal is not None:
-                setup_markers.append(_MealMarker(setup_signal, group[0].start, group[-1].end))
-            if closure_signal is not None:
-                closure_markers.append(_MealMarker(closure_signal, group[0].start, group[-1].end))
-            direct_signal = _meal_direct_signal(text, combined)
-            if direct_signal is None:
+            setup_marker = _minimal_meal_marker(_MEAL_SETUP_PATTERNS, group)
+            closure_marker = _minimal_meal_marker(_MEAL_CLOSURE_PATTERNS, group)
+            group_text = " ".join(cue.text.strip() for cue in group).casefold()
+            if (
+                closure_marker is not None
+                and closure_marker.signal == "meal_closure_reaction"
+                and _MEAL_RETROSPECTIVE_OR_PLAN_PATTERN.search(group_text)
+            ):
+                closure_marker = None
+            if setup_marker is not None:
+                setup_markers.append(setup_marker)
+            if closure_marker is not None:
+                closure_markers.append(closure_marker)
+            direct_match = _minimal_direct_meal_span(group, combined)
+            if direct_match is None:
                 continue
+            direct_signal, direct_start, direct_end = direct_match
             start, end = _ensure_duration(
-                max(0.0, group[0].start - 0.35),
-                min(clip.duration, group[-1].end + 0.75),
+                max(0.0, direct_start - 0.35),
+                min(clip.duration, direct_end + 0.75),
                 clip.duration,
                 minimum=2.5,
                 maximum=MEAL_OPTION_MAX_DURATION_SECONDS,
@@ -1125,7 +1307,27 @@ def _meal_evidence(clip: Clip, cues: list[TranscriptCue]) -> _MealEvidence:
         direct_options=tuple(direct_options[:3]),
         subtype=_meal_subtype(combined),
         virtual_context=virtual_context,
+        # Opaque body inference is intentionally conservative. Short meal
+        # clips often transcribe only greetings, but an explicit travel-state
+        # narration (for example, arriving at a hotel) must never stand in for
+        # filmed food merely because a "잘 먹었습니다" clip follows it.
+        inferred_body_eligible=_opaque_meal_body_eligible(combined),
     )
+
+
+def _opaque_meal_body_eligible(text: str) -> bool:
+    """Allow only silent or tightly allowlisted low-information clips."""
+    normalized = " ".join(text.casefold().split())
+    if not normalized:
+        return True
+    if _MEAL_RETROSPECTIVE_OR_PLAN_PATTERN.search(normalized):
+        return False
+    if any(word in normalized for word in JOURNEY_WORDS | SCENERY_WORDS):
+        return False
+    # Greetings, thanks, and tiny interjections are common on otherwise
+    # visual meal clips. Other semantics are not safe evidence merely because
+    # they happen to sit between meal setup and closure narration.
+    return _OPAQUE_MEAL_LOW_INFORMATION_PATTERN.fullmatch(normalized) is not None
 
 
 def _matching_meal_signal(
@@ -1133,6 +1335,76 @@ def _matching_meal_signal(
     text: str,
 ) -> str | None:
     return next((signal for signal, pattern in patterns if pattern.search(text)), None)
+
+
+def _minimal_meal_marker(
+    patterns: tuple[tuple[str, re.Pattern[str]], ...],
+    cues: list[TranscriptCue],
+) -> _MealMarker | None:
+    matches: list[tuple[float, int, float, _MealMarker]] = []
+    for start_index in range(len(cues)):
+        for end_index in range(start_index, len(cues)):
+            window = cues[start_index : end_index + 1]
+            text = " ".join(cue.text.strip() for cue in window).casefold()
+            signal = _matching_meal_signal(patterns, text)
+            if signal is None:
+                continue
+            marker = _MealMarker(signal, window[0].start, window[-1].end)
+            matches.append(
+                (
+                    marker.end - marker.start,
+                    len(window),
+                    marker.start,
+                    marker,
+                )
+            )
+    return min(matches, key=lambda item: item[:3])[3] if matches else None
+
+
+def _minimal_direct_meal_span(
+    cues: list[TranscriptCue],
+    clip_context: str,
+) -> tuple[str, float, float] | None:
+    matches: list[tuple[float, int, float, str, float, float]] = []
+    grouped_context = " ".join(cue.text.strip() for cue in cues).casefold()
+    group_signal = _meal_direct_signal(grouped_context, clip_context)
+    if group_signal is None:
+        return None
+    for start_index in range(len(cues)):
+        for end_index in range(start_index, len(cues)):
+            window = cues[start_index : end_index + 1]
+            # A demonstrative food reveal is high confidence only within one
+            # ASR cue. Joining a distant "이거 뭐야?" to a later misheard food
+            # noun promoted Sapporo outdoor footage as an explicit meal body.
+            if group_signal == "food_reveal" and len(window) > 1:
+                continue
+            text = " ".join(cue.text.strip() for cue in window).casefold()
+            signal = _meal_direct_signal(text, clip_context)
+            if signal != group_signal:
+                continue
+            start = window[0].start
+            end = window[-1].end
+            matches.append((end - start, len(window), start, signal, start, end))
+    if not matches:
+        if group_signal == "food_reveal":
+            return None
+        return group_signal, cues[0].start, cues[-1].end
+    _, _, _, signal, start, end = min(matches, key=lambda item: item[:3])
+    for cue in cues:
+        normalized = " ".join(cue.text.casefold().split())
+        if cue.start < start or cue.end - start > MEAL_OPTION_MAX_DURATION_SECONDS:
+            continue
+        if (
+            _MEAL_ACTUAL_EATING_PATTERN.search(normalized)
+            or _MEAL_FOOD_REVEAL_PATTERN.search(normalized)
+            or (
+                _MEAL_TASTING_PATTERN.search(normalized)
+                and not _MEAL_CLOSURE_REACTION_PATTERN.search(normalized)
+                and _MEAL_FOOD_NOUN_PATTERN.search(clip_context)
+            )
+        ):
+            end = max(end, cue.end)
+    return signal, start, end
 
 
 def _meal_direct_signal(text: str, clip_context: str = "") -> str | None:
@@ -1150,11 +1422,15 @@ def _meal_direct_signal(text: str, clip_context: str = "") -> str | None:
         return "food_reveal"
     if _MEAL_ACTUAL_EATING_PATTERN.search(normalized):
         return "actual_eating"
-    if _MEAL_TASTING_PATTERN.search(normalized) and (
-        _MEAL_FOOD_NOUN_PATTERN.search(normalized)
-        or (
-            _MEAL_PRESENT_CONTEXT_PATTERN.search(normalized)
-            and _MEAL_FOOD_NOUN_PATTERN.search(clip_context)
+    if (
+        _MEAL_TASTING_PATTERN.search(normalized)
+        and not _MEAL_CLOSURE_REACTION_PATTERN.search(normalized)
+        and (
+            _MEAL_FOOD_NOUN_PATTERN.search(normalized)
+            or (
+                _MEAL_PRESENT_CONTEXT_PATTERN.search(normalized)
+                and _MEAL_FOOD_NOUN_PATTERN.search(clip_context)
+            )
         )
     ):
         return "tasting_food"
@@ -1192,12 +1468,7 @@ def _inferred_meal_body_option(
     confidence: float,
     following: _MealEvidence | None = None,
 ) -> _MealOption | None:
-    if (
-        body.virtual_context
-        or body.setup_markers
-        or body.closure_markers
-        or body.clip.duration < 0.75
-    ):
+    if body.virtual_context:
         return None
     gap = (
         _clip_gap_seconds(anchor.clip, body.clip)
@@ -1208,6 +1479,10 @@ def _inferred_meal_body_option(
         return None
     if body.direct_options:
         return body.direct_options[0]
+    if not body.inferred_body_eligible:
+        return None
+    if body.setup_markers or body.closure_markers or body.clip.duration < 0.75:
+        return None
     duration = min(body.clip.duration, MAX_CANDIDATE_DURATION_SECONDS)
     return _MealOption(
         clip_id=body.clip.clip_id,
@@ -1222,8 +1497,111 @@ def _meal_option_key(option: _MealOption) -> tuple[str, float, float]:
     return option.clip_id, round(option.start, 3), round(option.end, 3)
 
 
+def _meal_context_option(
+    evidence: _MealEvidence,
+    marker: _MealMarker,
+    *,
+    stage: str,
+) -> _MealOption:
+    start, end = _ensure_duration(
+        max(0.0, marker.start - 0.35),
+        min(evidence.clip.duration, marker.end + 0.75),
+        evidence.clip.duration,
+        minimum=2.5,
+        maximum=MEAL_OPTION_MAX_DURATION_SECONDS,
+    )
+    return _MealOption(
+        clip_id=evidence.clip.clip_id,
+        start=round(start, 3),
+        end=round(end, 3),
+        confidence=0.95,
+        signals=(f"meal_{stage}", marker.signal),
+    )
+
+
+def _meal_context_id(event_id: str, stage: str) -> str:
+    return f"{event_id}:{stage}"
+
+
 def _meal_option_timestamp(evidence: _MealEvidence, option: _MealOption) -> float:
     return _clip_start_timestamp(evidence.clip) + option.start
+
+
+def _meal_option_center_timestamp(evidence: _MealEvidence, option: _MealOption) -> float:
+    return _clip_start_timestamp(evidence.clip) + (option.start + option.end) / 2.0
+
+
+def _meal_marker_timestamp(
+    evidence: _MealEvidence,
+    marker: _MealMarker,
+    *,
+    use_end: bool,
+) -> float:
+    return _clip_start_timestamp(evidence.clip) + (marker.end if use_end else marker.start)
+
+
+def _direct_meal_runs(
+    evidences: list[_MealEvidence],
+) -> list[list[tuple[_MealEvidence, _MealOption]]]:
+    """Group explicit nearby views without crossing a meal context boundary."""
+    entries = [
+        (evidence, option)
+        for evidence in evidences
+        for option in evidence.direct_options
+    ]
+    entries.sort(key=lambda item: (_meal_option_timestamp(*item), _meal_option_key(item[1])))
+    marker_times = sorted(
+        _meal_marker_timestamp(evidence, marker, use_end=False)
+        for evidence in evidences
+        for marker in (*evidence.setup_markers, *evidence.closure_markers)
+    )
+    runs: list[list[tuple[_MealEvidence, _MealOption]]] = []
+    for entry in entries:
+        if runs:
+            previous = runs[-1][-1]
+            previous_time = _meal_option_center_timestamp(*previous)
+            incoming_time = _meal_option_center_timestamp(*entry)
+            crosses_context = any(
+                previous_time < marker_time < incoming_time
+                for marker_time in marker_times
+            )
+            if (
+                entry[0].subtype != previous[0].subtype
+                or _meal_option_timestamp(*entry)
+                - _meal_option_timestamp(*previous)
+                > MEAL_DIRECT_CLUSTER_SECONDS
+                or crosses_context
+            ):
+                runs.append([])
+        if not runs:
+            runs.append([])
+        runs[-1].append(entry)
+    return runs
+
+
+def _direct_run_bounds(
+    run: list[tuple[_MealEvidence, _MealOption]],
+) -> tuple[float, float]:
+    centers = [_meal_option_center_timestamp(*entry) for entry in run]
+    return min(centers), max(centers)
+
+
+def _setup_matches_direct_run(
+    evidence: _MealEvidence,
+    marker: _MealMarker,
+    run: list[tuple[_MealEvidence, _MealOption]],
+) -> bool:
+    return (
+        evidence.subtype == run[0][0].subtype
+        or marker.signal in {"restaurant_arrival", "meal_setup_order"}
+    )
+
+
+def _closure_matches_direct_run(
+    evidence: _MealEvidence,
+    run: list[tuple[_MealEvidence, _MealOption]],
+) -> bool:
+    return evidence.subtype in {"meal", run[0][0].subtype}
 
 
 def _append_unique_meal_option(options: list[_MealOption], incoming: _MealOption) -> None:
@@ -1238,14 +1616,20 @@ def _make_meal_event(
     *,
     subtype: str,
     signals: list[str],
+    setup_options: list[_MealOption] | None = None,
+    closure_options: list[_MealOption] | None = None,
 ) -> _MealEvent:
     bounded = tuple(options[:3])
+    bounded_setup = tuple((setup_options or [])[:1])
+    bounded_closure = tuple((closure_options or [])[:1])
     event_id = "meal_" + stable_hash(
         {
             "policy": MEAL_EVENT_POLICY_VERSION,
             "day_key": clip.day_key,
             "subtype": subtype,
             "options": [_meal_option_key(option) for option in bounded],
+            "setup": [_meal_option_key(option) for option in bounded_setup],
+            "closure": [_meal_option_key(option) for option in bounded_closure],
         },
         length=18,
     )
@@ -1257,27 +1641,9 @@ def _make_meal_event(
         confidence=round(max(option.confidence for option in bounded), 3),
         signals=tuple(unique_preserving_order(signals)),
         options=bounded,
+        setup_options=bounded_setup,
+        closure_options=bounded_closure,
     )
-
-
-def _direct_meal_events(
-    cluster: list[tuple[_MealEvidence, _MealOption]],
-) -> list[_MealEvent]:
-    events: list[_MealEvent] = []
-    for offset in range(0, len(cluster), 3):
-        chunk = cluster[offset : offset + 3]
-        if not chunk:
-            continue
-        options = [option for _, option in chunk]
-        events.append(
-            _make_meal_event(
-                chunk[0][0].clip,
-                options,
-                subtype=_meal_event_subtype(*(evidence.subtype for evidence, _ in chunk)),
-                signals=["direct_actual", *(signal for option in options for signal in option.signals)],
-            )
-        )
-    return events
 
 
 def _detect_journey_transition_windows(
@@ -2187,6 +2553,41 @@ def _required_meal_events_payload(
                     "candidate_ids": option_candidate_ids,
                 }
             )
+        context_groups: list[dict[str, Any]] = []
+        for stage, options in (
+            ("setup", event.setup_options),
+            ("closure", event.closure_options),
+        ):
+            if not options:
+                continue
+            context_id = _meal_context_id(event.event_id, stage)
+            context_candidate_ids = [
+                candidate.candidate_id
+                for candidate in candidates
+                if context_id in candidate.required_meal_context_ids
+            ]
+            if not context_candidate_ids:
+                raise VideoSummaryError(
+                    f"필수 식사 {stage} 맥락 후보를 만들지 못했습니다: {event.event_id}"
+                )
+            context_groups.append(
+                {
+                    "context_id": context_id,
+                    "stage": stage,
+                    "selection_mode": "one_of",
+                    "candidate_ids": context_candidate_ids,
+                    "ranges": [
+                        {
+                            "clip_id": option.clip_id,
+                            "start": option.start,
+                            "end": option.end,
+                            "confidence": option.confidence,
+                            "signals": list(option.signals),
+                        }
+                        for option in options
+                    ],
+                }
+            )
         payload.append(
             {
                 "event_id": event.event_id,
@@ -2199,6 +2600,7 @@ def _required_meal_events_payload(
                 "signals": list(event.signals),
                 "candidate_ids": candidate_ids,
                 "option_ranges": option_ranges,
+                "context_groups": context_groups,
             }
         )
     return payload
@@ -2262,8 +2664,8 @@ def _candidate_windows(
         if transition_windows is not None
         else _detect_journey_transition_windows(clip, cues)
     )
-    # Meal bodies are semantic options, added after the ordinary per-clip cap.
-    # Setup/closure narration never reaches this list.
+    # Meal bodies and their detected setup/closure beats are semantic options,
+    # added after the ordinary per-clip cap so the full micro-story survives.
     selected.extend(meal_windows or [])
     return _merge_overlapping_windows(selected)
 
@@ -2283,7 +2685,7 @@ def _merge_overlapping_windows(
         components[-1].append((start, end, origin))
 
     merged: list[tuple[float, float, str]] = []
-    semantic_origins = {"transition", "meal"}
+    semantic_origins = {"transition", "meal", "meal_setup", "meal_closure"}
     for component in components:
         component_start = min(item[0] for item in component)
         component_end = max(item[1] for item in component)
@@ -2393,6 +2795,10 @@ def _merged_window_origin(
         return "interview"
     if "meal" in overlapping_origins:
         return "meal"
+    if "meal_setup" in overlapping_origins:
+        return "meal_setup"
+    if "meal_closure" in overlapping_origins:
+        return "meal_closure"
     if part_index == 0 and "opener" in overlapping_origins:
         return "opener"
     if part_index == part_count - 1 and "closer" in overlapping_origins:
@@ -2401,6 +2807,8 @@ def _merged_window_origin(
         "interview": 5,
         "transition": 4,
         "meal": 4,
+        "meal_setup": 4,
+        "meal_closure": 4,
         "speech": 3,
         "visual": 2,
         "opener": 1,
@@ -2529,7 +2937,7 @@ def _roles(text: str, clip: Clip, start: float, end: float, origin: str) -> list
     roles: list[str] = []
     if origin == "transition":
         roles.extend(["transition", "journey"])
-    elif origin == "meal":
+    elif origin in {"meal", "meal_setup", "meal_closure"}:
         roles.append("food")
     elif any(word in normalized for word in JOURNEY_WORDS) or origin in {"opener", "closer"}:
         roles.append("journey")

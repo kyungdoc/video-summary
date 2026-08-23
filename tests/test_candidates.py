@@ -79,6 +79,7 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertEqual(candidate.required_event_ids, [])
         self.assertEqual(candidate.required_meal_event_ids, [])
+        self.assertEqual(candidate.required_meal_context_ids, [])
 
     def test_candidate_cache_key_tracks_visual_signal_policy(self) -> None:
         clip = Clip(
@@ -184,6 +185,17 @@ class CandidateCoverageTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(_meal_direct_signal(text, text))
 
+    def test_direct_meal_localization_keeps_group_level_retrospective_guard(self) -> None:
+        clip = _clip("retrospective", duration=12.0)
+        cues = {
+            clip.clip_id: [
+                TranscriptCue(1.0, 3.0, "어제 먹었던 피자는"),
+                TranscriptCue(3.0, 5.0, "이거 진짜 맛있어요"),
+            ]
+        }
+
+        self.assertEqual(_detect_meal_events([clip], cues), [])
+
     def test_sapporo_meal_brackets_recover_silent_body_clips(self) -> None:
         clips = [
             _clip("clip_1f584a801742bfc6", duration=30.0, captured_at="2026-08-20T08:00:00+09:00"),
@@ -191,9 +203,11 @@ class CandidateCoverageTests(unittest.TestCase):
             _clip("clip_09993b62be79618f", duration=12.0, captured_at="2026-08-20T09:00:00+09:00"),
             _clip("clip_2d4c1871e944b838", duration=36.7, captured_at="2026-08-20T12:00:00+09:00"),
             _clip("clip_01d0a2498b9e63bc", duration=16.517, captured_at="2026-08-20T12:01:00+09:00"),
-            _clip("clip_5efdd0224f934a16", duration=14.0, captured_at="2026-08-20T12:02:00+09:00"),
-            _clip("clip_398d95c0dd2e8f5a", duration=5.956, captured_at="2026-08-20T17:00:00+09:00"),
-            _clip("clip_b6e2656927e8d91c", duration=20.0, captured_at="2026-08-20T17:01:00+09:00"),
+            _clip("clip_5efdd0224f934a16", duration=14.0, captured_at="2026-08-20T20:00:00+09:00"),
+            _clip("clip_7866091dfdbc5251", duration=6.39, captured_at="2026-08-20T17:00:00+09:00"),
+            _clip("clip_85b536e9d0aa58ba", duration=4.254, captured_at="2026-08-20T17:01:00+09:00"),
+            _clip("clip_398d95c0dd2e8f5a", duration=5.956, captured_at="2026-08-20T19:00:00+09:00"),
+            _clip("clip_b6e2656927e8d91c", duration=20.0, captured_at="2026-08-20T19:01:00+09:00"),
             _clip("clip_3fd035d9f5be4682", duration=182.0, captured_at="2026-08-20T20:51:00+09:00"),
         ]
         cues_by_clip = {
@@ -203,6 +217,8 @@ class CandidateCoverageTests(unittest.TestCase):
             "clip_2d4c1871e944b838": [TranscriptCue(30.0, 35.0, "밥 집에 왔습니다. 도착했습니다")],
             "clip_01d0a2498b9e63bc": [TranscriptCue(2.0, 4.0, "고맙습니다")],
             "clip_5efdd0224f934a16": [TranscriptCue(1.0, 4.0, "이거 피자야 맛있게 먹자")],
+            "clip_7866091dfdbc5251": [TranscriptCue(1.0, 3.0, "5시에 와서 대성공")],
+            "clip_85b536e9d0aa58ba": [TranscriptCue(0.0, 3.0, "맛있게 먹고 돌아갑시다")],
             "clip_398d95c0dd2e8f5a": [TranscriptCue(1.0, 2.0, "빠파")],
             "clip_b6e2656927e8d91c": [TranscriptCue(0.0, 3.0, "밥 먹고 나왔는데 이제 돌아갑니다")],
             "clip_3fd035d9f5be4682": [
@@ -221,6 +237,7 @@ class CandidateCoverageTests(unittest.TestCase):
         for clip_id in (
             "clip_e5b5516569fcbf68",
             "clip_01d0a2498b9e63bc",
+            "clip_7866091dfdbc5251",
             "clip_398d95c0dd2e8f5a",
         ):
             self.assertIn(clip_id, by_clip)
@@ -266,6 +283,121 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertEqual(_detect_meal_events([clip], cues), [])
 
+    def test_split_question_and_misheard_food_is_not_a_reveal(self) -> None:
+        clip = _clip(
+            "split-question",
+            duration=26.26,
+            captured_at="2025-02-05T13:01:10+09:00",
+        )
+        cues = {
+            clip.clip_id: [
+                TranscriptCue(0.0, 2.0, "이거 뭐야?"),
+                TranscriptCue(2.0, 4.0, "이거 뭐야? 소금이야?"),
+                TranscriptCue(4.0, 6.0, "뭐야?"),
+                TranscriptCue(6.0, 8.0, "아빠 피자야"),
+                TranscriptCue(8.0, 10.0, "나한테 거실게"),
+            ]
+        }
+
+        self.assertEqual(_detect_meal_events([clip], cues), [])
+
+    def test_lodging_arrival_before_meal_thanks_is_not_inferred_as_food(self) -> None:
+        clips = [
+            _clip(
+                "lodging_arrival",
+                duration=14.0,
+                captured_at="2025-12-30T17:32:14+07:00",
+            ),
+            _clip(
+                "meal_thanks",
+                duration=8.0,
+                captured_at="2025-12-30T17:32:40+07:00",
+            ),
+        ]
+        cues = {
+            "lodging_arrival": [
+                TranscriptCue(
+                    0.0,
+                    6.0,
+                    "멀큐리 푸꾸옥 리조트에 도착했습니다. 평화로운데?",
+                )
+            ],
+            "meal_thanks": [TranscriptCue(0.0, 3.0, "맛있게 잘 먹었습니다")],
+        }
+
+        self.assertEqual(_detect_meal_events(clips, cues), [])
+
+    def test_journey_words_do_not_hide_explicit_meal_body_after_setup(self) -> None:
+        clips = [
+            _clip(
+                "breakfast_setup",
+                duration=8.0,
+                captured_at="2026-08-20T07:59:00+09:00",
+            ),
+            _clip(
+                "breakfast_body",
+                duration=10.0,
+                captured_at="2026-08-20T08:00:00+09:00",
+            ),
+        ]
+        cues = {
+            "breakfast_setup": [TranscriptCue(0.0, 3.0, "아침 먹으러 갑니다")],
+            "breakfast_body": [
+                TranscriptCue(0.0, 4.0, "호텔 조식을 먹고 있어요")
+            ],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].options[0].clip_id, "breakfast_body")
+        self.assertEqual(events[0].setup_options[0].clip_id, "breakfast_setup")
+
+    def test_scenery_between_meal_setup_and_closure_is_not_inferred_as_food(self) -> None:
+        clips = [
+            _clip("lunch_setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("sea_view", duration=9.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("lunch_closure", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+        ]
+        cues = {
+            "lunch_setup": [TranscriptCue(0.0, 3.0, "점심 먹으러 갑시다")],
+            "sea_view": [TranscriptCue(0.0, 4.0, "바다가 정말 예쁘네요")],
+            "lunch_closure": [TranscriptCue(0.0, 3.0, "점심 먹고 나왔어요")],
+        }
+
+        self.assertEqual(_detect_meal_events(clips, cues), [])
+
+    def test_meal_memory_or_plan_between_setup_and_closure_is_not_a_body(self) -> None:
+        for body_text in (
+            "어제 먹었던 피자는 정말 맛있었는데 또 먹고 싶어요",
+            "내일은 피자를 먹을 예정이에요",
+        ):
+            with self.subTest(body_text=body_text):
+                clips = [
+                    _clip("setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+                    _clip("body", duration=9.0, captured_at="2026-08-20T12:01:00+09:00"),
+                    _clip("closure", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+                ]
+                cues = {
+                    "setup": [TranscriptCue(0.0, 3.0, "점심 먹으러 갑시다")],
+                    "body": [TranscriptCue(0.0, 4.0, body_text)],
+                    "closure": [TranscriptCue(0.0, 3.0, "점심 먹고 나왔어요")],
+                }
+
+                self.assertEqual(_detect_meal_events(clips, cues), [])
+
+    def test_retrospective_food_praise_is_not_a_current_meal_closure(self) -> None:
+        clips = [
+            _clip("opaque", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("memory", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+        ]
+        cues = {
+            "opaque": [TranscriptCue(1.0, 2.0, "안녕하세요")],
+            "memory": [TranscriptCue(1.0, 3.0, "어제 라멘 정말 맛있었어요")],
+        }
+
+        self.assertEqual(_detect_meal_events(clips, cues), [])
+
     def test_served_food_without_approach_context_remains_direct_meal(self) -> None:
         clip = _clip(
             "served-ramen",
@@ -280,6 +412,305 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual([option.clip_id for option in events[0].options], [clip.clip_id])
+        self.assertEqual(events[0].setup_options, ())
+        self.assertEqual(events[0].closure_options, ())
+
+    def test_served_food_body_keeps_a_nearby_tasting_reaction(self) -> None:
+        clip = _clip("ice-cream", duration=8.8)
+        cues = {
+            clip.clip_id: [
+                TranscriptCue(0.14, 2.14, "아이스크림 받았습니다"),
+                TranscriptCue(3.14, 5.14, "촉촉한게"),
+                TranscriptCue(5.14, 7.14, "음 엄청 맛있네요"),
+            ]
+        }
+
+        events = _detect_meal_events([clip], cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertLessEqual(events[0].options[0].start, 0.14)
+        self.assertGreaterEqual(events[0].options[0].end, 7.14)
+
+    def test_direct_meal_keeps_separate_same_clip_setup_and_closure(self) -> None:
+        clip = _clip(
+            "same-clip-meal-story",
+            duration=14.0,
+            captured_at="2026-08-20T12:00:00+09:00",
+        )
+        cues = {
+            clip.clip_id: [
+                TranscriptCue(1.0, 2.0, "이제 저녁 먹으러 갑시다"),
+                TranscriptCue(5.0, 6.0, "라멘이 나왔습니다"),
+                TranscriptCue(9.0, 10.0, "밥 먹고 나왔는데 맛있었어요"),
+            ]
+        }
+
+        events = _detect_meal_events([clip], cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events[0].options), 1)
+        self.assertEqual(len(events[0].setup_options), 1)
+        self.assertEqual(len(events[0].closure_options), 1)
+        self.assertLess(events[0].setup_options[0].end, events[0].options[0].start)
+        self.assertLess(events[0].options[0].end, events[0].closure_options[0].start)
+
+    def test_meal_context_localizes_the_matching_cues_inside_a_long_group(self) -> None:
+        clips = [
+            _clip("arrival", duration=36.7, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("body", duration=10.0, captured_at="2026-08-20T12:01:00+09:00"),
+        ]
+        cues = {
+            "arrival": [
+                TranscriptCue(16.24, 18.50, "엄마 사랑해"),
+                TranscriptCue(18.50, 20.72, "아빠 사랑해"),
+                TranscriptCue(20.72, 22.52, "사랑해는 무슨 말"),
+                TranscriptCue(22.52, 24.26, "그렇게 하자"),
+                TranscriptCue(24.26, 28.76, "오늘 재미있었지"),
+                TranscriptCue(28.76, 30.96, "자 어쨌든 밥 집에 왔습니다"),
+                TranscriptCue(30.96, 32.96, "도착했습니다"),
+            ],
+            "body": [TranscriptCue(1.0, 3.0, "고맙습니다")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 1)
+        setup = events[0].setup_options[0]
+        self.assertLessEqual(setup.start, 28.76)
+        self.assertGreaterEqual(setup.end, 30.96)
+        self.assertGreater(setup.start, 24.26)
+
+    def test_direct_meal_keeps_context_when_a_clip_boundary_splits_the_story(self) -> None:
+        cases = [
+            (
+                [
+                    _clip("setup-body", duration=12.0, captured_at="2026-08-20T12:00:00+09:00"),
+                    _clip("closure", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+                ],
+                {
+                    "setup-body": [
+                        TranscriptCue(1.0, 2.0, "저녁 먹으러 갑시다"),
+                        TranscriptCue(5.0, 6.0, "라멘이 나왔습니다"),
+                    ],
+                    "closure": [TranscriptCue(1.0, 2.0, "밥 먹고 나왔는데 맛있었어요")],
+                },
+            ),
+            (
+                [
+                    _clip("setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+                    _clip("body-closure", duration=12.0, captured_at="2026-08-20T12:01:00+09:00"),
+                ],
+                {
+                    "setup": [TranscriptCue(1.0, 2.0, "저녁 먹으러 갑시다")],
+                    "body-closure": [
+                        TranscriptCue(1.0, 2.0, "라멘이 나왔습니다"),
+                        TranscriptCue(5.0, 6.0, "밥 먹고 나왔는데 맛있었어요"),
+                    ],
+                },
+            ),
+        ]
+
+        for clips, cues in cases:
+            with self.subTest(clips=[clip.clip_id for clip in clips]):
+                events = _detect_meal_events(clips, cues)
+
+                self.assertEqual(len(events), 1)
+                self.assertEqual(len(events[0].setup_options), 1)
+                self.assertEqual(len(events[0].options), 1)
+                self.assertEqual(len(events[0].closure_options), 1)
+
+    def test_setup_does_not_claim_a_closure_after_an_intervening_meal(self) -> None:
+        clips = [
+            _clip("lunch-setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("lunch-body", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("dinner-body", duration=8.0, captured_at="2026-08-20T14:00:00+09:00"),
+            _clip("dinner-closure", duration=8.0, captured_at="2026-08-20T14:10:00+09:00"),
+        ]
+        cues = {
+            "lunch-setup": [TranscriptCue(1.0, 2.0, "점심 먹으러 갑시다")],
+            "lunch-body": [TranscriptCue(1.0, 2.0, "라멘이 나왔습니다")],
+            "dinner-body": [TranscriptCue(1.0, 2.0, "피자가 나왔습니다")],
+            "dinner-closure": [TranscriptCue(1.0, 2.0, "저녁 먹고 나왔어요")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+        lunch = next(
+            event
+            for event in events
+            if any(option.clip_id == "lunch-body" for option in event.options)
+        )
+        dinner = next(
+            event
+            for event in events
+            if any(option.clip_id == "dinner-body" for option in event.options)
+        )
+
+        self.assertEqual(len(lunch.setup_options), 1)
+        self.assertEqual(lunch.closure_options, ())
+        self.assertEqual(len(dinner.closure_options), 1)
+
+    def test_setup_and_closure_stay_one_event_across_nearby_body_views(self) -> None:
+        clips = [
+            _clip("setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("body-wide", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("body-close", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+            _clip("closure", duration=8.0, captured_at="2026-08-20T12:03:00+09:00"),
+        ]
+        cues = {
+            "setup": [TranscriptCue(1.0, 2.0, "점심 먹으러 갑시다")],
+            "body-wide": [TranscriptCue(1.0, 2.0, "라멘이 나왔습니다")],
+            "body-close": [TranscriptCue(1.0, 2.0, "초밥이 나왔습니다")],
+            "closure": [TranscriptCue(1.0, 2.0, "점심 먹고 나왔어요")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            [option.clip_id for option in events[0].options],
+            ["body-wide", "body-close"],
+        )
+        self.assertEqual(len(events[0].setup_options), 1)
+        self.assertEqual(len(events[0].closure_options), 1)
+
+    def test_explicit_body_after_low_information_clip_wins_the_meal_bracket(self) -> None:
+        clips = [
+            _clip("setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("greeting", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("food", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+            _clip("closure", duration=8.0, captured_at="2026-08-20T12:03:00+09:00"),
+        ]
+        cues = {
+            "setup": [TranscriptCue(1.0, 2.0, "점심 먹으러 갑시다")],
+            "greeting": [TranscriptCue(1.0, 2.0, "안녕하세요")],
+            "food": [TranscriptCue(1.0, 2.0, "라멘이 나왔습니다")],
+            "closure": [TranscriptCue(1.0, 2.0, "점심 먹고 나왔어요")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual([option.clip_id for option in events[0].options], ["food"])
+        self.assertEqual(events[0].setup_options[0].clip_id, "setup")
+        self.assertEqual(events[0].closure_options[0].clip_id, "closure")
+
+    def test_same_clip_setup_and_nearby_bodies_form_only_one_event(self) -> None:
+        clips = [
+            _clip("setup-body", duration=12.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("body-close", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("closure", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+        ]
+        cues = {
+            "setup-body": [
+                TranscriptCue(1.0, 2.0, "점심 먹으러 갑시다"),
+                TranscriptCue(5.0, 6.0, "라멘이 나왔습니다"),
+            ],
+            "body-close": [TranscriptCue(1.0, 2.0, "초밥이 나왔습니다")],
+            "closure": [TranscriptCue(1.0, 2.0, "점심 먹고 나왔어요")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            [option.clip_id for option in events[0].options],
+            ["setup-body", "body-close"],
+        )
+        self.assertEqual(events[0].setup_options[0].clip_id, "setup-body")
+        self.assertEqual(events[0].closure_options[0].clip_id, "closure")
+
+    def test_closure_claims_the_whole_nearby_direct_body_run(self) -> None:
+        clips = [
+            _clip("body-wide", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("body-close", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("closure", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+        ]
+        cues = {
+            "body-wide": [TranscriptCue(1.0, 2.0, "라멘이 나왔습니다")],
+            "body-close": [TranscriptCue(1.0, 2.0, "초밥이 나왔습니다")],
+            "closure": [TranscriptCue(1.0, 2.0, "점심 먹고 나왔어요")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            [option.clip_id for option in events[0].options],
+            ["body-wide", "body-close"],
+        )
+        self.assertEqual(events[0].setup_options, ())
+        self.assertEqual(events[0].closure_options[0].clip_id, "closure")
+
+    def test_closure_prefers_nearby_explicit_body_over_immediate_opaque_clip(self) -> None:
+        clips = [
+            _clip("food", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("greeting", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("closure", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+        ]
+        cues = {
+            "food": [TranscriptCue(1.0, 2.0, "라멘이 나왔습니다")],
+            "greeting": [TranscriptCue(1.0, 2.0, "안녕하세요")],
+            "closure": [TranscriptCue(1.0, 2.0, "점심 먹고 나왔어요")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual([option.clip_id for option in events[0].options], ["food"])
+        self.assertEqual(events[0].closure_options[0].clip_id, "closure")
+
+    def test_order_body_and_food_reaction_form_one_meal_story(self) -> None:
+        for reaction_text in ("라멘 정말 맛있었어요", "라멘 진짜 맛있었어요"):
+            with self.subTest(reaction_text=reaction_text):
+                clips = [
+                    _clip("order", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+                    _clip("body", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+                    _clip("reaction", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+                ]
+                cues = {
+                    "order": [TranscriptCue(1.0, 2.0, "메뉴를 주문했습니다")],
+                    "body": [TranscriptCue(1.0, 2.0, "라멘이 나왔습니다")],
+                    "reaction": [TranscriptCue(1.0, 2.0, reaction_text)],
+                }
+
+                events = _detect_meal_events(clips, cues)
+
+                self.assertEqual(len(events), 1)
+                self.assertEqual([option.clip_id for option in events[0].options], ["body"])
+                self.assertEqual(events[0].setup_options[0].clip_id, "order")
+                self.assertEqual(events[0].closure_options[0].clip_id, "reaction")
+                self.assertIn("meal_setup_order", events[0].signals)
+                self.assertIn("meal_closure_reaction", events[0].signals)
+
+    def test_order_context_never_becomes_an_inferred_meal_body(self) -> None:
+        clips = [
+            _clip("setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("order", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("closure", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+        ]
+        cues = {
+            "setup": [TranscriptCue(1.0, 2.0, "점심 먹으러 갑시다")],
+            "order": [TranscriptCue(1.0, 2.0, "메뉴를 주문했습니다")],
+            "closure": [TranscriptCue(1.0, 2.0, "점심 먹고 나왔어요")],
+        }
+
+        self.assertEqual(_detect_meal_events(clips, cues), [])
+
+    def test_short_unrelated_clip_is_not_an_opaque_meal_body(self) -> None:
+        for body_text in ("주차했습니다", "강아지가 귀여워요", "약 먹어요"):
+            with self.subTest(body_text=body_text):
+                clips = [
+                    _clip("setup", duration=8.0, captured_at="2026-08-20T12:00:00+09:00"),
+                    _clip("body", duration=8.0, captured_at="2026-08-20T12:01:00+09:00"),
+                    _clip("closure", duration=8.0, captured_at="2026-08-20T12:02:00+09:00"),
+                ]
+                cues = {
+                    "setup": [TranscriptCue(1.0, 2.0, "점심 먹으러 갑시다")],
+                    "body": [TranscriptCue(1.0, 2.0, body_text)],
+                    "closure": [TranscriptCue(1.0, 2.0, "점심 먹고 나왔어요")],
+                }
+
+                self.assertEqual(_detect_meal_events(clips, cues), [])
 
     def test_direct_meals_cluster_only_nearby_same_subtype_views(self) -> None:
         clips = [
@@ -346,7 +777,7 @@ class CandidateCoverageTests(unittest.TestCase):
             all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
         )
 
-    def test_build_records_one_of_meal_event_and_tags_only_body(self) -> None:
+    def test_build_records_body_plus_detected_setup_and_closure_groups(self) -> None:
         clips = [
             _clip("meal-setup", duration=10.0, captured_at="2026-08-20T12:00:00+09:00"),
             _clip("meal-body", duration=10.0, captured_at="2026-08-20T12:01:00+09:00"),
@@ -377,7 +808,7 @@ class CandidateCoverageTests(unittest.TestCase):
         meal_events = [
             event for event in payload["required_events"] if event["kind"] == "meal"
         ]
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 4)
         self.assertEqual(payload["policy_versions"]["meal_event"], MEAL_EVENT_POLICY_VERSION)
         self.assertEqual(len(meal_events), 1)
         event = meal_events[0]
@@ -398,12 +829,47 @@ class CandidateCoverageTests(unittest.TestCase):
             event["option_ranges"][0]["candidate_ids"],
             [candidate["candidate_id"] for candidate in tagged],
         )
+        self.assertEqual(
+            [
+                (group["stage"], group["selection_mode"])
+                for group in event["context_groups"]
+            ],
+            [("setup", "one_of"), ("closure", "one_of")],
+        )
+        context_groups = {group["stage"]: group for group in event["context_groups"]}
         setup_candidates = [
             candidate for candidate in payload["candidates"] if candidate["clip_id"] == "meal-setup"
         ]
+        closure_candidates = [
+            candidate
+            for candidate in payload["candidates"]
+            if candidate["clip_id"] == "meal-closure"
+        ]
         self.assertTrue(any("food" in candidate["roles"] for candidate in setup_candidates))
+        self.assertTrue(any("food" in candidate["roles"] for candidate in closure_candidates))
         self.assertTrue(
             all(not candidate["required_meal_event_ids"] for candidate in setup_candidates)
+        )
+        self.assertTrue(
+            all(not candidate["required_meal_event_ids"] for candidate in closure_candidates)
+        )
+        for stage, stage_candidates in (
+            ("setup", setup_candidates),
+            ("closure", closure_candidates),
+        ):
+            group = context_groups[stage]
+            tagged_context = [
+                candidate
+                for candidate in stage_candidates
+                if group["context_id"] in candidate["required_meal_context_ids"]
+            ]
+            self.assertTrue(tagged_context)
+            self.assertEqual(
+                group["candidate_ids"],
+                [candidate["candidate_id"] for candidate in tagged_context],
+            )
+        self.assertTrue(
+            all(not candidate["required_meal_context_ids"] for candidate in tagged)
         )
 
     def test_disabling_meal_preservation_leaves_food_role_nonmandatory(self) -> None:
@@ -427,6 +893,9 @@ class CandidateCoverageTests(unittest.TestCase):
         self.assertTrue(any("food" in candidate["roles"] for candidate in payload["candidates"]))
         self.assertTrue(
             all(not candidate["required_meal_event_ids"] for candidate in payload["candidates"])
+        )
+        self.assertTrue(
+            all(not candidate["required_meal_context_ids"] for candidate in payload["candidates"])
         )
 
     def test_detects_high_confidence_journey_transition_statements(self) -> None:
@@ -1013,7 +1482,7 @@ class CandidateCoverageTests(unittest.TestCase):
             ):
                 payload = build_candidates(paths, [clip], config)
 
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 4)
         self.assertEqual(len(payload["required_events"]), 1)
         event = payload["required_events"][0]
         tagged = [

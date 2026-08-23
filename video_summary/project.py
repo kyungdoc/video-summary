@@ -25,6 +25,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "editing": {
         "prompt": "날짜 순서를 지키고 여정, 재미있는 대화, 음식과 풍경이 균형 있게 드러나는 여행 브이로그",
         "target_minutes_per_day": 4.0,
+        "soft_max_minutes_per_day": 10.0,
         "cold_open": True,
         "preserve_family_interviews": True,
         "preserve_meal_events": True,
@@ -192,6 +193,12 @@ def _validate_config(config: dict[str, Any]) -> None:
     target = _finite_number(editing.get("target_minutes_per_day"), "target_minutes_per_day")
     if not 0.1 <= target <= 180:
         raise VideoSummaryError("target_minutes_per_day는 0.1~180 사이여야 합니다.")
+    soft_max = _finite_number(
+        editing.get("soft_max_minutes_per_day", 10.0),
+        "soft_max_minutes_per_day",
+    )
+    if not 0.1 <= soft_max <= 180:
+        raise VideoSummaryError("soft_max_minutes_per_day는 0.1~180 사이여야 합니다.")
     if editing.get("episode_mode") not in {"daily", "trip"}:
         raise VideoSummaryError("episode_mode는 daily 또는 trip이어야 합니다.")
     if type(editing.get("preserve_family_interviews", True)) is not bool:

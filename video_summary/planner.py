@@ -4,6 +4,7 @@ import json
 import math
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,18 @@ ALLOWED_ROLES = {
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
 MAX_CODEX_CONTACT_SHEETS = 20
 CONTACT_SHEET_CANDIDATES = 12
-SHORT_DAY_KEEP_RATIO = 0.80
+STORY_SELECTION_POLICY_VERSION = 2
+STORY_RUN_GAP_SECONDS = 2.0
+STORY_EVENT_GAP_SECONDS = 15.0 * 60.0
+STORY_EVENT_MAX_SPAN_SECONDS = 30.0 * 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class _StoryEventGroup:
+    event_id: str
+    day_key: str
+    kind: str
+    runs: tuple[tuple[Candidate, ...], ...]
 
 
 def _normalized_candidate_policy_versions(value: Any) -> dict[str, Any]:
@@ -59,7 +71,7 @@ def _plan_cache_key(
 ) -> str:
     return stable_hash(
         {
-            "version": 14,
+            "version": 16,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "candidate_policy_versions": _normalized_candidate_policy_versions(
@@ -69,6 +81,8 @@ def _plan_cache_key(
             "planner": planner_name,
             "planner_images": use_images,
             "target": config["editing"]["target_minutes_per_day"],
+            "soft_max": config["editing"].get("soft_max_minutes_per_day", 10.0),
+            "story_selection_policy": STORY_SELECTION_POLICY_VERSION,
             "cold_open": config["editing"].get("cold_open", True),
             "plan_file": str(plan_file_path) if plan_file_path else None,
             "plan_file_key": plan_file_key,
@@ -195,11 +209,16 @@ def local_plan(
     grouped: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
         grouped[candidate.day_key].append(candidate)
-    target = float(config["editing"].get("target_minutes_per_day", 4.0)) * 60
+    target = _configured_target_seconds(config)
+    soft_max = _configured_soft_max_seconds(config)
     episodes: list[Episode] = []
     for day_key, day_candidates in sorted(grouped.items()):
         day_candidates.sort(key=_candidate_sort_key)
-        selected = _select_day_candidates(day_candidates, target, _prompt_role_weights(prompt))
+        selected = _select_day_candidates(
+            day_candidates,
+            soft_max,
+            _prompt_role_weights(prompt),
+        )
         locations = list(dict.fromkeys(item.location for item in selected if item.location))
         segments: list[PlanSegment] = []
         use_earliest_hook = bool(config["editing"].get("cold_open", True)) and bool(selected) and "fun" in selected[0].roles
@@ -207,6 +226,7 @@ def local_plan(
             required_interview = _is_required_interview(candidate)
             required_transition = _is_required_transition(candidate)
             meal_event_ids = _required_meal_event_ids(candidate)
+            meal_context_ids = _required_meal_context_ids(candidate)
             role = (
                 "hook"
                 if index == 0 and use_earliest_hook
@@ -215,7 +235,7 @@ def local_plan(
                 else "transition"
                 if required_transition
                 else "food"
-                if meal_event_ids
+                if meal_event_ids or meal_context_ids
                 else _primary_role(candidate.roles)
             )
             if (
@@ -233,7 +253,9 @@ def local_plan(
                         "시간순 첫 장면으로 이 날의 분위기를 여는 재미있는 시작"
                         if role == "hook"
                         else "여행의 식사 경험을 빠짐없이 보존하는 대표 장면"
-                        if meal_event_ids and not required_interview and not required_transition
+                        if (meal_event_ids or meal_context_ids)
+                        and not required_interview
+                        and not required_transition
                         else _selection_reason(candidate)
                     ),
                     location=None if required_interview else candidate.location,
@@ -246,7 +268,7 @@ def local_plan(
         summary_roles = _role_summary(
             segments,
             has_transition=any(_is_required_transition(item) for item in selected),
-            has_meal=any(_required_meal_event_ids(item) for item in selected),
+            has_meal=any(_has_required_meal(item) for item in selected),
         )
         episodes.append(
             Episode(
@@ -328,7 +350,7 @@ def validate_and_normalize_plan(
         segments: list[PlanSegment] = []
         chronology: list[tuple[float, float, str]] = []
         selected_ranges: dict[str, list[Candidate]] = defaultdict(list)
-        runtime = 0.0
+        runtime_by_candidate: dict[str, float] = {}
         for index, raw_segment in enumerate(raw_segments):
             if not isinstance(raw_segment, dict):
                 raise VideoSummaryError("segment는 object여야 합니다.")
@@ -399,7 +421,7 @@ def validate_and_normalize_plan(
                         f"필수 이동 거점 후보는 role=transition이어야 합니다: {candidate_id}"
                     )
             if (
-                _required_meal_event_ids(candidate)
+                _has_required_meal(candidate)
                 and not _is_required_interview(candidate)
                 and not _is_required_transition(candidate)
             ):
@@ -418,7 +440,8 @@ def validate_and_normalize_plan(
                     )
             used_candidates.add(candidate_id)
             chronology.append(_candidate_sort_key(candidate))
-            runtime += candidate.duration / speed
+            candidate_runtime = candidate.duration / speed
+            runtime_by_candidate[candidate_id] = candidate_runtime
             segments.append(
                 PlanSegment(
                     candidate_id=candidate_id,
@@ -442,15 +465,28 @@ def validate_and_normalize_plan(
         if isinstance(target_value, bool) or not isinstance(target_value, (int, float)):
             raise VideoSummaryError("target_duration은 숫자여야 합니다.")
         requested_target = float(target_value)
-        configured_target = float(config["editing"]["target_minutes_per_day"]) * 60
+        configured_target = _configured_target_seconds(config)
         if not math.isfinite(requested_target) or requested_target <= 0:
             raise VideoSummaryError("target_duration이 잘못되었습니다.")
         if not configured_target * 0.75 <= requested_target <= configured_target * 1.25:
             raise VideoSummaryError("target_duration이 프로젝트 목표에서 25% 이상 벗어났습니다.")
-        mandatory_runtime = used_duration(_mandatory_day_candidates(grouped[day_key]))
-        runtime_limit = max(configured_target * 1.75, configured_target + 120, mandatory_runtime)
-        if runtime > runtime_limit:
-            raise VideoSummaryError(f"{day_key} 선택 길이가 목표보다 지나치게 깁니다.")
+        ceiling_exempt_ids = _runtime_ceiling_exempt_candidate_ids(
+            grouped[day_key],
+            set(runtime_by_candidate),
+        )
+        exempt_runtime = sum(
+            value
+            for candidate_id, value in runtime_by_candidate.items()
+            if candidate_id in ceiling_exempt_ids
+        )
+        ordinary_runtime = sum(runtime_by_candidate.values()) - exempt_runtime
+        soft_max = _configured_soft_max_seconds(config)
+        ordinary_budget = max(0.0, soft_max - exempt_runtime)
+        if ordinary_runtime > ordinary_budget + 1e-6:
+            raise VideoSummaryError(
+                f"{day_key} 일반 선택 길이가 soft maximum {soft_max:.1f}초의 "
+                "남은 범위를 넘습니다."
+            )
         episodes.append(
             Episode(
                 day_key=day_key,
@@ -492,6 +528,13 @@ def validate_and_normalize_plan(
                 f"플래너가 필수 식사 이벤트 {event_id}의 one_of 후보를 누락했습니다: "
                 + ", ".join(sorted(option_ids))
             )
+    for context_id, options in _meal_context_option_groups(candidates).items():
+        option_ids = {candidate.candidate_id for candidate in options}
+        if used_candidates.isdisjoint(option_ids):
+            raise VideoSummaryError(
+                f"플래너가 필수 식사 서사 {context_id}의 one_of 후보를 누락했습니다: "
+                + ", ".join(sorted(option_ids))
+            )
     episodes.sort(key=lambda episode: (episode.travel_day, episode.day_key))
     return EditPlan(
         project=str(config["project"]["name"]),
@@ -519,18 +562,22 @@ def build_planner_request(
         "렌더 명령이나 파일 경로를 만들지 말고 candidate_id만 선택하세요.",
         "각 날짜의 모든 segment는 role=hook을 포함해 captured_at 오름차순을 유지하세요. hook은 선택된 후보 중 가장 이른 첫 segment에만 허용됩니다.",
         "같은 원본 clip_id에서 source 시간(start/end)이 겹치는 candidate를 함께 선택하지 마세요.",
-        "각 날짜의 시간상 가장 이른 후보를 포함해 출발 맥락을 보존하고, 여유가 있으면 가장 늦은 후보도 포함하세요.",
+        "후보 분석과 사건 탐지는 목표 길이와 무관합니다. 먼저 각 DAY의 시간순 semantic event group을 식별한 뒤, 의미 있는 사건마다 대표적인 완결 contiguous source run을 선택하세요.",
+        "각 날짜의 시간상 가장 이른 후보를 포함해 출발 맥락을 보존하고, 의미 있는 closing run도 포함하세요.",
         "required_event_ids가 하나라도 있는 후보는 감지된 가족 인터뷰의 필수 구간입니다. 목표 시간을 넘더라도 해당 candidate_id를 모두 빠짐없이 선택하세요.",
         "필수 가족 인터뷰 후보는 원래 순서를 유지하고 speed=1.0, location=null, caption=null, role=interview로 사용하세요. 단, 그 날짜의 첫 후보라면 role=hook도 허용됩니다.",
-        "roles에 transition이 있는 후보는 출발·픽업·환승·공항·숙소 도착 같은 고신뢰 필수 이동 거점입니다. 목표 시간과 권장 상한을 넘더라도 해당 candidate_id를 모두 선택하세요.",
+        "roles에 transition이 있는 후보는 출발·픽업·환승·공항·숙소 도착 같은 고신뢰 필수 이동 거점입니다. 목표 시간과 soft maximum을 넘더라도 해당 candidate_id를 모두 선택하세요.",
         "필수 이동 거점 후보는 원래 순서를 유지하고 speed=1.0, role=transition으로 사용하세요. 단, 그 날짜의 첫 segment라면 role=hook, 마지막 segment라면 role=closing도 허용됩니다.",
         "한 후보가 필수 가족 인터뷰이면서 transition이기도 하면 더 엄격한 인터뷰 계약(role=interview, speed=1.0, location=null, caption=null)을 우선하세요.",
         "일반적인 이동 장면을 뜻하는 role=journey만 있는 후보는 필수가 아닙니다. transition으로 표시된 고신뢰 이동 거점만 위 필수 규칙을 적용하세요.",
         "required_meal_event_ids의 같은 이벤트 ID를 가진 후보들은 하나의 필수 식사 이벤트 option group입니다. 각 이벤트의 one_of 후보 중 최소 1개를 선택하되 반복을 피하려면 가장 적절한 1개만 우선하세요.",
-        "선택한 필수 식사 option은 목표 시간과 권장 상한보다 우선하며 speed=1.0, role=food로 사용하세요. 날짜의 첫 segment는 hook, 마지막 segment는 closing도 허용됩니다.",
-        "식사 option이 필수 인터뷰와 겹치면 인터뷰 계약이, transition과 겹치면 transition 계약이 food 계약보다 우선합니다. 단순히 role=food이지만 required_meal_event_ids가 비어 있는 후보는 필수가 아닙니다.",
-        "날짜별 목표 시간은 채워야 하는 할당량이 아니라 상한입니다. 후보 총량이 목표보다 짧은 날은 약한 장면까지 전부 선택하지 마세요.",
-        f"짧은 날은 최초·마무리·필수 사건과 완결된 연속 장면을 우선하고 후보 총량의 약 {SHORT_DAY_KEEP_RATIO:.0%}만 권장 분량으로 사용하세요.",
+        "required_meal_context_ids는 식사 전 setup 또는 식사 후 closure 서사 group입니다. 표시된 각 context group에서도 최소 1개를 선택해 setup → 실제 식사 → 마무리 흐름을 보존하세요.",
+        "선택한 필수 식사 option은 목표 시간과 soft maximum보다 우선하며 speed=1.0, role=food로 사용하세요. 날짜의 첫 segment는 hook, 마지막 segment는 closing도 허용됩니다.",
+        "식사 option이나 setup/closure 맥락이 필수 인터뷰와 겹치면 인터뷰 계약이, transition과 겹치면 transition 계약이 food 계약보다 우선합니다. 단순히 role=food이지만 required_meal_event_ids와 required_meal_context_ids가 모두 비어 있는 후보는 필수가 아닙니다.",
+        "target_duration은 기존 edit-plan schema 호환용 메타데이터이며 채워야 하는 할당량이 아닙니다.",
+        "의미 있는 event group의 coverage가 끝나면 즉시 선택을 멈추고, 남는 시간을 채우려고 약한 fragment나 near-duplicate를 추가하지 마세요.",
+        "의미 있는 사건이 soft maximum 안에 모두 들어가지 않으면 오전 사건부터 예산을 소진하지 말고, DAY의 초반·중반·후반을 고르게 대표하도록 시간축 전체에 선택을 분산하세요.",
+        "가장 이른 anchor, 의미 있는 closing, 필수 인터뷰·이동 거점·식사 body/context를 먼저 포함하고 그 runtime도 DAY 전체 soft maximum에 합산하세요. 이 필수·경계 장면 자체로 상한을 넘는 경우만 초과를 허용하고, 그때는 일반 event run을 더하지 마세요.",
         "각 날짜를 출발/도입 → 탐색/이동 → 핵심 경험 → 마무리의 4단계 이야기로 구성하되 실제 촬영 순서를 바꾸지 마세요.",
         "점수가 조금 높은 고립된 조각 여러 개보다 같은 원본에서 맞닿아 이어지는 후보 묶음을 우선해 대화와 동작이 자연스럽게 완결되게 하세요.",
         "같은 원본의 중간을 건너뛰고 다시 들어가는 jump cut은 꼭 필요한 경우가 아니면 피하고, 선택한다면 앞뒤 맥락이 완결된 구간을 고르세요.",
@@ -541,7 +588,8 @@ def build_planner_request(
         "",
         f"Project: {config['project']['name']}",
         f"Candidate set: {candidate_set_hash}",
-        f"Target per day: {config['editing']['target_minutes_per_day']} minutes",
+        f"Legacy target_duration per day: {config['editing']['target_minutes_per_day']} minutes",
+        f"Soft maximum per day: {config['editing'].get('soft_max_minutes_per_day', 10.0)} minutes",
         "",
         "## 사용자의 편집 프롬프트",
         prompt,
@@ -549,23 +597,34 @@ def build_planner_request(
         "## 후보 목록",
         "전체 구조화 데이터는 `candidates.json`에 있고, 아래는 요약입니다.",
     ]
-    configured_target = float(config["editing"]["target_minutes_per_day"]) * 60.0
+    configured_target = _configured_target_seconds(config)
+    soft_max = _configured_soft_max_seconds(config)
+    prompt_role_weights = _prompt_role_weights(prompt)
     for day_key, values in sorted(days.items()):
         ordered_values = sorted(values, key=_candidate_sort_key)
         deduped_values = _dedupe_candidates(ordered_values)
         available_seconds = used_duration(deduped_values)
-        recommended_seconds = max(
-            _adaptive_day_target_seconds(deduped_values, configured_target),
-            used_duration(_mandatory_day_candidates(deduped_values)),
-        )
+        story_events = _story_event_groups(deduped_values)
+        meaningful_story_events = [
+            (event, run)
+            for event in story_events
+            if (
+                run := _best_meaningful_event_run(
+                    event,
+                    prompt_role_weights,
+                )
+            )
+            is not None
+        ]
         required_values = [item for item in ordered_values if _is_required_interview(item)]
         transition_values = [item for item in ordered_values if _is_required_transition(item)]
         meal_event_groups = _meal_event_option_groups(ordered_values)
+        meal_context_groups = _meal_context_option_groups(ordered_values)
         lines.extend(
             [
                 "",
                 f"### {day_key} / DAY {values[0].travel_day}",
-                f"- usable candidate total: {available_seconds:.1f}s; recommended selection ceiling: {recommended_seconds:.1f}s",
+                f"- usable candidate total: {available_seconds:.1f}s; meaningful semantic events: {len(meaningful_story_events)}; soft maximum: {soft_max:.1f}s",
             ]
         )
         if required_values:
@@ -586,6 +645,16 @@ def build_planner_request(
                 f"- mandatory meal event {event_id} one_of candidates: "
                 + ", ".join(item.candidate_id for item in options)
             )
+        for context_id, options in meal_context_groups.items():
+            lines.append(
+                f"- mandatory meal narrative {context_id} one_of candidates: "
+                + ", ".join(item.candidate_id for item in options)
+            )
+        for event, run in meaningful_story_events:
+            lines.append(
+                f"- semantic event {event.event_id} kind={event.kind}; preferred complete run: "
+                + ", ".join(item.candidate_id for item in run)
+            )
         for candidate in ordered_values:
             transcript = re.sub(r"\s+", " ", candidate.transcript).strip()
             if len(transcript) > 180:
@@ -596,6 +665,7 @@ def build_planner_request(
                 f"roles={','.join(candidate.roles)} | score={candidate.score:.2f} | "
                 f"required_event_ids={','.join(_required_event_ids(candidate)) or '-'} | "
                 f"required_meal_event_ids={','.join(_required_meal_event_ids(candidate)) or '-'} | "
+                f"required_meal_context_ids={','.join(_required_meal_context_ids(candidate)) or '-'} | "
                 f"location={candidate.location or '-'} | transcript={transcript or '[silent]'}"
             )
     lines.extend(
@@ -606,15 +676,20 @@ def build_planner_request(
             f"- project는 {config['project']['name']}",
             f"- candidate_set_hash는 {candidate_set_hash}",
             "- 모든 날짜를 episodes에 정확히 한 번씩 포함",
-            f"- 각 episode의 target_duration 필드는 {configured_target:.1f}으로 유지하고, 위 recommended ceiling은 segment 실제 합계에만 적용",
+            f"- 각 episode의 target_duration 필드는 호환성을 위해 {configured_target:.1f}으로 유지하되 이를 채우지 말 것",
+            f"- earliest/meaningful closing/필수 interview·transition·meal body/context를 포함한 DAY 전체 runtime은 soft maximum {soft_max:.1f}초 이내",
+            "- 위 필수·경계 장면만으로 soft maximum을 넘는 경우에만 초과를 허용하고 일반 event run을 추가하지 말 것",
+            "- 시간순 semantic event coverage가 끝나면 중단하고 약한 fragment나 near-duplicate로 남는 시간을 채우지 말 것",
+            "- 모든 meaningful event가 soft maximum에 들어가지 않으면 DAY 초반·중반·후반을 고르게 대표하도록 시간축 전체에 선택을 분산할 것",
             "- segment에는 candidate_id, role, reason, location, caption, speed를 모두 포함; 표시값이 없으면 location/caption은 null, speed는 1.0",
             "- required_event_ids가 비어 있지 않은 candidate_id는 전부 포함; speed=1.0, location=null, caption=null, role=interview (날짜의 첫 segment만 hook 허용)",
             "- roles에 transition이 있는 candidate_id는 날짜별로 전부 포함; speed=1.0, role=transition (날짜의 첫 segment는 hook, 마지막 segment는 closing 허용)",
             "- 필수 인터뷰와 transition이 같은 candidate_id에 함께 있으면 인터뷰 role/location/caption 계약이 우선",
             "- role=journey만 있는 후보는 위 필수 이동 거점 계약의 대상이 아님",
             "- 각 required_meal_event_ids 이벤트의 one_of candidate_id 그룹에서 최소 1개를 포함하고, 반복 방지를 위해 가장 적절한 1개만 우선",
+            "- 각 required_meal_context_ids setup/closure one_of 그룹에서도 최소 1개를 포함해 식사 전후 서사를 보존",
             "- 선택한 식사 option은 speed=1.0, role=food (날짜의 첫 segment는 hook, 마지막 segment는 closing 허용)",
-            "- 식사 option이 필수 인터뷰/transition과 겹치면 각각 interview/transition 계약이 우선; required_meal_event_ids가 없는 role=food 후보는 필수가 아님",
+            "- 식사 option이나 setup/closure 맥락이 필수 인터뷰/transition과 겹치면 각각 interview/transition 계약이 우선; required_meal_event_ids와 required_meal_context_ids가 모두 없는 role=food 후보는 필수가 아님",
         ]
     )
     return "\n".join(lines).strip() + "\n"
@@ -622,10 +697,33 @@ def build_planner_request(
 
 def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash: str) -> dict[str, Any]:
     meal_event_groups = _meal_event_option_groups(candidates)
+    meal_context_groups = _meal_context_option_groups(candidates)
+    story_event_groups = _story_event_groups(_dedupe_candidates(candidates))
     return {
-        "version": 1,
+        "version": 2,
         "candidate_set_hash": candidate_set_hash,
         "transcript_policy": "whitespace-normalized excerpt, maximum 240 characters per candidate",
+        "story_selection_contract": {
+            "strategy": "event_first",
+            "fill_quota": False,
+            "soft_ceiling_scope": "total_day_runtime",
+            "exception_overflow_policy": "mandatory_or_boundary_only",
+            "complete_source_runs": True,
+            "omit_weak_fragments": True,
+            "omit_near_duplicates": True,
+        },
+        "story_event_groups": [
+            {
+                "event_id": event.event_id,
+                "day_key": event.day_key,
+                "kind": event.kind,
+                "candidate_runs": [
+                    [item.candidate_id for item in run]
+                    for run in event.runs
+                ],
+            }
+            for event in story_event_groups
+        ],
         "meal_event_selection_contract": {
             "selection_mode": "one_of",
             "minimum_selected_per_event": 1,
@@ -634,6 +732,7 @@ def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash:
             "selected_option_role": "food",
             "boundary_role_exceptions": ["hook_if_first", "closing_if_last"],
             "overlap_precedence": ["interview", "transition", "food"],
+            "required_narrative_stages": ["setup_if_detected", "closure_if_detected"],
         },
         "meal_event_option_groups": [
             {
@@ -643,6 +742,16 @@ def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash:
                 "one_of_candidate_ids": [item.candidate_id for item in options],
             }
             for event_id, options in meal_event_groups.items()
+        ],
+        "meal_context_option_groups": [
+            {
+                "context_id": context_id,
+                "stage": _meal_context_stage(context_id),
+                "day_key": options[0].day_key,
+                "selection_mode": "one_of",
+                "one_of_candidate_ids": [item.candidate_id for item in options],
+            }
+            for context_id, options in meal_context_groups.items()
         ],
         "candidates": [
             {
@@ -658,6 +767,7 @@ def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash:
                 "roles": item.roles,
                 "required_event_ids": list(_required_event_ids(item)),
                 "required_meal_event_ids": list(_required_meal_event_ids(item)),
+                "required_meal_context_ids": list(_required_meal_context_ids(item)),
                 "score": item.score,
                 "speech_ratio": item.speech_ratio,
                 "motion_score": item.motion_score,
@@ -934,139 +1044,303 @@ def parse_json_strict(text: str) -> dict[str, Any]:
 
 def _select_day_candidates(
     candidates: list[Candidate],
-    target_seconds: float,
+    soft_max_seconds: float,
     prompt_role_weights: dict[str, float] | None = None,
 ) -> list[Candidate]:
     deduped = _dedupe_candidates(candidates)
-    target_seconds = _adaptive_day_target_seconds(deduped, target_seconds)
     if not deduped:
         return []
-    mandatory = _mandatory_day_candidates(deduped)
-    target_seconds = max(target_seconds, used_duration(mandatory))
-    buckets = max(3, min(8, int(target_seconds // 30)))
-    positions = {item.candidate_id: index / max(1, len(deduped) - 1) for index, item in enumerate(deduped)}
-    candidate_indices = {item.candidate_id: index for index, item in enumerate(deduped)}
-    # A score-only summary can accidentally begin after the actual departure.
-    # Pin the first usable candidate for narrative continuity, and the last one
-    # when it fits, before filling the middle by quality and coverage.
-    selected: list[Candidate] = list(mandatory)
-
-    if (
-        deduped[-1] not in selected
-        and not _required_meal_event_ids(deduped[-1])
-        and used_duration(selected) + deduped[-1].duration <= target_seconds
-    ):
-        selected.append(deduped[-1])
-
-    visual_candidates = [
-        item
-        for item in deduped
-        if not _required_meal_event_ids(item)
-        and item.visual_quality >= 0.62
-        and ("scenery" in item.roles or item.speech_ratio <= 0.08)
-    ]
-    if visual_candidates:
-        visual_anchor = max(
-            visual_candidates,
-            key=lambda item: (
-                item.visual_quality + (0.12 if "scenery" in item.roles else 0.0)
-                - 0.08 * max(0.0, item.motion_score - 0.70),
-                item.score,
-                -_candidate_sort_key(item)[0],
-            ),
-        )
-        if visual_anchor not in selected and used_duration(selected) + visual_anchor.duration <= target_seconds:
-            selected.append(visual_anchor)
-
-    covered_roles: set[str] = set().union(*(set(item.roles) for item in selected))
-    covered_buckets = {
-        min(buckets - 1, int(positions[item.candidate_id] * buckets))
-        for item in selected
+    weights = prompt_role_weights or {}
+    selected_by_id = {
+        item.candidate_id: item
+        for item in _mandatory_day_candidates(deduped)
     }
-    used_time = sum(item.duration for item in selected)
-    remaining = [
-        item
-        for item in deduped
-        if item not in selected and not _required_meal_event_ids(item)
-    ]
-    while remaining:
-        affordable = [item for item in remaining if used_time + item.duration <= target_seconds]
+    for item in _meaningful_closing_run(deduped):
+        selected_by_id[item.candidate_id] = item
+
+    selected_runtime = used_duration(list(selected_by_id.values()))
+    pending = list(_story_event_groups(deduped))
+    while pending:
+        affordable: list[
+            tuple[
+                float,
+                float,
+                float,
+                _StoryEventGroup,
+                tuple[Candidate, ...],
+                list[Candidate],
+            ]
+        ] = []
+        completed_event_ids: set[str] = set()
+        covered_timestamps = [
+            _candidate_sort_key(item)[0]
+            for item in selected_by_id.values()
+        ]
+        for event in pending:
+            proposal: tuple[tuple[Candidate, ...], list[Candidate]] | None = None
+            for run in _ranked_meaningful_event_runs(event, weights):
+                missing = [
+                    item
+                    for item in run
+                    if item.candidate_id not in selected_by_id
+                ]
+                if not missing:
+                    completed_event_ids.add(event.event_id)
+                    proposal = None
+                    break
+                added_runtime = used_duration(missing)
+                if selected_runtime + added_runtime <= soft_max_seconds + 1e-6:
+                    proposal = (run, missing)
+                    break
+            if proposal is None:
+                continue
+            run, missing = proposal
+            timestamp = _story_run_timestamp(run)
+            coverage_distance = min(
+                (abs(timestamp - value) for value in covered_timestamps),
+                default=float("inf"),
+            )
+            affordable.append(
+                (
+                    coverage_distance,
+                    _event_run_value(run, weights),
+                    -used_duration(missing),
+                    event,
+                    run,
+                    missing,
+                )
+            )
+        pending = [
+            event
+            for event in pending
+            if event.event_id not in completed_event_ids
+        ]
         if not affordable:
             break
-
-        def gain(item: Candidate) -> tuple[float, float]:
-            bucket = min(buckets - 1, int(positions[item.candidate_id] * buckets))
-            new_roles = set(item.roles) - covered_roles
-            diversity = 0.08 * len(new_roles) + (0.16 if bucket not in covered_buckets else 0.0)
-            boundary = 0.10 if bucket in {0, buckets - 1} and bucket not in covered_buckets else 0.0
-            efficiency = min(0.08, 0.08 * 8.0 / max(4.0, item.duration))
-            prompt_bonus = sum((prompt_role_weights or {}).get(role, 0.0) for role in set(item.roles))
-            continuity = _selection_continuity_bonus(item, selected, deduped, candidate_indices)
-            return item.score + diversity + boundary + efficiency + prompt_bonus + continuity, -item.duration
-
-        chosen = max(affordable, key=gain)
-        selected.append(chosen)
-        used_time += chosen.duration
-        covered_roles.update(chosen.roles)
-        covered_buckets.add(min(buckets - 1, int(positions[chosen.candidate_id] * buckets)))
-        remaining.remove(chosen)
-    if not selected and deduped:
-        selected = [max(deduped, key=lambda item: item.score)]
-    return sorted(selected, key=_candidate_sort_key)
+        # When not every meaningful event fits, choose the run that fills the
+        # largest uncovered part of the DAY timeline. Quality and compactness
+        # break ties only after temporal breadth, preventing a dense morning
+        # from consuming the soft budget before afternoon and evening events.
+        _, _, _, chosen_event, _, missing = max(
+            affordable,
+            key=lambda value: (value[0], value[1], value[2]),
+        )
+        selected_by_id.update((item.candidate_id, item) for item in missing)
+        selected_runtime += used_duration(missing)
+        pending = [
+            event
+            for event in pending
+            if event.event_id != chosen_event.event_id
+        ]
+    return sorted(selected_by_id.values(), key=_candidate_sort_key)
 
 
 def used_duration(candidates: list[Candidate]) -> float:
     return sum(item.duration for item in candidates)
 
 
-def _adaptive_day_target_seconds(candidates: list[Candidate], configured_target: float) -> float:
-    """Treat a day target as a ceiling instead of padding a short day with every cue."""
-    available = used_duration(candidates)
-    if not candidates or available >= configured_target:
-        return configured_target
-    if len(candidates) <= 2:
-        return available
-    boundary_anchors = candidates[0].duration
-    if candidates[-1].candidate_id != candidates[0].candidate_id:
-        boundary_anchors += candidates[-1].duration
-    return min(configured_target, max(boundary_anchors, available * SHORT_DAY_KEEP_RATIO))
+def _story_event_groups(candidates: list[Candidate]) -> list[_StoryEventGroup]:
+    """Build chronological semantic groups without consulting a duration target."""
+    ordinary = [
+        item
+        for item in sorted(candidates, key=_candidate_sort_key)
+        if not _is_required_interview(item)
+        and not _is_required_transition(item)
+        and not _has_required_meal(item)
+    ]
+    by_day: dict[str, list[Candidate]] = defaultdict(list)
+    for item in ordinary:
+        by_day[item.day_key].append(item)
+
+    result: list[_StoryEventGroup] = []
+    for day_key, day_candidates in sorted(by_day.items()):
+        clusters: list[list[tuple[Candidate, ...]]] = []
+        for run in _source_runs(day_candidates):
+            if not clusters:
+                clusters.append([run])
+                continue
+            current = clusters[-1]
+            cluster_start = _candidate_sort_key(current[0][0])[0]
+            previous_end = _candidate_sort_key(current[-1][-1])[0] + current[-1][-1].duration
+            run_start = _candidate_sort_key(run[0])[0]
+            run_end = _candidate_sort_key(run[-1])[0] + run[-1].duration
+            previous_location = _run_location(current[-1])
+            run_location = _run_location(run)
+            location_changed = bool(
+                previous_location
+                and run_location
+                and previous_location != run_location
+            )
+            if (
+                run_start - previous_end > STORY_EVENT_GAP_SECONDS
+                or run_end - cluster_start > STORY_EVENT_MAX_SPAN_SECONDS
+                or location_changed
+            ):
+                clusters.append([run])
+            else:
+                current.append(run)
+
+        provisional: list[tuple[float, str, tuple[tuple[Candidate, ...], ...]]] = []
+        for cluster in clusters:
+            runs_by_kind: dict[str, list[tuple[Candidate, ...]]] = defaultdict(list)
+            first_timestamp: dict[str, float] = {}
+            for run in cluster:
+                timestamp = _candidate_sort_key(run[0])[0]
+                for kind in _story_run_kinds(run):
+                    runs_by_kind[kind].append(run)
+                    first_timestamp.setdefault(kind, timestamp)
+            for kind, runs in runs_by_kind.items():
+                provisional.append((first_timestamp[kind], kind, tuple(runs)))
+
+        provisional.sort(key=lambda value: (value[0], _story_kind_rank(value[1])))
+        for index, (_, kind, runs) in enumerate(provisional, start=1):
+            result.append(
+                _StoryEventGroup(
+                    event_id=f"story_{day_key}_{index:03d}",
+                    day_key=day_key,
+                    kind=kind,
+                    runs=runs,
+                )
+            )
+    return result
 
 
-def _selection_continuity_bonus(
-    candidate: Candidate,
-    selected: list[Candidate],
-    ordered: list[Candidate],
-    indices: dict[str, int],
-) -> float:
-    """Prefer complete source runs without letting continuity defeat timeline coverage."""
-    index = indices[candidate.candidate_id]
-    selected_ids = {item.candidate_id for item in selected}
-    neighboring: list[Candidate] = []
-    if index > 0:
-        neighboring.append(ordered[index - 1])
-    if index + 1 < len(ordered):
-        neighboring.append(ordered[index + 1])
-    potential = 0.0
-    for neighbor in neighboring:
-        if neighbor.clip_id != candidate.clip_id:
+def _source_runs(candidates: list[Candidate]) -> list[tuple[Candidate, ...]]:
+    runs: list[list[Candidate]] = []
+    for item in sorted(candidates, key=_candidate_sort_key):
+        if not runs:
+            runs.append([item])
             continue
-        source_gap = max(
-            candidate.start - neighbor.end,
-            neighbor.start - candidate.end,
-            0.0,
+        previous = runs[-1][-1]
+        if (
+            item.clip_id == previous.clip_id
+            and item.start - previous.end <= STORY_RUN_GAP_SECONDS + MAX_SOURCE_OVERLAP_SECONDS
+        ):
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return [tuple(run) for run in runs]
+
+
+def _run_location(run: tuple[Candidate, ...]) -> str | None:
+    return next((item.location for item in run if item.location), None)
+
+
+def _story_run_timestamp(run: tuple[Candidate, ...]) -> float:
+    first = _candidate_sort_key(run[0])[0]
+    last = _candidate_sort_key(run[-1])[0] + run[-1].duration
+    return (first + last) / 2.0
+
+
+def _story_run_kinds(run: tuple[Candidate, ...]) -> tuple[str, ...]:
+    roles = {role for item in run for role in item.roles}
+    specific = tuple(role for role in ("fun", "food", "scenery") if role in roles)
+    if specific:
+        return specific
+    if "dialogue" in roles:
+        return ("dialogue",)
+    if "journey" in roles:
+        return ("journey",)
+    return ("moment",)
+
+
+def _story_kind_rank(kind: str) -> int:
+    return {
+        "journey": 0,
+        "dialogue": 1,
+        "scenery": 2,
+        "food": 3,
+        "fun": 4,
+        "moment": 5,
+    }.get(kind, 6)
+
+
+def _event_run_value(
+    run: tuple[Candidate, ...],
+    prompt_role_weights: dict[str, float],
+) -> float:
+    best = max(
+        item.score
+        + sum(prompt_role_weights.get(role, 0.0) for role in set(item.roles))
+        + (
+            0.08
+            if item.visual_quality >= 0.72
+            and ("scenery" in item.roles or item.speech_ratio <= 0.08)
+            else 0.0
         )
-        if neighbor.candidate_id in selected_ids:
-            if source_gap <= MAX_SOURCE_OVERLAP_SECONDS:
-                return 0.30
-            if source_gap <= 2.0:
-                return 0.12
-        elif source_gap <= MAX_SOURCE_OVERLAP_SECONDS:
-            potential = max(potential, 0.12)
-    if potential:
-        return potential
-    if any(item.clip_id == candidate.clip_id for item in selected):
-        return -0.06
-    return 0.0
+        for item in run
+    )
+    return best + min(0.12, 0.04 * max(0, len(run) - 1))
+
+
+def _event_run_is_meaningful(
+    event: _StoryEventGroup,
+    run: tuple[Candidate, ...],
+    prompt_role_weights: dict[str, float],
+) -> bool:
+    duration = used_duration(list(run))
+    maximum_score = max(item.score for item in run)
+    if duration < 2.5 and maximum_score < 0.90:
+        return False
+    if any(
+        item.visual_quality >= 0.72
+        and ("scenery" in item.roles or item.speech_ratio <= 0.08)
+        for item in run
+    ):
+        return True
+    threshold = {
+        "fun": 0.58,
+        "food": 0.60,
+        "scenery": 0.58,
+        "dialogue": 0.68,
+        "journey": 0.66,
+        "moment": 0.72,
+    }.get(event.kind, 0.72)
+    if len(run) > 1:
+        threshold -= 0.05
+    return _event_run_value(run, prompt_role_weights) >= threshold
+
+
+def _ranked_meaningful_event_runs(
+    event: _StoryEventGroup,
+    prompt_role_weights: dict[str, float],
+) -> list[tuple[Candidate, ...]]:
+    return sorted(
+        (
+            run
+            for run in event.runs
+            if _event_run_is_meaningful(event, run, prompt_role_weights)
+        ),
+        key=lambda run: (
+            _event_run_value(run, prompt_role_weights),
+            used_duration(list(run)),
+            -_candidate_sort_key(run[0])[0],
+        ),
+        reverse=True,
+    )
+
+
+def _best_meaningful_event_run(
+    event: _StoryEventGroup,
+    prompt_role_weights: dict[str, float],
+) -> tuple[Candidate, ...] | None:
+    ranked = _ranked_meaningful_event_runs(event, prompt_role_weights)
+    return ranked[0] if ranked else None
+
+
+def _meaningful_closing_run(candidates: list[Candidate]) -> tuple[Candidate, ...]:
+    for run in reversed(_source_runs(candidates)):
+        if not any("closer" in item.roles for item in run):
+            continue
+        if any(
+            _is_required_interview(item)
+            or _is_required_transition(item)
+            or _has_required_meal(item)
+            or item.score >= 0.48
+            for item in run
+        ):
+            return run
+    return ()
 
 
 def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
@@ -1076,8 +1350,8 @@ def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
             _is_required_interview(item) or _is_required_transition(item),
             _is_required_interview(item),
             _is_required_transition(item),
-            bool(_required_meal_event_ids(item)),
-            len(_required_meal_event_ids(item)),
+            _has_required_meal(item),
+            len(_required_meal_event_ids(item)) + len(_required_meal_context_ids(item)),
             item.score,
             item.duration,
         ),
@@ -1192,12 +1466,46 @@ def _required_meal_event_ids(candidate: Candidate) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
 
+def _required_meal_context_ids(candidate: Candidate) -> tuple[str, ...]:
+    values = getattr(candidate, "required_meal_context_ids", []) or []
+    return tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _has_required_meal(candidate: Candidate) -> bool:
+    return bool(_required_meal_event_ids(candidate) or _required_meal_context_ids(candidate))
+
+
 def _meal_event_option_groups(candidates: list[Candidate]) -> dict[str, list[Candidate]]:
     groups: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in sorted(candidates, key=_candidate_sort_key):
         for event_id in _required_meal_event_ids(candidate):
             groups[event_id].append(candidate)
     return {event_id: groups[event_id] for event_id in sorted(groups)}
+
+
+def _meal_context_option_groups(candidates: list[Candidate]) -> dict[str, list[Candidate]]:
+    groups: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in sorted(candidates, key=_candidate_sort_key):
+        for context_id in _required_meal_context_ids(candidate):
+            groups[context_id].append(candidate)
+    return {
+        context_id: groups[context_id]
+        for context_id in sorted(groups, key=_meal_context_sort_key)
+    }
+
+
+def _meal_context_stage(context_id: str) -> str:
+    stage = context_id.rsplit(":", 1)[-1]
+    return stage if stage in {"setup", "closure"} else "context"
+
+
+def _meal_context_sort_key(context_id: str) -> tuple[str, int, str]:
+    event_id, separator, stage = context_id.rpartition(":")
+    return (
+        event_id if separator else context_id,
+        {"setup": 0, "closure": 1}.get(stage, 2),
+        context_id,
+    )
 
 
 def _meal_option_rank(candidate: Candidate) -> tuple[float, float, float, float, str]:
@@ -1232,7 +1540,59 @@ def _mandatory_day_candidates(candidates: list[Candidate]) -> list[Candidate]:
         option_ids = {item.candidate_id for item in options}
         if mandatory_ids.isdisjoint(option_ids):
             mandatory_ids.add(max(options, key=_meal_option_rank).candidate_id)
+    for options in _meal_context_option_groups(ordered).values():
+        option_ids = {item.candidate_id for item in options}
+        if mandatory_ids.isdisjoint(option_ids):
+            mandatory_ids.add(max(options, key=_meal_option_rank).candidate_id)
     return [item for item in ordered if item.candidate_id in mandatory_ids]
+
+
+def _runtime_ceiling_exempt_candidate_ids(
+    candidates: list[Candidate],
+    selected_ids: set[str],
+) -> set[str]:
+    """Return only the selected anchors required outside the ordinary soft maximum."""
+    ordered = sorted(candidates, key=_candidate_sort_key)
+    if not ordered:
+        return set()
+    exempt_ids = {ordered[0].candidate_id}
+    exempt_ids.update(
+        item.candidate_id
+        for item in ordered
+        if item.candidate_id in selected_ids
+        and (_is_required_interview(item) or _is_required_transition(item))
+    )
+    for groups in (
+        _meal_event_option_groups(ordered),
+        _meal_context_option_groups(ordered),
+    ):
+        for options in groups.values():
+            selected_options = [
+                item for item in options if item.candidate_id in selected_ids
+            ]
+            if not selected_options:
+                continue
+            if exempt_ids.isdisjoint(
+                item.candidate_id for item in selected_options
+            ):
+                exempt_ids.add(
+                    max(selected_options, key=_meal_option_rank).candidate_id
+                )
+    exempt_ids.update(
+        item.candidate_id
+        for item in _meaningful_closing_run(_dedupe_candidates(ordered))
+        if item.candidate_id in selected_ids
+    )
+    return exempt_ids
+
+
+def _configured_target_seconds(config: dict[str, Any]) -> float:
+    """Keep the legacy edit-plan target field stable for existing projects."""
+    return float(config["editing"].get("target_minutes_per_day", 4.0)) * 60.0
+
+
+def _configured_soft_max_seconds(config: dict[str, Any]) -> float:
+    return float(config["editing"].get("soft_max_minutes_per_day", 10.0)) * 60.0
 
 
 def _safe_text(value: Any, field: str, maximum: int) -> str:

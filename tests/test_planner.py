@@ -8,12 +8,10 @@ from unittest.mock import patch
 
 from video_summary.models import Candidate
 from video_summary.planner import (
-    SHORT_DAY_KEEP_RATIO,
-    _adaptive_day_target_seconds,
-    _select_day_candidates,
     _planner_candidates_payload,
     _prompt_role_weights,
     _sample_contact_sheets,
+    _select_day_candidates,
     build_planner_request,
     local_plan,
     plan_project,
@@ -65,6 +63,17 @@ def meal_candidate(
         candidate(candidate_id, captured_at, start).to_dict()
     )
     item.required_meal_event_ids = list(event_ids)
+    return item
+
+
+def meal_context_candidate(
+    candidate_id: str,
+    captured_at: str,
+    context_ids: list[str],
+    start: float = 0.0,
+) -> Candidate:
+    item = candidate(candidate_id, captured_at, start)
+    item.required_meal_context_ids = list(context_ids)
     return item
 
 
@@ -133,6 +142,29 @@ class PlannerTests(unittest.TestCase):
 
             self.assertEqual(planned.call_count, 2)
 
+    def test_plan_cache_tracks_the_story_soft_maximum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            write_json(
+                paths.candidates,
+                {
+                    "version": 2,
+                    "candidate_set_hash": "unchanged-candidates",
+                    "policy_versions": {},
+                },
+            )
+            with (
+                patch("video_summary.planner.load_candidates", return_value=self.candidates),
+                patch("video_summary.planner.local_plan", wraps=local_plan) as planned,
+            ):
+                plan_project(paths, self.config)
+                self.config["editing"]["soft_max_minutes_per_day"] = 9.0
+                plan_project(paths, self.config)
+                plan_project(paths, self.config)
+
+            self.assertEqual(planned.call_count, 2)
+
     def test_hash_and_required_fields_are_strict(self) -> None:
         payload = self.valid_payload()
         del payload["candidate_set_hash"]
@@ -185,7 +217,7 @@ class PlannerTests(unittest.TestCase):
         self.assertNotEqual(segments[0].role, "hook")
 
     def test_local_plan_preserves_the_day_start_and_end_anchors(self) -> None:
-        self.config["editing"]["target_minutes_per_day"] = 10.0 / 60.0
+        self.config["editing"]["soft_max_minutes_per_day"] = 10.0 / 60.0
         anchors = [
             candidate("early", "2026-11-01T08:00:00-05:00"),
             candidate("middle", "2026-11-01T09:00:00-05:00", 6.0),
@@ -193,7 +225,8 @@ class PlannerTests(unittest.TestCase):
         ]
         anchors[0].score = 0.05
         anchors[1].score = 1.0
-        anchors[2].score = 0.1
+        anchors[2].roles = ["journey", "closer"]
+        anchors[2].score = 0.55
         plan = local_plan(self.config, "여정", anchors, "hash")
         self.assertEqual(
             [item.candidate_id for item in plan.episodes[0].segments],
@@ -201,7 +234,7 @@ class PlannerTests(unittest.TestCase):
         )
 
     def test_local_plan_keeps_a_strong_silent_visual_anchor(self) -> None:
-        self.config["editing"]["target_minutes_per_day"] = 15.0 / 60.0
+        self.config["editing"]["soft_max_minutes_per_day"] = 15.0 / 60.0
         anchors = [
             candidate("early", "2026-11-01T08:00:00-05:00"),
             candidate("talk", "2026-11-01T09:00:00-05:00", 6.0),
@@ -209,20 +242,23 @@ class PlannerTests(unittest.TestCase):
             candidate("late", "2026-11-01T11:00:00-05:00", 18.0),
         ]
         anchors[0].score = 0.1
-        anchors[1].score = 1.0
+        anchors[1].score = 0.2
+        anchors[1].roles = ["dialogue"]
+        anchors[1].visual_quality = 0.4
         anchors[2].score = 0.2
         anchors[2].roles = ["scenery"]
         anchors[2].speech_ratio = 0.0
         anchors[2].visual_quality = 0.95
-        anchors[3].score = 0.1
+        anchors[3].roles = ["journey", "closer"]
+        anchors[3].score = 0.55
         plan = local_plan(self.config, "여정과 풍경", anchors, "hash")
         self.assertEqual(
             [item.candidate_id for item in plan.episodes[0].segments],
             ["early", "view", "late"],
         )
 
-    def test_local_plan_pins_all_detected_interview_candidates_past_a_tight_target(self) -> None:
-        self.config["editing"]["target_minutes_per_day"] = 5.0 / 60.0
+    def test_local_plan_pins_all_detected_interviews_past_a_tight_soft_maximum(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
         items = [
             candidate("early", "2026-11-01T08:00:00-05:00"),
             candidate(
@@ -252,8 +288,8 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(all(item.caption is None for item in segments[1:]))
         self.assertTrue(all(item.location is None for item in segments[1:]))
 
-    def test_local_plan_pins_transition_waypoints_past_a_tight_target(self) -> None:
-        self.config["editing"]["target_minutes_per_day"] = 5.0 / 60.0
+    def test_local_plan_pins_transition_waypoints_past_a_tight_soft_maximum(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
         items = [
             candidate("early", "2026-11-01T08:00:00-05:00"),
             candidate("pickup", "2026-11-01T09:00:00-05:00"),
@@ -275,8 +311,8 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(all("이동 거점" in item.reason for item in segments[1:]))
         self.assertIn("주요 이동 거점", plan.episodes[0].summary)
 
-    def test_local_plan_selects_one_best_option_per_meal_past_a_tight_target(self) -> None:
-        self.config["editing"]["target_minutes_per_day"] = 5.0 / 60.0
+    def test_local_plan_selects_one_best_meal_option_past_a_tight_soft_maximum(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
         items = [
             candidate("early", "2026-11-01T08:00:00-05:00"),
             meal_candidate("breakfast_low", "2026-11-01T09:00:00-05:00", ["meal_1"]),
@@ -300,8 +336,44 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(all("식사 경험" in item.reason for item in segments[1:]))
         self.assertIn("먹거리", plan.episodes[0].summary)
 
+    def test_local_plan_pins_detected_meal_setup_body_and_closure(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
+        items = [
+            candidate("early", "2026-11-01T08:00:00-05:00"),
+            meal_context_candidate(
+                "setup_low",
+                "2026-11-01T09:00:00-05:00",
+                ["meal_1:setup"],
+            ),
+            meal_context_candidate(
+                "setup_best",
+                "2026-11-01T09:30:00-05:00",
+                ["meal_1:setup"],
+            ),
+            meal_candidate("body", "2026-11-01T10:00:00-05:00", ["meal_1"]),
+            meal_context_candidate(
+                "closure",
+                "2026-11-01T11:00:00-05:00",
+                ["meal_1:closure"],
+            ),
+            candidate("late", "2026-11-01T12:00:00-05:00"),
+        ]
+        items[1].score = 0.2
+        items[2].score = 0.95
+
+        plan = local_plan(self.config, "식사 서사를 자연스럽게 보존해줘", items, "hash")
+        segments = plan.episodes[0].segments
+
+        self.assertEqual(
+            [item.candidate_id for item in segments],
+            ["early", "setup_best", "body", "closure"],
+        )
+        self.assertEqual([item.role for item in segments], ["hook", "food", "food", "food"])
+        self.assertTrue(all(item.speed == 1.0 for item in segments[1:]))
+        self.assertTrue(all("식사 경험" in item.reason for item in segments[1:]))
+
     def test_local_meal_group_reuses_an_already_mandatory_transition_option(self) -> None:
-        self.config["editing"]["target_minutes_per_day"] = 5.0 / 60.0
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
         transition = meal_candidate(
             "restaurant_arrival",
             "2026-11-01T09:00:00-05:00",
@@ -375,6 +447,14 @@ class PlannerTests(unittest.TestCase):
         item.transcript = "민감한 대화 " * 80
         payload = _planner_candidates_payload([item], "hash")
         exported = payload["candidates"][0]
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["story_selection_contract"]["strategy"], "event_first")
+        self.assertFalse(payload["story_selection_contract"]["fill_quota"])
+        self.assertEqual(
+            payload["story_selection_contract"]["soft_ceiling_scope"],
+            "total_day_runtime",
+        )
+        self.assertTrue(payload["story_event_groups"])
         self.assertNotIn("transcript", exported)
         self.assertLessEqual(len(exported["transcript_excerpt"]), 240)
         self.assertEqual(exported["required_event_ids"], [])
@@ -419,14 +499,29 @@ class PlannerTests(unittest.TestCase):
 
         self.assertIn("transition", payload["candidates"][1]["roles"])
         self.assertIn("mandatory transition waypoint candidates: c2", request)
-        self.assertIn("목표 시간과 권장 상한을 넘더라도", request)
+        self.assertIn("목표 시간과 soft maximum을 넘더라도", request)
         self.assertIn("speed=1.0, role=transition", request)
         self.assertIn("role=journey만 있는 후보는 필수가 아닙니다", request)
 
     def test_external_payload_and_request_expose_meal_one_of_groups(self) -> None:
         options = [
+            meal_context_candidate(
+                "setup_a",
+                "2026-11-01T08:30:00-05:00",
+                ["meal_1:setup"],
+            ),
+            meal_context_candidate(
+                "setup_b",
+                "2026-11-01T08:45:00-05:00",
+                ["meal_1:setup"],
+            ),
             meal_candidate("meal_a", "2026-11-01T09:00:00-05:00", ["meal_1"]),
             meal_candidate("meal_b", "2026-11-01T10:00:00-05:00", ["meal_1", "meal_2"]),
+            meal_context_candidate(
+                "closure",
+                "2026-11-01T11:00:00-05:00",
+                ["meal_1:closure"],
+            ),
         ]
 
         payload = _planner_candidates_payload([self.candidates[0], *options], "hash")
@@ -460,13 +555,47 @@ class PlannerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            payload["candidates"][2]["required_meal_event_ids"],
+            next(
+                item["required_meal_event_ids"]
+                for item in payload["candidates"]
+                if item["candidate_id"] == "meal_b"
+            ),
             ["meal_1", "meal_2"],
         )
+        self.assertEqual(
+            payload["meal_context_option_groups"],
+            [
+                {
+                    "context_id": "meal_1:setup",
+                    "stage": "setup",
+                    "day_key": "2026-11-01",
+                    "selection_mode": "one_of",
+                    "one_of_candidate_ids": ["setup_a", "setup_b"],
+                },
+                {
+                    "context_id": "meal_1:closure",
+                    "stage": "closure",
+                    "day_key": "2026-11-01",
+                    "selection_mode": "one_of",
+                    "one_of_candidate_ids": ["closure"],
+                },
+            ],
+        )
         self.assertIn("mandatory meal event meal_1 one_of candidates: meal_a, meal_b", request)
+        self.assertIn(
+            "mandatory meal narrative meal_1:setup one_of candidates: setup_a, setup_b",
+            request,
+        )
+        self.assertIn(
+            "mandatory meal narrative meal_1:closure one_of candidates: closure",
+            request,
+        )
         self.assertIn("각 이벤트의 one_of 후보 중 최소 1개", request)
         self.assertIn("speed=1.0, role=food", request)
-        self.assertIn("required_meal_event_ids가 비어 있는 후보는 필수가 아닙니다", request)
+        self.assertIn(
+            "required_meal_event_ids와 required_meal_context_ids가 모두 비어 있는 후보는 필수가 아닙니다",
+            request,
+        )
 
     def test_planner_schema_const_fields_also_declare_their_json_type(self) -> None:
         schema = planner_schema()
@@ -528,6 +657,7 @@ class PlannerTests(unittest.TestCase):
         candidates[0].score = 1.0
         candidates[1].score = 0.9
         candidates[2].score = 0.8
+        candidates[2].roles = ["journey", "closer"]
 
         plan = local_plan(self.config, "자연스러운 시간순 여행", candidates, "hash")
 
@@ -546,27 +676,137 @@ class PlannerTests(unittest.TestCase):
         items[1].score = 0.79
         items[2].score = 0.74
         items[3].score = 0.82
+        items[4].roles = ["journey", "closer"]
+        items[4].score = 0.55
 
         selected = _select_day_candidates(items, 20.0)
 
         self.assertEqual([item.candidate_id for item in selected], ["early", "run_a", "run_b", "late"])
 
-    def test_short_day_uses_an_adaptive_ceiling_instead_of_every_candidate(self) -> None:
+    def test_event_first_stops_after_coverage_without_filling_the_soft_maximum(self) -> None:
         items = [
-            candidate(f"c{index}", f"2026-11-01T{8 + index:02d}:00:00-05:00")
-            for index in range(5)
+            candidate("early", "2026-11-01T08:00:00-05:00"),
+            candidate("strong", "2026-11-01T08:02:00-05:00"),
+            candidate("near_duplicate", "2026-11-01T08:04:00-05:00"),
+            candidate("weak_fragment", "2026-11-01T08:06:00-05:00"),
+            candidate("closing", "2026-11-01T08:08:00-05:00"),
         ]
+        for item in items:
+            item.roles = ["journey"]
+        items[0].score = 0.1
+        items[1].score = 0.95
+        items[2].score = 0.90
+        items[3].score = 0.2
+        items[3].visual_quality = 0.3
+        items[4].roles = ["journey", "closer"]
+        items[4].score = 0.55
 
-        adaptive_target = _adaptive_day_target_seconds(items, 60.0)
-        selected = _select_day_candidates(items, 60.0)
+        selected = _select_day_candidates(items, 600.0)
 
-        self.assertEqual(adaptive_target, 25.0 * SHORT_DAY_KEEP_RATIO)
-        self.assertLess(len(selected), len(items))
-        self.assertLessEqual(sum(item.duration for item in selected), adaptive_target)
-        self.assertEqual(selected[0].candidate_id, "c0")
-        self.assertEqual(selected[-1].candidate_id, "c4")
+        self.assertEqual(
+            [item.candidate_id for item in selected],
+            ["early", "strong", "closing"],
+        )
+        self.assertEqual(sum(item.duration for item in selected), 15.0)
 
-    def test_external_request_calls_the_day_target_a_soft_ceiling(self) -> None:
+    def test_event_first_balances_dense_events_across_the_full_day(self) -> None:
+        items: list[Candidate] = []
+        for index in range(13):
+            total_minutes = 8 * 60 + index * 31
+            hour, minute = divmod(total_minutes, 60)
+            item = candidate(
+                f"event_{index:02d}",
+                f"2026-11-01T{hour:02d}:{minute:02d}:00-05:00",
+            )
+            item.end = 50.0
+            item.roles = ["scenery"]
+            item.score = 0.95
+            item.speech_ratio = 0.0
+            item.visual_quality = 0.95
+            items.append(item)
+        items[-1].roles.append("closer")
+
+        selected = _select_day_candidates(items, 300.0)
+        selected_indexes = {
+            int(item.candidate_id.rsplit("_", 1)[-1])
+            for item in selected
+        }
+
+        self.assertLessEqual(sum(item.duration for item in selected), 300.0)
+        self.assertIn(0, selected_indexes)
+        self.assertIn(12, selected_indexes)
+        self.assertTrue(selected_indexes & set(range(1, 4)))
+        self.assertTrue(selected_indexes & set(range(4, 9)))
+        self.assertTrue(selected_indexes & set(range(9, 12)))
+
+    def test_soft_maximum_includes_mandatory_runtime_before_story_events(self) -> None:
+        items = [
+            candidate("early", "2026-11-01T08:00:00-05:00"),
+            candidate(
+                "interview",
+                "2026-11-01T09:00:00-05:00",
+                required_event_ids=["family_interview_1"],
+            ),
+            candidate("event_a", "2026-11-01T10:00:00-05:00"),
+            candidate("event_b", "2026-11-01T11:00:00-05:00"),
+        ]
+        items[0].end = 5.0
+        items[0].score = 0.1
+        items[1].roles = ["interview", "dialogue"]
+        items[1].end = 195.0
+        for item in items[2:]:
+            item.roles = ["scenery"]
+            item.score = 0.95
+            item.speech_ratio = 0.0
+            item.visual_quality = 0.95
+            item.end = 200.0
+
+        selected = _select_day_candidates(items, 600.0)
+
+        self.assertEqual(
+            [item.candidate_id for item in selected],
+            ["early", "interview", "event_a", "event_b"],
+        )
+        self.assertEqual(sum(item.duration for item in selected), 600.0)
+
+    def test_mandatory_runtime_over_soft_maximum_blocks_optional_events(self) -> None:
+        interview = candidate(
+            "interview",
+            "2026-11-01T08:00:00-05:00",
+            required_event_ids=["family_interview_1"],
+        )
+        interview.roles = ["interview", "dialogue"]
+        interview.end = 650.0
+        optional = candidate("optional", "2026-11-01T09:00:00-05:00")
+        optional.roles = ["scenery"]
+        optional.score = optional.visual_quality = 0.95
+        optional.speech_ratio = 0.0
+
+        selected = _select_day_candidates([interview, optional], 600.0)
+
+        self.assertEqual([item.candidate_id for item in selected], ["interview"])
+
+    def test_legacy_target_changes_metadata_but_not_event_selection(self) -> None:
+        items = [
+            candidate("early", "2026-11-01T08:00:00-05:00"),
+            candidate("event", "2026-11-01T09:00:00-05:00"),
+        ]
+        five_minute_config = copy.deepcopy(self.config)
+        six_minute_config = copy.deepcopy(self.config)
+        five_minute_config["editing"]["target_minutes_per_day"] = 5.0
+        six_minute_config["editing"]["target_minutes_per_day"] = 6.0
+
+        five_minute_plan = local_plan(five_minute_config, "여행", items, "hash")
+        six_minute_plan = local_plan(six_minute_config, "여행", items, "hash")
+
+        self.assertEqual(
+            [item.candidate_id for item in five_minute_plan.episodes[0].segments],
+            [item.candidate_id for item in six_minute_plan.episodes[0].segments],
+        )
+        self.assertEqual(five_minute_plan.episodes[0].target_duration, 300.0)
+        self.assertEqual(six_minute_plan.episodes[0].target_duration, 360.0)
+
+    def test_external_request_declares_event_first_and_a_separate_soft_ceiling(self) -> None:
         request = build_planner_request(
             ProjectPaths(Path("/tmp"), "project"),
             self.config,
@@ -575,10 +815,15 @@ class PlannerTests(unittest.TestCase):
             "hash",
         )
 
-        self.assertIn("채워야 하는 할당량이 아니라 상한", request)
+        self.assertIn("semantic event group", request)
+        self.assertIn("채워야 하는 할당량이 아닙니다", request)
+        self.assertIn("약한 fragment나 near-duplicate", request)
         self.assertIn("usable candidate total: 10.0s", request)
-        self.assertIn("recommended selection ceiling: 10.0s", request)
-        self.assertIn("target_duration 필드는 12.0으로 유지", request)
+        self.assertIn("soft maximum: 600.0s", request)
+        self.assertIn("Legacy target_duration per day: 0.2 minutes", request)
+        self.assertIn("Soft maximum per day: 10.0 minutes", request)
+        self.assertIn("DAY 전체 runtime은 soft maximum 600.0초 이내", request)
+        self.assertIn("target_duration 필드는 호환성을 위해 12.0으로 유지", request)
         self.assertIn("location/caption은 null, speed는 1.0", request)
 
     def test_broad_journey_role_alone_is_not_mandatory(self) -> None:
@@ -609,6 +854,55 @@ class PlannerTests(unittest.TestCase):
             ["c1"],
         )
 
+    def test_validator_uses_soft_maximum_instead_of_the_legacy_target(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 3.0
+        self.candidates[1].end = self.candidates[1].start + 150.0
+
+        plan = validate_and_normalize_plan(
+            self.valid_payload(),
+            self.config,
+            "x",
+            self.candidates,
+            "hash",
+            "file",
+        )
+
+        self.assertEqual(plan.episodes[0].target_duration, 12.0)
+
+    def test_validator_rejects_ordinary_runtime_past_remaining_soft_maximum(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
+
+        with self.assertRaisesRegex(VideoSummaryError, "soft maximum 6.0초"):
+            validate_and_normalize_plan(
+                self.valid_payload(),
+                self.config,
+                "x",
+                self.candidates,
+                "hash",
+                "file",
+            )
+
+    def test_meaningful_closing_can_extend_the_soft_maximum(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
+        self.candidates[1].roles = ["journey", "closer"]
+        self.candidates[1].score = 0.8
+        payload = self.valid_payload()
+        payload["episodes"][0]["segments"][1]["role"] = "closing"
+
+        plan = validate_and_normalize_plan(
+            payload,
+            self.config,
+            "x",
+            self.candidates,
+            "hash",
+            "file",
+        )
+
+        self.assertEqual(
+            [item.candidate_id for item in plan.episodes[0].segments],
+            ["c1", "c2"],
+        )
+
     def test_external_planners_require_one_option_from_each_meal_group(self) -> None:
         candidates = [
             self.candidates[0],
@@ -632,6 +926,87 @@ class PlannerTests(unittest.TestCase):
                         "hash",
                         planner_name,
                     )
+
+    def test_external_planners_require_detected_meal_setup_and_closure_groups(self) -> None:
+        candidates = [
+            self.candidates[0],
+            meal_context_candidate(
+                "setup",
+                "2026-11-01T09:00:00-05:00",
+                ["meal_1:setup"],
+            ),
+            meal_candidate("body", "2026-11-01T10:00:00-05:00", ["meal_1"]),
+            meal_context_candidate(
+                "closure",
+                "2026-11-01T11:00:00-05:00",
+                ["meal_1:closure"],
+            ),
+        ]
+        missing_cases = {
+            "meal_1:setup": ["c1", "body", "closure"],
+            "meal_1:closure": ["c1", "setup", "body"],
+        }
+
+        for planner_name in ("file", "codex", "claude"):
+            for context_id, selected_ids in missing_cases.items():
+                with self.subTest(planner=planner_name, missing=context_id):
+                    payload = self.valid_payload()
+                    payload["episodes"][0]["segments"] = [
+                        {
+                            "candidate_id": candidate_id,
+                            "role": "fun" if candidate_id == "c1" else "food",
+                            "reason": "식사 서사",
+                            "speed": 1.0,
+                        }
+                        for candidate_id in selected_ids
+                    ]
+                    with self.assertRaisesRegex(
+                        VideoSummaryError,
+                        f"필수 식사 서사 {context_id}.*one_of",
+                    ):
+                        validate_and_normalize_plan(
+                            payload,
+                            self.config,
+                            "x",
+                            candidates,
+                            "hash",
+                            planner_name,
+                        )
+
+    def test_meal_context_candidates_require_normal_speed_and_food_role(self) -> None:
+        context = meal_context_candidate(
+            "setup",
+            "2026-11-01T09:00:00-05:00",
+            ["meal_1:setup"],
+        )
+        candidates = [self.candidates[0], context]
+
+        for planner_name in ("file", "codex", "claude"):
+            for field, value, message in (
+                ("speed", 1.25, "speed=1.0"),
+                ("role", "moment", "role=food"),
+            ):
+                with self.subTest(planner=planner_name, violation=field):
+                    payload = self.valid_payload()
+                    payload["episodes"][0]["segments"] = [
+                        payload["episodes"][0]["segments"][0],
+                        {
+                            "candidate_id": "setup",
+                            "role": "food",
+                            "reason": "식사 준비",
+                            "speed": 1.0,
+                        },
+                    ]
+                    payload["episodes"][0]["segments"][-1][field] = value
+                    with self.assertRaisesRegex(VideoSummaryError, message):
+                        validate_and_normalize_plan(
+                            payload,
+                            self.config,
+                            "x",
+                            candidates,
+                            "hash",
+                            planner_name,
+                        )
 
     def test_external_planners_accept_one_meal_option_and_reject_its_speed_or_role(self) -> None:
         candidates = [
@@ -701,6 +1076,7 @@ class PlannerTests(unittest.TestCase):
             ["meal_1"],
         )
         interview.required_event_ids = ["family_interview_1"]
+        interview.required_meal_context_ids = ["meal_1:setup"]
         interview.roles = ["interview", "food"]
         transition = meal_candidate(
             "transition_meal",
@@ -708,6 +1084,7 @@ class PlannerTests(unittest.TestCase):
             ["meal_2"],
         )
         transition.roles = ["transition", "journey", "food"]
+        transition.required_meal_context_ids = ["meal_2:closure"]
         candidates = [self.candidates[0], interview, transition]
         payload = self.valid_payload()
         payload["episodes"][0]["segments"] = [
@@ -881,7 +1258,8 @@ class PlannerTests(unittest.TestCase):
                 payload, self.config, "x", self.candidates, "hash", "file"
             )
 
-    def test_required_interview_runtime_can_extend_the_normal_plan_limit(self) -> None:
+    def test_required_interview_runtime_can_extend_the_soft_maximum(self) -> None:
+        self.config["editing"]["soft_max_minutes_per_day"] = 0.1
         self.candidates[1].required_event_ids = ["family_interview_1"]
         self.candidates[1].roles = ["interview", "dialogue"]
         self.candidates[1].end = self.candidates[1].start + 200.0

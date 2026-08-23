@@ -43,8 +43,9 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 19
+RENDER_POLICY_VERSION = 20
 SOURCE_RENDER_POLICY_VERSION = 8
+RENDER_REPORT_VERSION = 6
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
 YOUTUBE_MIN_CHAPTERS = 3
@@ -296,7 +297,7 @@ def meal_event_coverage(
     *,
     enabled: bool,
 ) -> dict[str, Any]:
-    """Audit one-of coverage for locally detected meal events."""
+    """Audit body and detected setup/closure coverage for meal events."""
     selected_ids = {
         segment.candidate_id
         for episode in plan.episodes
@@ -308,6 +309,10 @@ def meal_event_coverage(
         "option_candidate_count": 0,
         "selected_event_count": 0,
         "selected_candidate_count": 0,
+        "context_group_count": 0,
+        "selected_context_group_count": 0,
+        "context_candidate_count": 0,
+        "selected_context_candidate_count": 0,
         "events": [],
     }
     if not enabled:
@@ -319,6 +324,10 @@ def meal_event_coverage(
     events: list[dict[str, Any]] = []
     option_ids: set[str] = set()
     selected_option_ids: set[str] = set()
+    context_ids: set[str] = set()
+    selected_context_ids: set[str] = set()
+    context_candidate_ids: set[str] = set()
+    selected_context_candidate_ids: set[str] = set()
     for raw_event in meal_events:
         event_id = str(raw_event.get("event_id", "")).strip()
         selection_mode = str(raw_event.get("selection_mode", "")).strip()
@@ -344,6 +353,63 @@ def meal_event_coverage(
             )
         option_ids.update(candidate_ids)
         selected_option_ids.update(selected_event_ids)
+        context_groups_value = raw_event.get("context_groups", [])
+        if not isinstance(context_groups_value, list):
+            raise VideoSummaryError("candidates.json의 식사 서사 그룹이 잘못되었습니다.")
+        context_groups: list[dict[str, Any]] = []
+        for raw_group in context_groups_value:
+            if not isinstance(raw_group, dict):
+                raise VideoSummaryError("candidates.json의 식사 서사 그룹이 잘못되었습니다.")
+            context_id = str(raw_group.get("context_id", "")).strip()
+            stage = str(raw_group.get("stage", "")).strip()
+            context_selection_mode = str(raw_group.get("selection_mode", "")).strip()
+            context_candidate_ids_value = raw_group.get("candidate_ids", [])
+            if (
+                not context_id
+                or stage not in {"setup", "closure"}
+                or context_selection_mode != "one_of"
+                or not isinstance(context_candidate_ids_value, list)
+                or not context_candidate_ids_value
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in context_candidate_ids_value
+                )
+            ):
+                raise VideoSummaryError("candidates.json의 식사 서사 그룹이 잘못되었습니다.")
+            if context_id in context_ids:
+                raise VideoSummaryError(
+                    f"candidates.json에 중복된 식사 서사 그룹이 있습니다: {context_id}"
+                )
+            group_candidate_ids = list(
+                dict.fromkeys(value.strip() for value in context_candidate_ids_value)
+            )
+            missing_context_catalog = [
+                value for value in group_candidate_ids if value not in candidate_by_id
+            ]
+            if missing_context_catalog:
+                raise VideoSummaryError(
+                    f"식사 서사 그룹이 알 수 없는 후보를 참조합니다: {context_id}"
+                )
+            selected_group_ids = [
+                value for value in group_candidate_ids if value in selected_ids
+            ]
+            if not selected_group_ids:
+                raise VideoSummaryError(
+                    f"필수 식사 서사가 최종 plan에서 누락되었습니다: {context_id}"
+                )
+            context_ids.add(context_id)
+            selected_context_ids.add(context_id)
+            context_candidate_ids.update(group_candidate_ids)
+            selected_context_candidate_ids.update(selected_group_ids)
+            context_groups.append(
+                {
+                    "context_id": context_id,
+                    "stage": stage,
+                    "selection_mode": "one_of",
+                    "candidate_ids": group_candidate_ids,
+                    "selected_candidate_ids": selected_group_ids,
+                }
+            )
         signals_value = raw_event.get("signals", [])
         signals = (
             [str(value) for value in signals_value if isinstance(value, str)]
@@ -367,6 +433,7 @@ def meal_event_coverage(
                 "selection_mode": "one_of",
                 "candidate_ids": candidate_ids,
                 "selected_candidate_ids": selected_event_ids,
+                "context_groups": context_groups,
             }
         )
 
@@ -376,6 +443,10 @@ def meal_event_coverage(
         "option_candidate_count": len(option_ids),
         "selected_event_count": len(events),
         "selected_candidate_count": len(selected_option_ids),
+        "context_group_count": len(context_ids),
+        "selected_context_group_count": len(selected_context_ids),
+        "context_candidate_count": len(context_candidate_ids),
+        "selected_context_candidate_count": len(selected_context_candidate_ids),
         "events": events,
     }
 
@@ -599,7 +670,7 @@ def render_project(
                 )
             )
         report = {
-            "version": 5,
+            "version": RENDER_REPORT_VERSION,
             "cache_key": cache_key,
             "project": validated.project,
             "planner": validated.planner,
