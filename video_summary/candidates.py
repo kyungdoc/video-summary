@@ -39,7 +39,7 @@ JOURNEY_TRANSITION_DEDUPE_SECONDS = 60.0
 PARTY_TRANSITION_CONTEXT_POLICY_VERSION = 1
 PARTY_TRANSITION_CONTEXT_MAX_SECONDS = 12.0
 PARTY_TRANSITION_CONTEXT_MAX_CUES = 3
-MEAL_EVENT_POLICY_VERSION = 1
+MEAL_EVENT_POLICY_VERSION = 2
 MEAL_OPTION_MAX_DURATION_SECONDS = 12.0
 MEAL_SETUP_CLUSTER_SECONDS = 45.0 * 60.0
 MEAL_SETUP_HORIZON_SECONDS = 3.0 * 60.0 * 60.0
@@ -340,6 +340,11 @@ _MEAL_SERVED_FOOD_PATTERN = re.compile(
     r"(?:음식|요리|메뉴|피자|라멘|라면|초밥|스시|고기|빵|아이스크림|디저트|케이크|커피|주스)"
     r"|\b(?:food|meal|dish|pizza|ramen|sushi|ice\s*cream|dessert|cake|coffee)\b"
     r".{0,24}?\b(?:arrived|was\s+served|is\s+here)\b"
+)
+_MEAL_APPROACH_OR_QUEUE_PATTERN = re.compile(
+    r"(?:가\s*보시죠|들어가\s*보(?:자|시죠|겠습니다)|"
+    r"줄.{0,24}?(?:서서|서|사서)?\s*기다리|대기\s*중|웨이팅\s*중)"
+    r"|\b(?:let['’]?s\s+go\s+(?:in|inside|there)|waiting\s+in\s+line|queueing|queuing)\b"
 )
 _MEAL_ACTUAL_EATING_PATTERN = re.compile(
     r"(?:먹고\s*있|먹는\s*중|먹어\s*볼|먹어\s*보|먹어봤|한\s*입|입에\s*넣|냠냠)"
@@ -1136,7 +1141,10 @@ def _meal_direct_signal(text: str, clip_context: str = "") -> str | None:
         return None
     if _MEAL_RETROSPECTIVE_OR_PLAN_PATTERN.search(normalized):
         return None
-    if _MEAL_SERVED_FOOD_PATTERN.search(normalized):
+    if (
+        _MEAL_SERVED_FOOD_PATTERN.search(normalized)
+        and not _MEAL_APPROACH_OR_QUEUE_PATTERN.search(normalized)
+    ):
         return "served_food"
     if _MEAL_FOOD_REVEAL_PATTERN.search(normalized):
         return "food_reveal"

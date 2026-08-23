@@ -248,6 +248,39 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertEqual(_detect_meal_events([clip], cues), [])
 
+    def test_sapporo_ramen_shop_queue_asr_is_not_served_food(self) -> None:
+        clip = _clip(
+            "clip_bd060152d7b0a84c",
+            duration=12.0,
+            captured_at="2025-02-06T10:38:00+09:00",
+        )
+        cues = {
+            clip.clip_id: [
+                TranscriptCue(
+                    0.0,
+                    12.0,
+                    "네, 이 치킨 라면이 나왔습니다. 가보시죠. 사람이 한 5명 정도 줄 사서 기다리고 있네요.",
+                )
+            ]
+        }
+
+        self.assertEqual(_detect_meal_events([clip], cues), [])
+
+    def test_served_food_without_approach_context_remains_direct_meal(self) -> None:
+        clip = _clip(
+            "served-ramen",
+            duration=10.0,
+            captured_at="2026-08-20T12:00:00+09:00",
+        )
+        cues = {
+            clip.clip_id: [TranscriptCue(1.0, 3.0, "라멘이 나왔습니다. 먹어보시죠.")]
+        }
+
+        events = _detect_meal_events([clip], cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual([option.clip_id for option in events[0].options], [clip.clip_id])
+
     def test_direct_meals_cluster_only_nearby_same_subtype_views(self) -> None:
         clips = [
             _clip("lunch-wide", duration=10.0, captured_at="2026-08-20T12:00:00+09:00"),
