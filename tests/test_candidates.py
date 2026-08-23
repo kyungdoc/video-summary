@@ -8,13 +8,21 @@ from unittest.mock import patch
 
 from video_summary.candidates import (
     INTERVIEW_DETECTION_POLICY_VERSION,
+    JOURNEY_TRANSITION_POLICY_VERSION,
+    MEAL_EVENT_POLICY_VERSION,
+    PARTY_TRANSITION_CONTEXT_POLICY_VERSION,
     VISUAL_SIGNAL_POLICY_VERSION,
     _detect_family_interview_events,
     _detect_interview_events,
+    _detect_journey_transition_windows,
+    _detect_meal_events,
     _candidate_cache_key,
     _candidate_location,
     _candidate_windows,
+    _journey_direction_destination,
+    _journey_transition_signal,
     _merge_overlapping_windows,
+    _meal_direct_signal,
     build_candidates,
 )
 from video_summary.models import Candidate, Clip, TranscriptCue
@@ -70,6 +78,7 @@ class CandidateCoverageTests(unittest.TestCase):
         )
 
         self.assertEqual(candidate.required_event_ids, [])
+        self.assertEqual(candidate.required_meal_event_ids, [])
 
     def test_candidate_cache_key_tracks_visual_signal_policy(self) -> None:
         clip = Clip(
@@ -110,6 +119,612 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertNotEqual(current, disabled)
         self.assertNotEqual(current, changed_policy)
+
+    def test_candidate_cache_key_tracks_journey_transition_policy(self) -> None:
+        clip = _clip(duration=10.0)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            current = _candidate_cache_key(paths, [clip], config)
+            with patch(
+                "video_summary.candidates.JOURNEY_TRANSITION_POLICY_VERSION",
+                JOURNEY_TRANSITION_POLICY_VERSION + 1,
+            ):
+                changed = _candidate_cache_key(paths, [clip], config)
+            with patch(
+                "video_summary.candidates.PARTY_TRANSITION_CONTEXT_POLICY_VERSION",
+                PARTY_TRANSITION_CONTEXT_POLICY_VERSION + 1,
+            ):
+                changed_context = _candidate_cache_key(paths, [clip], config)
+
+        self.assertNotEqual(current, changed)
+        self.assertNotEqual(current, changed_context)
+
+    def test_candidate_cache_key_tracks_meal_policy_and_toggle(self) -> None:
+        clip = _clip(duration=10.0)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            current = _candidate_cache_key(paths, [clip], config)
+            disabled_config = copy.deepcopy(config)
+            disabled_config["editing"]["preserve_meal_events"] = False
+            disabled = _candidate_cache_key(paths, [clip], disabled_config)
+            with patch(
+                "video_summary.candidates.MEAL_EVENT_POLICY_VERSION",
+                MEAL_EVENT_POLICY_VERSION + 1,
+            ):
+                changed_policy = _candidate_cache_key(paths, [clip], config)
+
+        self.assertNotEqual(current, disabled)
+        self.assertNotEqual(current, changed_policy)
+
+    def test_meal_direct_signal_requires_filmed_present_food_evidence(self) -> None:
+        positives = [
+            "라멘이 나왔습니다",
+            "지금 초밥을 먹고 있어요",
+            "이 아이스크림 엄청 맛있네요",
+            "This pizza tastes delicious",
+        ]
+        negatives = [
+            "내일 라멘 먹으러 갑니다",
+            "어제 먹었던 음식이 맛있었어요",
+            "밥 먹고 나왔는데 이제 숙소로 갑니다",
+            "오늘 저녁을 먹었습니다",
+            "요리책 속 고양이가 볶음밥을 먹네요",
+            "보러 걸고기하고 나왔다니 눈이 엄청 많이 내려요",
+            "고기를 먹고 식당에서 나왔어요",
+        ]
+
+        for text in positives:
+            with self.subTest(text=text):
+                self.assertIsNotNone(_meal_direct_signal(text, text))
+        for text in negatives:
+            with self.subTest(text=text):
+                self.assertIsNone(_meal_direct_signal(text, text))
+
+    def test_sapporo_meal_brackets_recover_silent_body_clips(self) -> None:
+        clips = [
+            _clip("clip_1f584a801742bfc6", duration=30.0, captured_at="2026-08-20T08:00:00+09:00"),
+            _clip("clip_e5b5516569fcbf68", duration=12.98, captured_at="2026-08-20T08:05:00+09:00"),
+            _clip("clip_09993b62be79618f", duration=12.0, captured_at="2026-08-20T09:00:00+09:00"),
+            _clip("clip_2d4c1871e944b838", duration=36.7, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("clip_01d0a2498b9e63bc", duration=16.517, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("clip_5efdd0224f934a16", duration=14.0, captured_at="2026-08-20T12:02:00+09:00"),
+            _clip("clip_398d95c0dd2e8f5a", duration=5.956, captured_at="2026-08-20T17:00:00+09:00"),
+            _clip("clip_b6e2656927e8d91c", duration=20.0, captured_at="2026-08-20T17:01:00+09:00"),
+            _clip("clip_3fd035d9f5be4682", duration=182.0, captured_at="2026-08-20T20:51:00+09:00"),
+        ]
+        cues_by_clip = {
+            "clip_1f584a801742bfc6": [TranscriptCue(20.0, 24.0, "자 밥 먹으러 갑시다 우리 비니 가자")],
+            "clip_e5b5516569fcbf68": [TranscriptCue(1.0, 4.0, "안녕 안녕 안녕")],
+            "clip_09993b62be79618f": [TranscriptCue(1.0, 4.0, "밥 먹고 왔더니 날이 어두워졌어요")],
+            "clip_2d4c1871e944b838": [TranscriptCue(30.0, 35.0, "밥 집에 왔습니다. 도착했습니다")],
+            "clip_01d0a2498b9e63bc": [TranscriptCue(2.0, 4.0, "고맙습니다")],
+            "clip_5efdd0224f934a16": [TranscriptCue(1.0, 4.0, "이거 피자야 맛있게 먹자")],
+            "clip_398d95c0dd2e8f5a": [TranscriptCue(1.0, 2.0, "빠파")],
+            "clip_b6e2656927e8d91c": [TranscriptCue(0.0, 3.0, "밥 먹고 나왔는데 이제 돌아갑니다")],
+            "clip_3fd035d9f5be4682": [
+                TranscriptCue(1.0, 8.0, "그림책에서 고양이 친구들이 볶음밥을 만들어요"),
+                TranscriptCue(9.0, 14.0, "다 같이 맛있게 먹고 잘 먹었습니다"),
+            ],
+        }
+
+        events = _detect_meal_events(clips, cues_by_clip)
+        by_clip = {
+            option.clip_id: event
+            for event in events
+            for option in event.options
+        }
+
+        for clip_id in (
+            "clip_e5b5516569fcbf68",
+            "clip_01d0a2498b9e63bc",
+            "clip_398d95c0dd2e8f5a",
+        ):
+            self.assertIn(clip_id, by_clip)
+            self.assertEqual(len(by_clip[clip_id].options), 1)
+        self.assertNotIn("clip_1f584a801742bfc6", by_clip)
+        self.assertNotIn("clip_09993b62be79618f", by_clip)
+        self.assertNotIn("clip_b6e2656927e8d91c", by_clip)
+        self.assertNotIn("clip_3fd035d9f5be4682", by_clip)
+
+    def test_sapporo_snowy_street_exit_asr_is_not_served_food(self) -> None:
+        clip = _clip(
+            "clip_e791288eb18d9573",
+            duration=6.31,
+            captured_at="2025-02-05T11:44:14+09:00",
+        )
+        cues = {
+            clip.clip_id: [
+                TranscriptCue(
+                    0.0,
+                    6.0,
+                    "보러 걸고기하고 나왔다니 눈이 엄청 많이 내려요",
+                )
+            ]
+        }
+
+        self.assertEqual(_detect_meal_events([clip], cues), [])
+
+    def test_direct_meals_cluster_only_nearby_same_subtype_views(self) -> None:
+        clips = [
+            _clip("lunch-wide", duration=10.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("lunch-close", duration=10.0, captured_at="2026-08-20T12:05:00+09:00"),
+            _clip("dessert", duration=10.0, captured_at="2026-08-20T13:00:00+09:00"),
+        ]
+        cues = {
+            "lunch-wide": [TranscriptCue(1.0, 3.0, "라멘이 나왔습니다")],
+            "lunch-close": [TranscriptCue(1.0, 3.0, "초밥이 나왔습니다")],
+            "dessert": [TranscriptCue(1.0, 3.0, "아이스크림을 받았습니다")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(
+            {option.clip_id for option in events[0].options},
+            {"lunch-wide", "lunch-close"},
+        )
+        self.assertEqual([option.clip_id for option in events[1].options], ["dessert"])
+        self.assertEqual(events[1].subtype, "dessert")
+
+    def test_meal_plan_does_not_promote_an_unrelated_intervening_clip(self) -> None:
+        clips = [
+            _clip("meal-plan", duration=10.0, captured_at="2026-08-20T10:00:00+09:00"),
+            _clip("unrelated-view", duration=10.0, captured_at="2026-08-20T10:05:00+09:00"),
+            _clip("actual-lunch", duration=10.0, captured_at="2026-08-20T11:00:00+09:00"),
+        ]
+        cues = {
+            "meal-plan": [TranscriptCue(1.0, 3.0, "이제 라멘 먹으러 갑니다")],
+            "unrelated-view": [TranscriptCue(1.0, 3.0, "바다가 정말 예쁘네요")],
+            "actual-lunch": [TranscriptCue(1.0, 3.0, "라멘이 나왔습니다")],
+        }
+
+        events = _detect_meal_events(clips, cues)
+        option_clip_ids = {
+            option.clip_id for event in events for option in event.options
+        }
+
+        self.assertEqual(option_clip_ids, {"actual-lunch"})
+
+    def test_meal_boundaries_keep_only_compact_body_mandatory(self) -> None:
+        windows = _merge_overlapping_windows(
+            [
+                (0.0, 30.0, "speech"),
+                (13.25, 17.75, "meal"),
+            ]
+        )
+
+        self.assertEqual(
+            windows,
+            [
+                (0.0, 13.25, "speech"),
+                (13.25, 17.75, "meal"),
+                (17.75, 30.0, "speech"),
+            ],
+        )
+        self.assertEqual(
+            sum(end - start for start, end, origin in windows if origin == "meal"),
+            4.5,
+        )
+        self.assertTrue(
+            all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+        )
+
+    def test_build_records_one_of_meal_event_and_tags_only_body(self) -> None:
+        clips = [
+            _clip("meal-setup", duration=10.0, captured_at="2026-08-20T12:00:00+09:00"),
+            _clip("meal-body", duration=10.0, captured_at="2026-08-20T12:01:00+09:00"),
+            _clip("meal-closure", duration=10.0, captured_at="2026-08-20T12:02:00+09:00"),
+        ]
+        cues_by_clip = {
+            "meal-setup": [TranscriptCue(1.0, 3.0, "자 밥 먹으러 갑시다")],
+            "meal-body": [TranscriptCue(1.0, 3.0, "안녕")],
+            "meal-closure": [TranscriptCue(1.0, 3.0, "밥 먹고 나왔는데")],
+        }
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["project"]["name"] = "meal-event-test"
+        config["analysis"]["max_candidates_per_clip"] = 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            with (
+                patch(
+                    "video_summary.candidates.load_transcript",
+                    side_effect=lambda _paths, clip_id: cues_by_clip[clip_id],
+                ),
+                patch("video_summary.candidates.analyze_visual_signals", return_value=[]),
+                patch("video_summary.candidates.extract_frame"),
+            ):
+                payload = build_candidates(paths, clips, config)
+
+        meal_events = [
+            event for event in payload["required_events"] if event["kind"] == "meal"
+        ]
+        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["policy_versions"]["meal_event"], MEAL_EVENT_POLICY_VERSION)
+        self.assertEqual(len(meal_events), 1)
+        event = meal_events[0]
+        self.assertEqual(event["selection_mode"], "one_of")
+        self.assertEqual(len(event["option_ranges"]), 1)
+        self.assertEqual(event["option_ranges"][0]["clip_id"], "meal-body")
+        self.assertNotIn("transcript", event)
+        self.assertNotIn("path", event)
+        tagged = [
+            candidate
+            for candidate in payload["candidates"]
+            if event["event_id"] in candidate["required_meal_event_ids"]
+        ]
+        self.assertTrue(tagged)
+        self.assertEqual({candidate["clip_id"] for candidate in tagged}, {"meal-body"})
+        self.assertEqual(event["candidate_ids"], [candidate["candidate_id"] for candidate in tagged])
+        self.assertEqual(
+            event["option_ranges"][0]["candidate_ids"],
+            [candidate["candidate_id"] for candidate in tagged],
+        )
+        setup_candidates = [
+            candidate for candidate in payload["candidates"] if candidate["clip_id"] == "meal-setup"
+        ]
+        self.assertTrue(any("food" in candidate["roles"] for candidate in setup_candidates))
+        self.assertTrue(
+            all(not candidate["required_meal_event_ids"] for candidate in setup_candidates)
+        )
+
+    def test_disabling_meal_preservation_leaves_food_role_nonmandatory(self) -> None:
+        clip = _clip("food-plan", duration=10.0)
+        cues = [TranscriptCue(1.0, 3.0, "자 저녁 먹으러 갑시다")]
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["project"]["name"] = "meal-disabled-test"
+        config["editing"]["preserve_meal_events"] = False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            with (
+                patch("video_summary.candidates.load_transcript", return_value=cues),
+                patch("video_summary.candidates.analyze_visual_signals", return_value=[]),
+                patch("video_summary.candidates.extract_frame"),
+            ):
+                payload = build_candidates(paths, [clip], config)
+
+        self.assertEqual(payload["required_events"], [])
+        self.assertTrue(any("food" in candidate["roles"] for candidate in payload["candidates"]))
+        self.assertTrue(
+            all(not candidate["required_meal_event_ids"] for candidate in payload["candidates"])
+        )
+
+    def test_detects_high_confidence_journey_transition_statements(self) -> None:
+        examples = [
+            "할머니, 할아버지 태우고 이제 공항으로 갑니다",
+            "부모님을 픽업해서 함께 이동합니다",
+            "오늘 도쿄에서 환승하고 삿포로로 갑니다",
+            "렌터카를 반납하러 갑니다",
+            "오릭스 렌터카러 갑니다",
+            "호텔 체크인을 마쳤습니다",
+            "우리의 호텔 방입니다",
+            "여기가 우리 숙소입니다",
+            "복스 라이트 호텔을 찾았습니다",
+            "램프라이트 복스 호텔을 찾았습니다",
+            "신치토세 공항에 도착했습니다",
+            "공항에 내렸습니다",
+            "샌프란시스코에 도착했습니다. 다행히 세관도 잘 통과했습니다",
+            "우리 샌프라이 시스코 왕이 도착했습니다. 무사히 세관도 통과하고",
+            "삿포로역에서 출발했습니다",
+            "비행기에서 내렸습니다",
+            "We picked up our grandparents and headed to the airport.",
+            "We're transferring to another flight.",
+            "We returned the rental car.",
+            "We're checking out of the hotel.",
+            "We arrived at the airport.",
+            "We departed from the airport.",
+            "We joined our family at the airport.",
+            "We're getting off the train.",
+            "We took the train.",
+            "We arrived in San Francisco and cleared customs.",
+        ]
+
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertIsNotNone(_journey_transition_signal(text))
+
+    def test_rejects_questions_instructions_and_non_transport_arrivals(self) -> None:
+        examples = [
+            "우리 어디 가죠?",
+            "할머니 태우고 어디 가죠?",
+            "자, 이제 가자",
+            "이제 출발",
+            "출발합니다",
+            "공항 탑승 안내 방송입니다",
+            "승객 여러분, 비행기에 탑승해 주세요",
+            "렌터카를 반납하세요",
+            "호텔 체크인 안내입니다",
+            "맛집에 도착했습니다",
+            "식당에 도착했습니다",
+            "오도리 공원에 도착했습니다",
+            "관광지에 도착했습니다",
+            "관광 지역에 도착했습니다",
+            "행사 구역에 도착했습니다",
+            "택시를 타고 가고 있습니다",
+            "비행기 타고 삿포로로 가는 길입니다",
+            "동키호텔에 왔습니다",
+            "돈키호테 호텔에 왔습니다",
+            "돈키호테 호텔을 찾았습니다",
+            "호텔 방이 넓고 예쁘네요",
+            "숙소가 좋아 보여요",
+            "여행 전에 좋은 호텔을 찾았습니다",
+            "인터넷에서 묵을 호텔을 찾았습니다",
+            "샌프란시스코에 도착했습니다",
+            "반납했습니다",
+            "Where are we going?",
+            "Please board the train.",
+            "We arrived at the museum.",
+            "We're taking the train to the airport.",
+            "We're transferring photos over Wi-Fi.",
+            "We're making a connection over Wi-Fi.",
+            "We arrived in San Francisco.",
+        ]
+
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertIsNone(_journey_transition_signal(text))
+
+    def test_mid_clip_transition_survives_max_one_and_records_policy(self) -> None:
+        clip = _clip("mid-clip-transition", duration=60.0)
+        cues = [
+            TranscriptCue(1.0, 4.0, "공항 맛집이 대박! 가족 여행이 정말 재미있어요"),
+            TranscriptCue(30.0, 33.0, "할머니, 할아버지 태우고 이제 공항으로 갑니다"),
+        ]
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["project"]["name"] = "journey-transition-test"
+        config["analysis"]["max_candidates_per_clip"] = 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            with (
+                patch("video_summary.candidates.load_transcript", return_value=cues),
+                patch("video_summary.candidates.analyze_visual_signals", return_value=[]),
+                patch("video_summary.candidates.extract_frame"),
+            ):
+                payload = build_candidates(paths, [clip], config)
+
+        transitions = [
+            candidate
+            for candidate in payload["candidates"]
+            if "transition" in candidate["roles"]
+        ]
+        self.assertEqual(
+            payload["policy_versions"]["journey_transition"],
+            JOURNEY_TRANSITION_POLICY_VERSION,
+        )
+        self.assertGreater(payload["count"], 1)
+        self.assertEqual(len(transitions), 1)
+        self.assertGreater(transitions[0]["start"], 20.0)
+        self.assertEqual(transitions[0]["roles"][:2], ["transition", "journey"])
+        self.assertGreaterEqual(transitions[0]["score"], 0.7)
+
+    def test_family_pickup_transition_includes_adjacent_airport_direction(self) -> None:
+        clip = _clip(
+            "clip_dbcb8447ef93c8ac",
+            duration=8.959,
+            captured_at="2025-02-02T17:29:00+09:00",
+        )
+        cues = [
+            TranscriptCue(0.0, 2.0, "잘가."),
+            TranscriptCue(2.0, 4.0, "할머니, 할아버지 태우고"),
+            TranscriptCue(4.0, 6.0, "잘가."),
+            TranscriptCue(6.0, 8.0, "인창공항으로 갑니다."),
+        ]
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["project"]["name"] = "family-pickup-direction-test"
+        config["analysis"]["max_candidates_per_clip"] = 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            with (
+                patch("video_summary.candidates.load_transcript", return_value=cues),
+                patch("video_summary.candidates.analyze_visual_signals", return_value=[]),
+                patch("video_summary.candidates.extract_frame"),
+            ):
+                payload = build_candidates(paths, [clip], config)
+
+        transitions = [
+            candidate
+            for candidate in payload["candidates"]
+            if "transition" in candidate["roles"]
+        ]
+        self.assertEqual(len(transitions), 1)
+        self.assertIn("할머니, 할아버지 태우고", transitions[0]["transcript"])
+        self.assertIn("인창공항으로 갑니다", transitions[0]["transcript"])
+        self.assertGreaterEqual(transitions[0]["end"], 8.0)
+        self.assertLessEqual(transitions[0]["duration"], 8.0)
+        ordered = sorted(payload["candidates"], key=lambda item: item["start"])
+        self.assertTrue(
+            all(left["end"] <= right["start"] for left, right in zip(ordered, ordered[1:]))
+        )
+
+    def test_party_transition_direction_context_requires_a_concrete_waypoint(self) -> None:
+        positives = [
+            "인천공항으로 갑니다",
+            "삿포로로 갑니다",
+            "We are headed to the airport.",
+            "We're headed to New York.",
+        ]
+        negatives = [
+            "공항으로 가나요?",
+            "공항으로 가세요",
+            "식당으로 갑니다",
+            "오도리 공원으로 갑니다",
+            "좋은 곳으로 갑니다",
+            "We are going to dinner.",
+            "We're heading to the museum.",
+            "We're heading to bed.",
+        ]
+
+        for text in positives:
+            with self.subTest(text=text):
+                self.assertTrue(_journey_direction_destination(text))
+        for text in negatives:
+            with self.subTest(text=text):
+                self.assertFalse(_journey_direction_destination(text))
+
+    def test_party_transition_does_not_extend_through_generic_destination_chatter(self) -> None:
+        clip = _clip("party-generic-destination", duration=12.0)
+        windows = _detect_journey_transition_windows(
+            clip,
+            [
+                TranscriptCue(2.0, 4.0, "부모님을 픽업했습니다"),
+                TranscriptCue(4.0, 6.0, "오늘도 신나네요"),
+                TranscriptCue(6.0, 8.0, "식당으로 갑니다"),
+            ],
+        )
+
+        self.assertEqual(len(windows), 1)
+        self.assertLess(windows[0][1], 6.0)
+
+    def test_english_party_pickup_can_include_named_destination_direction(self) -> None:
+        windows = _detect_journey_transition_windows(
+            _clip("english-party-destination", duration=12.0),
+            [
+                TranscriptCue(1.0, 3.0, "We picked up our family."),
+                TranscriptCue(3.0, 5.0, "Everyone is ready."),
+                TranscriptCue(5.0, 7.0, "We're headed to New York."),
+            ],
+        )
+
+        self.assertEqual(len(windows), 1)
+        self.assertGreaterEqual(windows[0][1], 7.0)
+
+    def test_transition_boundaries_keep_mandatory_padding_compact(self) -> None:
+        windows = _merge_overlapping_windows(
+            [
+                (0.0, 30.0, "speech"),
+                (13.25, 17.75, "transition"),
+            ]
+        )
+
+        self.assertEqual(
+            windows,
+            [
+                (0.0, 13.25, "speech"),
+                (13.25, 17.75, "transition"),
+                (17.75, 30.0, "speech"),
+            ],
+        )
+        transition_duration = sum(
+            end - start
+            for start, end, origin in windows
+            if origin == "transition"
+        )
+        self.assertEqual(transition_duration, 4.5)
+        self.assertEqual(sum(end - start for start, end, _ in windows), 30.0)
+        self.assertTrue(
+            all(left[1] <= right[0] for left, right in zip(windows, windows[1:]))
+        )
+
+    def test_transition_boundary_absorbs_a_tiny_ordinary_sliver(self) -> None:
+        windows = _merge_overlapping_windows(
+            [
+                (0.0, 6.0, "speech"),
+                (0.2, 2.7, "transition"),
+            ]
+        )
+
+        self.assertEqual(
+            windows,
+            [
+                (0.0, 2.7, "transition"),
+                (2.7, 6.0, "speech"),
+            ],
+        )
+        self.assertAlmostEqual(2.7 - 2.5, 0.2)
+        self.assertEqual(sum(end - start for start, end, _ in windows), 6.0)
+        self.assertTrue(all(end - start >= 0.75 for start, end, _ in windows))
+
+    def test_repeated_nearby_transition_subtype_is_deduplicated(self) -> None:
+        for index, transport_phrase in enumerate(("트램을", "택시를")):
+            transport = transport_phrase[:-1]
+            with self.subTest(transport=transport):
+                windows = _detect_journey_transition_windows(
+                    _clip(f"repeated-transport-{index}", duration=60.0),
+                    [
+                        TranscriptCue(20.0, 21.0, f"{transport_phrase} 탔습니다"),
+                        TranscriptCue(30.0, 31.0, f"{transport_phrase} 탔어요"),
+                    ],
+                )
+
+                self.assertEqual(len(windows), 1)
+                self.assertEqual(windows[0][2], "transition")
+
+    def test_distant_same_transition_subtype_is_not_deduplicated(self) -> None:
+        windows = _detect_journey_transition_windows(
+            _clip("distant-tram-boardings", duration=150.0),
+            [
+                TranscriptCue(20.0, 21.0, "트램을 탔습니다"),
+                TranscriptCue(100.0, 101.0, "트램을 탔어요"),
+            ],
+        )
+
+        self.assertEqual(len(windows), 2)
+        self.assertTrue(all(origin == "transition" for _, _, origin in windows))
+
+    def test_customs_destination_arrival_can_span_adjacent_cues(self) -> None:
+        windows = _detect_journey_transition_windows(
+            _clip("customs-arrival", duration=20.0),
+            [
+                TranscriptCue(1.0, 3.5, "샌프란시스코에 도착했습니다"),
+                TranscriptCue(3.5, 5.5, "무사히 세관도 통과하고"),
+            ],
+        )
+
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0][2], "transition")
+
+    def test_interview_and_transition_merge_into_disjoint_dual_role_candidate(self) -> None:
+        clip = _clip("interview-transition", duration=60.0)
+        cues = [
+            TranscriptCue(20.0, 22.0, "이번 여행 어땠나요?"),
+            TranscriptCue(
+                22.2,
+                27.0,
+                "할머니 할아버지 태우고 공항으로 가는 길이 정말 좋았어요",
+            ),
+        ]
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["project"]["name"] = "interview-transition-test"
+        config["editing"]["preserve_family_interviews"] = True
+        config["analysis"]["max_candidates_per_clip"] = 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            with (
+                patch("video_summary.candidates.load_transcript", return_value=cues),
+                patch("video_summary.candidates.analyze_visual_signals", return_value=[]),
+                patch("video_summary.candidates.extract_frame"),
+            ):
+                payload = build_candidates(paths, [clip], config)
+
+        event = payload["required_events"][0]
+        event_candidates = [
+            candidate
+            for candidate in payload["candidates"]
+            if event["event_id"] in candidate["required_event_ids"]
+        ]
+        self.assertTrue(
+            any(
+                {"interview", "transition", "journey"}.issubset(candidate["roles"])
+                for candidate in event_candidates
+            )
+        )
+        ordered = sorted(payload["candidates"], key=lambda item: item["start"])
+        self.assertTrue(
+            all(left["end"] <= right["start"] for left, right in zip(ordered, ordered[1:]))
+        )
 
     def test_detects_korean_and_english_review_qa(self) -> None:
         korean = _detect_interview_events(
@@ -365,7 +980,7 @@ class CandidateCoverageTests(unittest.TestCase):
             ):
                 payload = build_candidates(paths, [clip], config)
 
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
         self.assertEqual(len(payload["required_events"]), 1)
         event = payload["required_events"][0]
         tagged = [

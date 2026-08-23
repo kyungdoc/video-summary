@@ -34,11 +34,342 @@ SCENERY_WORDS = {
     "beach", "mountain", "sunset", "view", "street", "market", "pool",
 }
 MAX_CANDIDATE_DURATION_SECONDS = 18.0
+JOURNEY_TRANSITION_POLICY_VERSION = 1
+JOURNEY_TRANSITION_DEDUPE_SECONDS = 60.0
+PARTY_TRANSITION_CONTEXT_POLICY_VERSION = 1
+PARTY_TRANSITION_CONTEXT_MAX_SECONDS = 12.0
+PARTY_TRANSITION_CONTEXT_MAX_CUES = 3
+MEAL_EVENT_POLICY_VERSION = 1
+MEAL_OPTION_MAX_DURATION_SECONDS = 12.0
+MEAL_SETUP_CLUSTER_SECONDS = 45.0 * 60.0
+MEAL_SETUP_HORIZON_SECONDS = 3.0 * 60.0 * 60.0
+MEAL_DIRECT_CLUSTER_SECONDS = 30.0 * 60.0
+MEAL_INFER_AFTER_SETUP_SECONDS = 60.0 * 60.0
+MEAL_INFER_BEFORE_CLOSURE_SECONDS = 15.0 * 60.0
 INTERVIEW_DETECTION_POLICY_VERSION = 3
 INTERVIEW_ANSWER_WAIT_SECONDS = 15.0
 INTERVIEW_CONTINUATION_GAP_SECONDS = 12.0
 INTERVIEW_EVENT_MAX_SPAN_SECONDS = 180.0
 INTERVIEW_CONTEXT_EVENT_MAX_DISTANCE_SECONDS = 90.0
+
+
+_KO_TRAVEL_PARTY = (
+    r"(?:\ud560\uba38\ub2c8|\ud560\uc544\ubc84\uc9c0|\uc870\ubd80\ubaa8\ub2d8|\ubd80\ubaa8\ub2d8|\uc5c4\ub9c8|\uc544\ube60|\uc5b4\uba38\ub2c8|\uc544\ubc84\uc9c0|\uac00\uc871|\uc2dd\uad6c|\uc77c\ud589|"
+    r"\uce5c\uad6c\ub4e4?|\uc544\uc774\ub4e4?|\uc560\ub4e4|\ub3d9\uc0dd|\ud615|\ub204\ub098|\uc5b8\ub2c8|\uc624\ube60|\uc0bc\ucd0c|\uc774\ubaa8|\uace0\ubaa8|\uc678\uc0bc\ucd0c)"
+)
+_EN_TRAVEL_PARTY = (
+    r"(?:family|parents?|grandparents?|grandm(?:a|other)|grandp(?:a|father)|mom|mum|mother|"
+    r"dad|father|friends?|kids?|children|brother|sister|party|group)"
+)
+_KO_TRANSIT_PLACE = (
+    r"(?:\uacf5\ud56d|\uae30\ucc28\uc5ed|\uc804\ucca0\uc5ed|\uc9c0\ud558\ucca0\uc5ed|"
+    r"(?:[^\s,，.]{1,12})(?<![\uc9c0\uad6c\uc601])\uc5ed|(?<![\uac00-\ud7a3])\uc5ed|\ubc84\uc2a4\s*\ud130\ubbf8\ub110|\ud130\ubbf8\ub110|"
+    r"\ud638\ud154|\uc219\uc18c|\ub9ac\uc870\ud2b8|\ud39c\uc158|\uac8c\uc2a4\ud2b8\ud558\uc6b0\uc2a4|\uc5d0\uc5b4\ube44\uc564\ube44)"
+)
+_EN_TRANSIT_PLACE = (
+    r"(?:airport|(?:train|railway|subway|bus)\s+station|station|terminal|hotel|resort|hostel|"
+    r"guest\s*house|airbnb|lodging|accommodation)"
+)
+_KO_TRANSPORT = r"(?:\ube44\ud589\uae30|\ud56d\uacf5\uae30|\uae30\ucc28|\uc5f4\ucc28|\ubc84\uc2a4|\ud0dd\uc2dc|\ud398\ub9ac|\ubc30|\uc9c0\ud558\ucca0|\uc804\ucca0|\ubaa8\ub178\ub808\uc77c|\ud2b8\ub7a8)"
+_EN_TRANSPORT = r"(?:flight|plane|aircraft|train|bus|taxi|ferry|boat|subway|metro|monorail|tram)"
+
+_JOURNEY_TRANSITION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "ko_party_pickup_dropoff_join",
+        re.compile(
+            rf"{_KO_TRAVEL_PARTY}.{{0,36}}?"
+            r"(?:\ud0dc\uc6b0(?:\uace0|\ub7ec|\ub824\uace0|\uba74\uc11c|\uc5c8|\uc558|\uaca0)|\ud53d\uc5c5(?:\ud558|\ud574|\ud588)|\ub370\ub9ac(?:\uace0|\ub7ec)|\ubaa8\uc2dc(?:\uace0|\ub7ec)|"
+            r"\ud569\ub958(?:\ud588|\ud574\uc11c|\ud558\uace0|\ud558\ub7ec|\ud569\ub2c8\ub2e4)|\ub9cc\ub098\uc11c\s*(?:\ud568\uaed8|\uac19\uc774)|"
+            r"\ub0b4\ub824\s*\ub4dc\ub9ac|\ubaa8\uc154\ub2e4\s*\ub4dc\ub9ac|\ubc14\ub798\ub2e4\s*\ub4dc\ub9ac|\ub370\ub824\ub2e4\s*\uc8fc|\ub4dc\ub86d\s*\uc624\ud504)"
+            rf"|(?:\ud53d\uc5c5(?:\ud558|\ud574|\ud588)|\ub370\ub9ac(?:\uace0|\ub7ec)|\ubaa8\uc2dc(?:\uace0|\ub7ec)|\ud569\ub958(?:\ud588|\ud574\uc11c|\ud558\uace0))"
+            rf".{{0,28}}?{_KO_TRAVEL_PARTY}"
+        ),
+    ),
+    (
+        "en_party_pickup_dropoff_join",
+        re.compile(
+            rf"(?:pick(?:ed|ing)?\s+up|drop(?:ped|ping)?\s+off|collect(?:ed|ing)?|"
+            rf"meet(?:ing)?\s+up\s+with|met\s+up\s+with|join(?:ed|ing)?(?:\s+up)?\s+with)"
+            rf"\s+(?:(?:my|our|the)\s+)?{_EN_TRAVEL_PARTY}"
+            rf"|(?:drop(?:ped|ping)?|pick(?:ed|ing)?)\s+(?:(?:my|our|the)\s+)?"
+            rf"{_EN_TRAVEL_PARTY}\s+(?:off|up)"
+            rf"|join(?:ed|ing)\s+(?:(?:my|our|the)\s+)?{_EN_TRAVEL_PARTY}"
+            rf"|{_EN_TRAVEL_PARTY}.{{0,20}}?(?:joined|met)\s+(?:us|me)"
+        ),
+    ),
+    (
+        "ko_transfer_stopover",
+        re.compile(
+            r"(?:\ud658\uc2b9(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\uace0|\ud574\uc11c|\ud558\ub7ec|\s*\uc911\uc785\ub2c8\ub2e4)|"
+            r"\uacbd\uc720(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\uace0|\ud574\uc11c|\s*\uc911\uc785\ub2c8\ub2e4)|"
+            r"\uae30\ucc29(?:\ud588|\ud569\ub2c8\ub2e4)|\uac08\uc544\ud0d4|\uac08\uc544\ud0c0\uace0|\uac08\uc544\ud0c0\ub7ec|\uac08\uc544\ud0d1\ub2c8\ub2e4)"
+        ),
+    ),
+    (
+        "en_transfer_stopover",
+        re.compile(
+            rf"\b(?:we(?:'re|\s+are|\s+just)?\s+)?transferr(?:ed|ing)\s+"
+            rf"(?:(?:to|between|from)\s+(?:(?:another|the|our|a)\s+)?{_EN_TRANSPORT}"
+            rf"|(?:at|in|through)\s+(?:(?:the|our)\s+)?{_EN_TRANSIT_PLACE})\b"
+            r"|\b(?:we(?:'re|\s+are|\s+just)?\s+)?chang(?:ed|ing)\s+(?:trains?|flights?)\b"
+            r"|\b(?:we(?:'re|\s+are|\s+just)?\s+)?stopp(?:ed|ing)\s+over\b"
+            rf"|\bmak(?:e|ing)\s+(?:a\s+)?connection.{{0,24}}?{_EN_TRANSIT_PLACE}\b"
+            rf"|\bconnect(?:ed|ing)\s+through\s+(?:(?:the|our)\s+)?{_EN_TRANSIT_PLACE}\b"
+            r"|\b(?:we\s+(?:have|had)|we've|our|the)\s+(?:a\s+)?(?:layover|stopover)\b"
+        ),
+    ),
+    (
+        "ko_rental_pickup_return",
+        re.compile(
+            r"(?:\ub80c\ud130\uce74|\ub80c\ud2b8\uce74|\ub300\uc5ec\ucc28).{0,28}?"
+            r"(?:\uc778\uc218(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\ub7ec)|\ud53d\uc5c5(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\ub7ec)|\ucc3e\uc73c\ub7ec|\ubc1b\uc558|"
+            r"\ubc18\ub0a9(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\ub7ec)|\ub3cc\ub824\uc8fc\ub7ec|\ub3cc\ub824\uc92c)"
+            r"|(?:\uc778\uc218(?:\ud588|\ud558\ub7ec)|\ud53d\uc5c5(?:\ud588|\ud558\ub7ec)|\ubc18\ub0a9(?:\ud588|\ud558\ub7ec)|\ub3cc\ub824\uc8fc\ub7ec)"
+            r".{0,24}?(?:\ub80c\ud130\uce74|\ub80c\ud2b8\uce74|\ub300\uc5ec\ucc28)"
+            r"|(?:\ub80c\ud130\uce74|\ub80c\ud2b8\uce74)\ub7ec\s*\uac11\ub2c8\ub2e4"
+        ),
+    ),
+    (
+        "en_rental_pickup_return",
+        re.compile(
+            r"\b(?:pick(?:ed|ing)?\s+up|collect(?:ed|ing)?|return(?:ed|ing)?)\s+"
+            r"(?:(?:the|our|a)\s+)?rental\s+car\b"
+            r"|\brental\s+car.{0,20}\b(?:pick(?:ed|ing)?\s+up|collect(?:ed|ing)?|return(?:ed|ing)?)\b"
+        ),
+    ),
+    (
+        "ko_lodging_reveal",
+        re.compile(
+            r"(?:\uc5ec\uae30\uac00|\uc5ec\uae30\ub294|\uc774\uacf3\uc774)\s*(?:\ubc14\ub85c\s*)?(?:\uc6b0\ub9ac(?:\uc758)?\s*)?"
+            r"(?:\ud638\ud154\s*\ubc29|\uc219\uc18c|\ub9ac\uc870\ud2b8|\ud39c\uc158|\uac8c\uc2a4\ud2b8\ud558\uc6b0\uc2a4)(?:\uc785\ub2c8\ub2e4|\uc774\uc5d0\uc694|\uc608\uc694)"
+            r"|(?:\uc6b0\ub9ac(?:\uc758)?\s+)(?:\ud638\ud154\s*\ubc29|\uc219\uc18c)(?:\uc785\ub2c8\ub2e4|\uc774\uc5d0\uc694|\uc608\uc694)"
+            r"|(?:[0-9a-z\uac00-\ud7a3'’\-]{2,20}\s+){1,3}"
+            r"(?:\ud638\ud154|\ub9ac\uc870\ud2b8|\ud39c\uc158|\uac8c\uc2a4\ud2b8\ud558\uc6b0\uc2a4)(?:\uc744|\ub97c)\s*\ucc3e\uc558\uc2b5\ub2c8\ub2e4"
+        ),
+    ),
+    (
+        "ko_lodging_checkin_checkout",
+        re.compile(
+            r"(?:\ud638\ud154|\uc219\uc18c|\ub9ac\uc870\ud2b8|\ud39c\uc158|\uac8c\uc2a4\ud2b8\ud558\uc6b0\uc2a4|\uc5d0\uc5b4\ube44\uc564\ube44).{0,28}?"
+            r"\uccb4\ud06c\s*(?:\uc778|\uc544\uc6c3)(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\uace0|\ud574\uc11c|\ud558\ub7ec|\s*\uc911\uc785\ub2c8\ub2e4|\uc744?\s*\ub9c8\uce58|\uc744?\s*\ub9c8\ucce4)"
+            r"|\uccb4\ud06c\s*(?:\uc778|\uc544\uc6c3)(?:\ud588|\ud558\uace0|\ud574\uc11c|\ud558\ub7ec|\uc744?\s*\ub9c8\uce58|\uc744?\s*\ub9c8\ucce4).{0,24}?"
+            r"(?:\ud638\ud154|\uc219\uc18c|\ub9ac\uc870\ud2b8|\ud39c\uc158|\uac8c\uc2a4\ud2b8\ud558\uc6b0\uc2a4|\uc5d0\uc5b4\ube44\uc564\ube44)"
+        ),
+    ),
+    (
+        "en_lodging_checkin_checkout",
+        re.compile(
+            rf"\b(?:checked|checking)\s+(?:in(?:to|\s+at)?|out(?:\s+of)?)\b.{{0,28}}?{_EN_TRANSIT_PLACE}\b"
+            rf"|\b{_EN_TRANSIT_PLACE}\b.{{0,28}}?\b(?:checked|checking)\s+(?:in|out)\b"
+        ),
+    ),
+    (
+        "ko_customs_destination_arrival",
+        re.compile(
+            r"(?:[0-9a-z\uac00-\ud7a3'’\-]{2,24}(?:\s+[0-9a-z\uac00-\ud7a3'’\-]{2,24}){0,3})"
+            r"(?:\uc5d0|\uc73c\ub85c)?\s*\ub3c4\ucc29(?:\ud588|\ud569\ub2c8\ub2e4|\ud588\uc5b4\uc694|\ud569\ub2c8\ub2e4)"
+            r".{0,60}?(?:\uc138\uad00|\uc785\uad6d\s*\uc2ec\uc0ac).{0,14}?(?:\ud1b5\uacfc(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\uace0)|\ub9c8\ucce4\uc2b5\ub2c8\ub2e4)"
+            r"|(?:\uc138\uad00|\uc785\uad6d\s*\uc2ec\uc0ac).{0,14}?(?:\ud1b5\uacfc(?:\ud588|\ud569\ub2c8\ub2e4|\ud558\uace0)|\ub9c8\ucce4\uc2b5\ub2c8\ub2e4)"
+            r".{0,60}?(?:[0-9a-z\uac00-\ud7a3'’\-]{2,24}(?:\s+[0-9a-z\uac00-\ud7a3'’\-]{2,24}){0,3})"
+            r"(?:\uc5d0|\uc73c\ub85c)?\s*\ub3c4\ucc29(?:\ud588|\ud569\ub2c8\ub2e4|\ud588\uc5b4\uc694|\ud569\ub2c8\ub2e4)"
+        ),
+    ),
+    (
+        "en_customs_destination_arrival",
+        re.compile(
+            r"\barrived\s+(?:in|at)\s+(?:[a-z][a-z'’\-]{1,24})(?:\s+[a-z][a-z'’\-]{1,24}){0,3}"
+            r".{0,60}?\b(?:cleared|passed|went\s+through|finished)\s+(?:customs|immigration)\b"
+            r"|\b(?:cleared|passed|went\s+through|finished)\s+(?:customs|immigration)\b"
+            r".{0,60}?\barrived\s+(?:in|at)\s+(?:[a-z][a-z'’\-]{1,24})(?:\s+[a-z][a-z'’\-]{1,24}){0,3}"
+        ),
+    ),
+    (
+        "ko_transit_arrival_departure",
+        re.compile(
+            rf"{_KO_TRANSIT_PLACE}(?:\uc5d0|\uc73c\ub85c|\uc5d0\uc11c|\uc744|\ub97c)?\s*.{{0,12}}?"
+            r"(?:\ub3c4\ucc29(?:\ud588|\ud569\ub2c8\ub2e4|\ud588\uc5b4\uc694|\ud569\ub2c8\ub2e4)|\uc654\uc2b5\ub2c8\ub2e4|\uc654\uc5b4\uc694|"
+            r"\ucd9c\ubc1c(?:\ud588|\ud569\ub2c8\ub2e4|\ud588\uc5b4\uc694)|\ub5a0\ub0ac|\ub5a0\ub0a9\ub2c8\ub2e4|\ub098\uc654|\ub098\uc635\ub2c8\ub2e4|"
+            r"\ub0b4\ub838\uc2b5\ub2c8\ub2e4|\ub0b4\ub838\uc5b4\uc694)"
+        ),
+    ),
+    (
+        "en_transit_arrival_departure",
+        re.compile(
+            rf"\b(?:we(?:'ve|\s+have|\s+just)?|i(?:'ve|\s+have|\s+just)?)?\s*"
+            rf"(?:arrived|made\s+it|got)\s+(?:at|to)\s+(?:(?:the|our)\s+)?{_EN_TRANSIT_PLACE}\b"
+            rf"|\b(?:we(?:'re|\s+are|\s+just)?|i(?:'m|\s+am|\s+just)?)?\s*"
+            rf"(?:left|leaving|departed\s+from|departing\s+from)\s+(?:(?:the|our)\s+)?{_EN_TRANSIT_PLACE}\b"
+        ),
+    ),
+    (
+        "ko_transport_boarding_alighting",
+        re.compile(
+            rf"{_KO_TRANSPORT}(?:\uc744|\ub97c|\uc5d0|\uc5d0\uc11c)?\s*.{{0,12}}?"
+            r"(?:\ud0d4\uc2b5\ub2c8\ub2e4|\ud0d4\uc5b4\uc694|\ud0d1\ub2c8\ub2e4|\ud0d1\uc2b9\ud588\uc2b5\ub2c8\ub2e4|\ud0d1\uc2b9\ud569\ub2c8\ub2e4|\uc62c\ub77c\ud0d4|"
+            r"\ud0c0\ub7ec\s*\uac11\ub2c8\ub2e4|\ub0b4\ub838\uc2b5\ub2c8\ub2e4|\ub0b4\ub838\uc5b4\uc694|\ub0b4\ub824\uc11c|\ub0b4\ub9ac\uace0|\ud558\ucc28\ud588\uc2b5\ub2c8\ub2e4|\ud558\ucc28\ud569\ub2c8\ub2e4)"
+        ),
+    ),
+    (
+        "en_transport_boarding_alighting",
+        re.compile(
+            rf"\b(?:we(?:'re|\s+are|\s+just|\s+have)?|i(?:'m|\s+am|\s+just|\s+have)?)?\s*"
+            rf"(?:boarded|boarding|got\s+on|getting\s+on|caught|took|got\s+off|getting\s+off|"
+            rf"got\s+out\s+of|getting\s+out\s+of|stepped\s+off)"
+            rf"\s+(?:(?:the|a|our)\s+)?{_EN_TRANSPORT}\b"
+        ),
+    ),
+)
+
+_JOURNEY_TRANSITION_QUESTION_PATTERN = re.compile(
+    r"[?？]|(?:\uc5b4\ub514|\uc5b8\uc81c|\ub204\uad6c|\ubb50|\ubb34\uc5c7|\uc5b4\ub290).{0,30}?(?:\uac00|\uc624|\ub3c4\ucc29|\ucd9c\ubc1c|\ud0c0|\ub0b4\ub9ac)"
+    r"|^\s*(?:where|when|who|what|which|how|are|is|do|did|should|shall|can|could|will|would)\b"
+)
+_JOURNEY_TRANSITION_INSTRUCTION_PATTERN = re.compile(
+    r"(?:\uc548\ub0b4|\ubc29\uc1a1|\uc2b9\uac1d|\uace0\uac1d|\ud0d1\uc2b9\uac1d|\uc8fc\uc758\s*\ubc14\ub78d\ub2c8\ub2e4|\ud558\uc2dc\uae30\s*\ubc14\ub78d\ub2c8\ub2e4|"
+    r"\ud574\s*\uc8fc\uc138\uc694|\ud574\uc8fc\uc138\uc694|\ud558\uc138\uc694|\ud558\uc2ed\uc2dc\uc624|\ud0c0\uc138\uc694|\ub0b4\ub9ac\uc138\uc694|\uac00\uc138\uc694|\uc624\uc138\uc694)"
+    r"|\b(?:please|attention|passengers?|customers?|announcement)\b"
+)
+_GENERIC_JOURNEY_COMMAND_PATTERN = re.compile(
+    r"^(?:\uc790\s*[,，]?\s*|\uc774\uc81c\s*)?(?:\uac00\uc790|\uac11\uc2dc\ub2e4|\ucd9c\ubc1c|\ucd9c\ubc1c\ud558\uc790)[\s.!~]*$"
+    r"|^(?:let['’]?s\s+go|time\s+to\s+go)[\s.!]*$"
+    r"|^(?:please\s+)?(?:board|take|get\s+on|get\s+off|check\s+(?:in|out)|return|pick\s+up|drop\s+off|join)\b"
+)
+_NON_LODGING_ASR_PATTERN = re.compile(
+    r"(?:\ub3d9\ud0a4\s*\ud638\ud154|\ub3d9\ud0a4\ud638\ud14c|\ub3c8\ud0a4\s*\ud638\ud154|\ub3c8\ud0a4\s*\ud638\ud14c|\ub3c8\ud0a4\ud638\ud14c).{0,24}?"
+    r"(?:\uc654|\ub3c4\ucc29|\ucc3e\uc558|\ubc29\uc785\ub2c8\ub2e4|\uc219\uc18c\uc785\ub2c8\ub2e4)"
+)
+_GENERIC_LODGING_SEARCH_PATTERN = re.compile(
+    r"(?:\uc88b\uc740|\uad1c\ucc2e\uc740|\uc608\uc05c|\uc800\ub834\ud55c|\uc0c8\ub85c\uc6b4|\ub2e4\ub978|\ubb35\uc744|\uc608\uc57d\ud560|\uac80\uc0c9\ud55c)\s*"
+    r"(?:\ud638\ud154|\ub9ac\uc870\ud2b8|\ud39c\uc158|\uac8c\uc2a4\ud2b8\ud558\uc6b0\uc2a4)(?:\uc744|\ub97c)\s*\ucc3e\uc558"
+    r"|(?:\uc778\ud130\ub137|\uac80\uc0c9|\uc608\uc57d|\ud6c4\uae30).{0,24}?"
+    r"(?:\ud638\ud154|\ub9ac\uc870\ud2b8|\ud39c\uc158|\uac8c\uc2a4\ud2b8\ud558\uc6b0\uc2a4).{0,14}?\ucc3e\uc558"
+)
+
+_KO_TRANSIT_DIRECTION_PATTERN = re.compile(
+    rf"{_KO_TRANSIT_PLACE}(?:으로|로|에|까지)?\s*"
+    r"(?:갑니다|가요|향합니다|향해\s*갑니다|이동합니다|"
+    r"가는\s*길(?:입니다|이에요)|가고\s*있습니다)\s*[.!~]*$"
+)
+_KO_NAMED_DIRECTION_PATTERN = re.compile(
+    r"(?P<destination>[0-9a-z가-힣'’\-]{2,24}(?:\s+[0-9a-z가-힣'’\-]{2,24}){0,2}?)"
+    r"(?:으로|로|에|까지)\s*"
+    r"(?:갑니다|가요|향합니다|향해\s*갑니다|이동합니다|"
+    r"가는\s*길(?:입니다|이에요)|가고\s*있습니다)\s*[.!~]*$"
+)
+_KO_NON_WAYPOINT_DIRECTION_PATTERN = re.compile(
+    r"(?:거기|저기|여기|어디|어딘가|다음|곳|장소|목적지|여행지|밖|안|앞|뒤|"
+    r"식당|맛집|카페|공원|박물관|"
+    r"시장|해변|관광지|동물원|쇼핑몰|마트|병원|화장실|주차장|식사|아침|점심|저녁|"
+    r"맛있는\s*곳|집|댓|회사|학교|놀이터)"
+)
+_EN_DIRECTION_PREFIX = (
+    r"(?:(?:we|i)(?:'re|'m|\s+are|\s+am)?\s+)?"
+    r"(?:going|heading|headed|traveling|travelling|driving|moving|on\s+our\s+way)"
+    r"\s+(?:to|towards?)\s+(?:(?:the|our)\s+)?"
+)
+_EN_TRANSIT_DIRECTION_PATTERN = re.compile(
+    rf"\b{_EN_DIRECTION_PREFIX}{_EN_TRANSIT_PLACE}"
+    r"(?:\s+(?:now|today))?\s*[.!~]*$"
+)
+_EN_NAMED_DIRECTION_PATTERN = re.compile(
+    rf"\b{_EN_DIRECTION_PREFIX}"
+    r"(?P<destination>[a-z][a-z'’\-]{1,24}(?:\s+[a-z][a-z'’\-]{1,24}){0,3})"
+    r"\s*[.!~]*$"
+)
+_EN_NON_WAYPOINT_DIRECTION_PATTERN = re.compile(
+    r"\b(?:there|here|somewhere|anywhere|next|place|destination|outside|inside|bed|work|"
+    r"dinner|breakfast|lunch|"
+    r"restaurant|diner|cafe|park|museum|beach|market|mall|zoo|bathroom|parking|"
+    r"home|house|office|school|store|shop|attraction|playground)\b"
+)
+
+_MEAL_SETUP_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "meal_setup_departure",
+        re.compile(
+            r"(?:밥|아침|점심|저녁|음식|라멘|라면|초밥|스시|고기|피자).{0,18}?"
+            r"(?:먹으러|먹으로).{0,18}?(?:갑니다|가요|가자|갑시다|갈\s*거예요)"
+            r"|\b(?:going|heading)\s+(?:out\s+)?(?:to\s+eat|for\s+(?:breakfast|lunch|dinner|food))\b"
+        ),
+    ),
+    (
+        "restaurant_arrival",
+        re.compile(
+            r"(?:식당|밥\s*집|밥집|맛집|레스토랑).{0,20}?(?:왔습니다|왔어요|도착했습니다|도착했어요)"
+            r"|(?:왔습니다|왔어요|도착했습니다|도착했어요).{0,20}?(?:식당|밥\s*집|밥집|맛집|레스토랑)"
+            r"|\b(?:arrived|made\s+it|we(?:'re|\s+are)\s+here)\b.{0,24}\b(?:restaurant|diner|cafe)\b"
+        ),
+    ),
+)
+
+_MEAL_CLOSURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "meal_closure_exit",
+        re.compile(
+            r"(?:밥|아침|점심|저녁|음식)?\s*먹고\s*(?:왔|나왔|돌아왔)"
+            r"|(?:맛있게|다)\s*먹고.{0,24}?(?:돌아|갑시다|나왔|왔)"
+            r"|\b(?:finished|done)\s+(?:eating|with\s+(?:breakfast|lunch|dinner))\b"
+            r"|\b(?:just\s+ate|came\s+out\s+of\s+the\s+restaurant)\b"
+        ),
+    ),
+    (
+        "meal_closure_thanks",
+        re.compile(r"잘\s*먹었습니다|잘\s*먹었어요|\bthanks?\s+for\s+the\s+(?:meal|food)\b"),
+    ),
+)
+
+_VIRTUAL_MEAL_CONTEXT_PATTERN = re.compile(
+    r"(?:책|동화|그림책|만화|이야기).{0,36}?(?:요리|음식|밥|먹|주먹밥|볶음밥)"
+    r"|(?:요리|음식|밥|먹|주먹밥|볶음밥).{0,36}?(?:책|동화|그림책|만화|이야기)"
+    r"|(?:고양이|친구들|가족들).{0,30}?(?:밥을\s*주|볶음밥을\s*먹네|다\s*같이\s*먹)"
+    r"|\b(?:storybook|cookbook|picture\s+book|cartoon).{0,40}\b(?:cook|food|eat)\b"
+)
+_MEAL_RETROSPECTIVE_OR_PLAN_PATTERN = re.compile(
+    r"(?:먹으러|먹으로|먹을\s*(?:거|예정)|먹고\s*(?:왔|나왔|돌아왔)|잘\s*먹었습니다|잘\s*먹었어요)"
+    r"|(?:어제|지난번|그때|예전에).{0,30}?(?:먹|맛있)"
+    r"|(?:먹었던|먹었었던|맛있었던)"
+    r"|\b(?:going\s+to\s+eat|plan(?:ning)?\s+to\s+eat|ate\s+yesterday|used\s+to\s+eat)\b"
+)
+_MEAL_SERVED_FOOD_PATTERN = re.compile(
+    r"(?:음식|요리|메뉴|피자|라멘|라면|초밥|스시|고기|빵|아이스크림|디저트|케이크|커피|주스)"
+    r"(?:이|가|은|는|도|을|를)?\s*(?:(?:드디어|이제|방금|다|먼저|막)\s*)?"
+    r"(?:나왔습니다|나왔어요|나왔네요|나왔어|받았습니다|받았어요|받았네요|"
+    r"차려졌습니다|차려졌어요|도착했습니다)"
+    r"|(?:나왔습니다|나왔어요|나왔네요|받았습니다|받았어요|차려졌습니다|"
+    r"차려졌어요).{0,12}?"
+    r"(?:음식|요리|메뉴|피자|라멘|라면|초밥|스시|고기|빵|아이스크림|디저트|케이크|커피|주스)"
+    r"|\b(?:food|meal|dish|pizza|ramen|sushi|ice\s*cream|dessert|cake|coffee)\b"
+    r".{0,24}?\b(?:arrived|was\s+served|is\s+here)\b"
+)
+_MEAL_ACTUAL_EATING_PATTERN = re.compile(
+    r"(?:먹고\s*있|먹는\s*중|먹어\s*볼|먹어\s*보|먹어봤|한\s*입|입에\s*넣|냠냠)"
+    r"|\b(?:we(?:'re|\s+are)|i(?:'m|\s+am))\s+(?:eating|having\s+(?:breakfast|lunch|dinner))\b"
+    r"|\b(?:take|taking|took)\s+(?:a\s+)?bite\b"
+)
+_MEAL_TASTING_PATTERN = re.compile(
+    r"(?:맛있어요|맛있네요|맛있습니다|진짜\s*맛있|엄청\s*맛있|너무\s*맛있|맛을\s*보)"
+    r"|\b(?:tastes?|is)\s+(?:really\s+|so\s+|very\s+)?(?:delicious|tasty|good)\b"
+)
+_MEAL_FOOD_REVEAL_PATTERN = re.compile(
+    r"(?:이거|이건|이게).{0,18}?(?:피자|라멘|라면|초밥|스시|고기|빵|아이스크림|디저트|케이크)(?:야|예요|이에요|입니다)"
+)
+_MEAL_FOOD_NOUN_PATTERN = re.compile(
+    r"(?:밥|식사|아침|점심|저녁|음식|요리|메뉴|피자|라멘|라면|초밥|스시|고기|빵|"
+    r"아이스크림|디저트|케이크|커피|주스)"
+    r"|\b(?:breakfast|lunch|dinner|food|meal|dish|pizza|ramen|sushi|ice\s*cream|dessert|cake|coffee|juice)\b"
+)
+_MEAL_PRESENT_CONTEXT_PATTERN = re.compile(
+    r"(?:이거|이건|이게|지금|여기|와|우와)"
+    r"|\b(?:this|these|here|right\s+now|wow)\b"
+)
+_MEAL_DESSERT_PATTERN = re.compile(
+    r"(?:아이스크림|디저트|케이크|빙수|도넛|과자)"
+    r"|\b(?:ice\s*cream|dessert|cake|donut|doughnut)\b"
+)
+_MEAL_DRINK_PATTERN = re.compile(
+    r"(?:커피|주스|음료|차를?\s*(?:마시|먹))"
+    r"|\b(?:coffee|juice|drink|tea)\b"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +381,43 @@ class _InterviewEvent:
     confidence: float
     signals: tuple[str, ...]
     anchor_event_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MealMarker:
+    signal: str
+    start: float
+    end: float
+
+
+@dataclass(frozen=True, slots=True)
+class _MealOption:
+    clip_id: str
+    start: float
+    end: float
+    confidence: float
+    signals: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MealEvent:
+    event_id: str
+    day_key: str
+    travel_day: int
+    subtype: str
+    confidence: float
+    signals: tuple[str, ...]
+    options: tuple[_MealOption, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MealEvidence:
+    clip: Clip
+    setup_markers: tuple[_MealMarker, ...]
+    closure_markers: tuple[_MealMarker, ...]
+    direct_options: tuple[_MealOption, ...]
+    subtype: str
+    virtual_context: bool
 
 
 _INTERVIEW_QUESTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -286,6 +654,7 @@ def build_candidates(
         candidates: list[Candidate] = []
         required_interview_events: list[tuple[Clip, _InterviewEvent]] = []
         preserve_family_interviews = _preserve_family_interviews(config)
+        preserve_meal_events = _preserve_meal_events(config)
         cues_by_clip = {
             clip.clip_id: load_transcript(paths, clip.clip_id)
             for clip in clips
@@ -296,6 +665,15 @@ def build_candidates(
             if preserve_family_interviews
             else {}
         )
+        meal_events = (
+            _detect_meal_events(clips, cues_by_clip)
+            if preserve_meal_events
+            else []
+        )
+        meal_options_by_clip: dict[str, list[tuple[_MealEvent, _MealOption]]] = defaultdict(list)
+        for meal_event in meal_events:
+            for option in meal_event.options:
+                meal_options_by_clip[option.clip_id].append((meal_event, option))
         for index, clip in enumerate(clips, start=1):
             if clip.duration <= 0:
                 continue
@@ -304,12 +682,19 @@ def build_candidates(
             signals = analyze_visual_signals(paths, clip, interval, force=force)
             interview_events = interview_events_by_clip.get(clip.clip_id, [])
             required_interview_events.extend((clip, event) for event in interview_events)
+            transition_windows = _detect_journey_transition_windows(clip, cues)
+            clip_meal_options = meal_options_by_clip.get(clip.clip_id, [])
             windows = _candidate_windows(
                 clip,
                 cues,
                 signals,
                 max_per_clip,
                 required_events=interview_events,
+                transition_windows=transition_windows,
+                meal_windows=[
+                    (option.start, option.end, "meal")
+                    for _, option in clip_meal_options
+                ],
             )
             for start, end, origin in windows:
                 text = _window_transcript(cues, start, end)
@@ -321,6 +706,13 @@ def build_candidates(
                 ]
                 if required_event_ids:
                     roles = unique_preserving_order(["interview", *roles])
+                required_meal_event_ids = unique_preserving_order(
+                    event.event_id
+                    for event, option in clip_meal_options
+                    if _ranges_overlap(start, end, option.start, option.end)
+                )
+                if required_meal_event_ids:
+                    roles = unique_preserving_order(["food", *roles])
                 motion, quality = _window_signals(signals, start, end)
                 speech_duration = sum(
                     max(0.0, min(cue.end, end) - max(cue.start, start))
@@ -365,17 +757,25 @@ def build_candidates(
                         location=location,
                         frame_path=str(frame_path.relative_to(paths.root)),
                         required_event_ids=required_event_ids,
+                        required_meal_event_ids=required_meal_event_ids,
                     )
                 )
 
         candidates.sort(key=lambda item: (_candidate_timestamp(item), item.candidate_id))
         if not candidates:
             raise VideoSummaryError("편집 후보를 만들지 못했습니다.")
-        required_events = _required_events_payload(required_interview_events, candidates)
+        required_events = [
+            *_required_events_payload(required_interview_events, candidates),
+            *_required_meal_events_payload(meal_events, candidates),
+        ]
         payload = {
-            "version": 2,
+            "version": 3,
             "project": config["project"]["name"],
             "cache_key": cache_key,
+            "policy_versions": {
+                "journey_transition": JOURNEY_TRANSITION_POLICY_VERSION,
+                "meal_event": MEAL_EVENT_POLICY_VERSION,
+            },
             "candidate_set_hash": stable_hash([candidate.to_dict() for candidate in candidates], length=32),
             "count": len(candidates),
             "days": _day_summary(candidates),
@@ -424,8 +824,16 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 11,
+            "version": 13,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
+            "journey_transition_detection": {
+                "policy": JOURNEY_TRANSITION_POLICY_VERSION,
+                "party_direction_context_policy": PARTY_TRANSITION_CONTEXT_POLICY_VERSION,
+            },
+            "meal_event_detection": {
+                "policy": MEAL_EVENT_POLICY_VERSION,
+                "preserve": _preserve_meal_events(config),
+            },
             "family_interview_detection": {
                 "policy": INTERVIEW_DETECTION_POLICY_VERSION,
                 "preserve": _preserve_family_interviews(config),
@@ -460,6 +868,604 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
 
 def _preserve_family_interviews(config: dict[str, Any]) -> bool:
     return config.get("editing", {}).get("preserve_family_interviews", True) is True
+
+
+def _preserve_meal_events(config: dict[str, Any]) -> bool:
+    return config.get("editing", {}).get("preserve_meal_events", True) is True
+
+
+def _detect_meal_events(
+    clips: list[Clip],
+    cues_by_clip: dict[str, list[TranscriptCue]],
+) -> list[_MealEvent]:
+    """Detect filmed meal bodies while leaving setup and closure narration optional."""
+    evidences = [
+        _meal_evidence(clip, cues_by_clip.get(clip.clip_id, []))
+        for clip in clips
+        if clip.duration > 0
+    ]
+    grouped: dict[str, list[_MealEvidence]] = defaultdict(list)
+    for evidence in evidences:
+        grouped[evidence.clip.day_key].append(evidence)
+
+    events: list[_MealEvent] = []
+    for day_evidences in grouped.values():
+        day_evidences.sort(key=lambda item: (_clip_start_timestamp(item.clip), item.clip.clip_id))
+        consumed_closures: set[int] = set()
+        consumed_direct: set[tuple[str, float, float]] = set()
+
+        # A setup may be recorded more than once while the party is moving.
+        # Prefer the last consecutive setup before the first possible body.
+        for index, evidence in enumerate(day_evidences):
+            if not evidence.setup_markers:
+                continue
+            if index + 1 < len(day_evidences):
+                following = day_evidences[index + 1]
+                if (
+                    following.setup_markers
+                    and _clip_gap_seconds(evidence.clip, following.clip)
+                    <= MEAL_SETUP_CLUSTER_SECONDS
+                ):
+                    continue
+
+            horizon_end = _clip_start_timestamp(evidence.clip) + MEAL_SETUP_HORIZON_SECONDS
+            closure_index = next(
+                (
+                    candidate_index
+                    for candidate_index in range(index + 1, len(day_evidences))
+                    if day_evidences[candidate_index].closure_markers
+                    and _clip_start_timestamp(day_evidences[candidate_index].clip) <= horizon_end
+                ),
+                None,
+            )
+            search_end = closure_index if closure_index is not None else len(day_evidences) - 1
+            direct_options = [
+                option
+                for candidate_index in range(index + 1, search_end + 1)
+                if _clip_start_timestamp(day_evidences[candidate_index].clip) <= horizon_end
+                for option in day_evidences[candidate_index].direct_options
+            ]
+
+            options: list[_MealOption] = []
+            next_evidence = day_evidences[index + 1] if index + 1 < len(day_evidences) else None
+            has_bracket = (
+                closure_index is not None
+                or any(marker.signal == "restaurant_arrival" for marker in evidence.setup_markers)
+                or bool(next_evidence and next_evidence.direct_options)
+            )
+            if next_evidence is not None and has_bracket:
+                inferred = _inferred_meal_body_option(
+                    evidence,
+                    next_evidence,
+                    signal="inferred_body_after_setup",
+                    maximum_gap=MEAL_INFER_AFTER_SETUP_SECONDS,
+                    confidence=0.91 if closure_index is not None else 0.88,
+                )
+                if inferred is not None:
+                    _append_unique_meal_option(options, inferred)
+            if not options:
+                continue
+
+            if closure_index is not None:
+                consumed_closures.add(closure_index)
+            consumed_direct.update(_meal_option_key(option) for option in options)
+            if next_evidence is not None and options and options[0].clip_id == next_evidence.clip.clip_id:
+                body_timestamp = _clip_start_timestamp(next_evidence.clip)
+                consumed_direct.update(
+                    _meal_option_key(option)
+                    for option in direct_options
+                    if abs(
+                        _clip_start_timestamp(
+                            next(
+                                candidate.clip
+                                for candidate in day_evidences
+                                if candidate.clip.clip_id == option.clip_id
+                            )
+                        )
+                        - body_timestamp
+                    )
+                    <= MEAL_SETUP_CLUSTER_SECONDS
+                )
+            event_signals = [marker.signal for marker in evidence.setup_markers]
+            if closure_index is not None:
+                event_signals.extend(
+                    marker.signal
+                    for marker in day_evidences[closure_index].closure_markers
+                )
+            event_signals.extend(signal for option in options for signal in option.signals)
+            events.append(
+                _make_meal_event(
+                    evidence.clip,
+                    options,
+                    subtype=_meal_event_subtype(
+                        evidence.subtype,
+                        *(day_evidences[candidate_index].subtype for candidate_index in range(index + 1, search_end + 1)),
+                    ),
+                    signals=event_signals,
+                )
+            )
+
+        # A post-meal statement can reveal an otherwise silent filmed meal in
+        # the immediately preceding clip. The closure clip itself is never an
+        # option, so narration such as "먹고 나왔는데" remains non-mandatory.
+        for index, evidence in enumerate(day_evidences):
+            if index in consumed_closures or not evidence.closure_markers or index == 0:
+                continue
+            previous = day_evidences[index - 1]
+            options = []
+            if previous.direct_options:
+                for option in previous.direct_options:
+                    _append_unique_meal_option(options, option)
+            else:
+                inferred = _inferred_meal_body_option(
+                    previous,
+                    previous,
+                    signal="inferred_body_before_closure",
+                    maximum_gap=MEAL_INFER_BEFORE_CLOSURE_SECONDS,
+                    confidence=0.90,
+                    following=evidence,
+                )
+                if inferred is not None:
+                    _append_unique_meal_option(options, inferred)
+            if not options:
+                continue
+            consumed_direct.update(_meal_option_key(option) for option in previous.direct_options)
+            events.append(
+                _make_meal_event(
+                    previous.clip,
+                    options[:3],
+                    subtype=_meal_event_subtype(previous.subtype, evidence.subtype),
+                    signals=[
+                        *(marker.signal for marker in evidence.closure_markers),
+                        *(signal for option in options for signal in option.signals),
+                    ],
+                )
+            )
+
+        # Direct filmed evidence needs no setup/closure pair. Nearby cues are
+        # alternative views of one meal, capped at three conservative options.
+        remaining: list[tuple[_MealEvidence, _MealOption]] = [
+            (evidence, option)
+            for evidence in day_evidences
+            for option in evidence.direct_options
+            if _meal_option_key(option) not in consumed_direct
+        ]
+        cluster: list[tuple[_MealEvidence, _MealOption]] = []
+        for item in remaining:
+            if (
+                cluster
+                and (
+                    item[0].subtype != cluster[-1][0].subtype
+                    or _meal_option_timestamp(*item)
+                    - _meal_option_timestamp(*cluster[-1])
+                    > MEAL_DIRECT_CLUSTER_SECONDS
+                )
+            ):
+                events.extend(_direct_meal_events(cluster))
+                cluster = []
+            cluster.append(item)
+        events.extend(_direct_meal_events(cluster))
+
+    deduplicated: dict[tuple[tuple[str, float, float], ...], _MealEvent] = {}
+    for event in events:
+        signature = tuple(_meal_option_key(option) for option in event.options)
+        existing = deduplicated.get(signature)
+        if existing is None or (event.confidence, len(event.signals)) > (
+            existing.confidence,
+            len(existing.signals),
+        ):
+            deduplicated[signature] = event
+    return sorted(
+        deduplicated.values(),
+        key=lambda event: (
+            event.day_key,
+            min(
+                _clip_start_timestamp(next(evidence.clip for evidence in evidences if evidence.clip.clip_id == option.clip_id))
+                + option.start
+                for option in event.options
+            ),
+            event.event_id,
+        ),
+    )
+
+
+def _meal_evidence(clip: Clip, cues: list[TranscriptCue]) -> _MealEvidence:
+    ordered = sorted(
+        (cue for cue in cues if cue.end > cue.start and cue.text.strip()),
+        key=lambda cue: (cue.start, cue.end),
+    )
+    combined = " ".join(cue.text.strip() for cue in ordered).casefold()
+    virtual_context = _VIRTUAL_MEAL_CONTEXT_PATTERN.search(combined) is not None
+    setup_markers: list[_MealMarker] = []
+    closure_markers: list[_MealMarker] = []
+    direct_options: list[_MealOption] = []
+    if not virtual_context:
+        for group in _group_cues(ordered):
+            text = " ".join(cue.text.strip() for cue in group).casefold()
+            setup_signal = _matching_meal_signal(_MEAL_SETUP_PATTERNS, text)
+            closure_signal = _matching_meal_signal(_MEAL_CLOSURE_PATTERNS, text)
+            if setup_signal is not None:
+                setup_markers.append(_MealMarker(setup_signal, group[0].start, group[-1].end))
+            if closure_signal is not None:
+                closure_markers.append(_MealMarker(closure_signal, group[0].start, group[-1].end))
+            direct_signal = _meal_direct_signal(text, combined)
+            if direct_signal is None:
+                continue
+            start, end = _ensure_duration(
+                max(0.0, group[0].start - 0.35),
+                min(clip.duration, group[-1].end + 0.75),
+                clip.duration,
+                minimum=2.5,
+                maximum=MEAL_OPTION_MAX_DURATION_SECONDS,
+            )
+            _append_unique_meal_option(
+                direct_options,
+                _MealOption(
+                    clip_id=clip.clip_id,
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    confidence={
+                        "served_food": 0.97,
+                        "actual_eating": 0.96,
+                        "food_reveal": 0.94,
+                        "tasting_food": 0.92,
+                    }[direct_signal],
+                    signals=(direct_signal,),
+                ),
+            )
+    return _MealEvidence(
+        clip=clip,
+        setup_markers=tuple(setup_markers),
+        closure_markers=tuple(closure_markers),
+        direct_options=tuple(direct_options[:3]),
+        subtype=_meal_subtype(combined),
+        virtual_context=virtual_context,
+    )
+
+
+def _matching_meal_signal(
+    patterns: tuple[tuple[str, re.Pattern[str]], ...],
+    text: str,
+) -> str | None:
+    return next((signal for signal, pattern in patterns if pattern.search(text)), None)
+
+
+def _meal_direct_signal(text: str, clip_context: str = "") -> str | None:
+    normalized = " ".join(text.casefold().split())
+    if not normalized or _VIRTUAL_MEAL_CONTEXT_PATTERN.search(normalized):
+        return None
+    if _MEAL_RETROSPECTIVE_OR_PLAN_PATTERN.search(normalized):
+        return None
+    if _MEAL_SERVED_FOOD_PATTERN.search(normalized):
+        return "served_food"
+    if _MEAL_FOOD_REVEAL_PATTERN.search(normalized):
+        return "food_reveal"
+    if _MEAL_ACTUAL_EATING_PATTERN.search(normalized):
+        return "actual_eating"
+    if _MEAL_TASTING_PATTERN.search(normalized) and (
+        _MEAL_FOOD_NOUN_PATTERN.search(normalized)
+        or (
+            _MEAL_PRESENT_CONTEXT_PATTERN.search(normalized)
+            and _MEAL_FOOD_NOUN_PATTERN.search(clip_context)
+        )
+    ):
+        return "tasting_food"
+    return None
+
+
+def _meal_subtype(text: str) -> str:
+    if _MEAL_DESSERT_PATTERN.search(text):
+        return "dessert"
+    if _MEAL_DRINK_PATTERN.search(text):
+        return "drink"
+    return "meal"
+
+
+def _meal_event_subtype(*subtypes: str) -> str:
+    values = [value for value in subtypes if value]
+    if "meal" in values:
+        return "meal"
+    return values[0] if values else "meal"
+
+
+def _clip_gap_seconds(earlier: Clip, later: Clip) -> float:
+    return max(
+        0.0,
+        _clip_start_timestamp(later) - (_clip_start_timestamp(earlier) + earlier.duration),
+    )
+
+
+def _inferred_meal_body_option(
+    anchor: _MealEvidence,
+    body: _MealEvidence,
+    *,
+    signal: str,
+    maximum_gap: float,
+    confidence: float,
+    following: _MealEvidence | None = None,
+) -> _MealOption | None:
+    if (
+        body.virtual_context
+        or body.setup_markers
+        or body.closure_markers
+        or body.clip.duration < 0.75
+    ):
+        return None
+    gap = (
+        _clip_gap_seconds(anchor.clip, body.clip)
+        if following is None
+        else _clip_gap_seconds(body.clip, following.clip)
+    )
+    if gap > maximum_gap:
+        return None
+    if body.direct_options:
+        return body.direct_options[0]
+    duration = min(body.clip.duration, MAX_CANDIDATE_DURATION_SECONDS)
+    return _MealOption(
+        clip_id=body.clip.clip_id,
+        start=0.0,
+        end=round(duration, 3),
+        confidence=confidence,
+        signals=(signal,),
+    )
+
+
+def _meal_option_key(option: _MealOption) -> tuple[str, float, float]:
+    return option.clip_id, round(option.start, 3), round(option.end, 3)
+
+
+def _meal_option_timestamp(evidence: _MealEvidence, option: _MealOption) -> float:
+    return _clip_start_timestamp(evidence.clip) + option.start
+
+
+def _append_unique_meal_option(options: list[_MealOption], incoming: _MealOption) -> None:
+    if any(_meal_option_key(option) == _meal_option_key(incoming) for option in options):
+        return
+    options.append(incoming)
+
+
+def _make_meal_event(
+    clip: Clip,
+    options: list[_MealOption],
+    *,
+    subtype: str,
+    signals: list[str],
+) -> _MealEvent:
+    bounded = tuple(options[:3])
+    event_id = "meal_" + stable_hash(
+        {
+            "policy": MEAL_EVENT_POLICY_VERSION,
+            "day_key": clip.day_key,
+            "subtype": subtype,
+            "options": [_meal_option_key(option) for option in bounded],
+        },
+        length=18,
+    )
+    return _MealEvent(
+        event_id=event_id,
+        day_key=clip.day_key,
+        travel_day=clip.travel_day,
+        subtype=subtype,
+        confidence=round(max(option.confidence for option in bounded), 3),
+        signals=tuple(unique_preserving_order(signals)),
+        options=bounded,
+    )
+
+
+def _direct_meal_events(
+    cluster: list[tuple[_MealEvidence, _MealOption]],
+) -> list[_MealEvent]:
+    events: list[_MealEvent] = []
+    for offset in range(0, len(cluster), 3):
+        chunk = cluster[offset : offset + 3]
+        if not chunk:
+            continue
+        options = [option for _, option in chunk]
+        events.append(
+            _make_meal_event(
+                chunk[0][0].clip,
+                options,
+                subtype=_meal_event_subtype(*(evidence.subtype for evidence, _ in chunk)),
+                signals=["direct_actual", *(signal for option in options for signal in option.signals)],
+            )
+        )
+    return events
+
+
+def _detect_journey_transition_windows(
+    clip: Clip,
+    cues: list[TranscriptCue],
+) -> list[tuple[float, float, str]]:
+    """Return compact, high-confidence waypoints without project-specific names."""
+    ordered = sorted(
+        (cue for cue in cues if cue.end > cue.start and cue.text.strip()),
+        key=lambda cue: (cue.start, cue.end),
+    )
+    windows: list[tuple[float, float, str]] = []
+    matched_cues: set[int] = set()
+    recent_by_subtype: dict[str, tuple[float, float]] = {}
+
+    def append_once(start: float, end: float, text: str, signal: str) -> None:
+        subtype = _journey_transition_dedupe_key(signal, text)
+        previous = recent_by_subtype.get(subtype)
+        if previous is not None and start - previous[1] <= JOURNEY_TRANSITION_DEDUPE_SECONDS:
+            return
+        recent_by_subtype[subtype] = (start, end)
+        padded_start, padded_end = _ensure_duration(
+            max(0.0, start - 0.35),
+            min(clip.duration, end + 0.75),
+            clip.duration,
+            minimum=2.5,
+            maximum=MAX_CANDIDATE_DURATION_SECONDS,
+        )
+        _append_window(windows, (padded_start, padded_end, "transition"))
+
+    for index, cue in enumerate(ordered):
+        signal = _journey_transition_signal(cue.text)
+        if signal is None:
+            continue
+        matched_cues.add(index)
+        start, end, text = _party_transition_context(ordered, index, signal)
+        append_once(start, end, text, signal)
+
+    # ASR can split the party/place and movement verb across adjacent cues.
+    # Only join one short, continuous speech run and retain the same strict
+    # question/instruction filters over the combined text.
+    for group in _group_cues(ordered):
+        group_indexes = {
+            index
+            for index, cue in enumerate(ordered)
+            if cue in group
+        }
+        if group_indexes & matched_cues or len(group) < 2:
+            continue
+        text = " ".join(cue.text.strip() for cue in group)
+        signal = _journey_transition_signal(text)
+        if signal is None:
+            continue
+        append_once(group[0].start, group[-1].end, text, signal)
+    return _merge_overlapping_windows(windows)
+
+
+def _party_transition_context(
+    cues: list[TranscriptCue],
+    anchor_index: int,
+    signal: str,
+) -> tuple[float, float, str]:
+    """Attach one nearby, declarative destination leg to a family handoff."""
+    anchor = cues[anchor_index]
+    if "party_pickup_dropoff_join" not in signal:
+        return anchor.start, anchor.end, anchor.text
+
+    contexts: list[tuple[float, float, str]] = []
+    forward_limit = min(len(cues), anchor_index + 1 + PARTY_TRANSITION_CONTEXT_MAX_CUES)
+    for end_index in range(anchor_index + 1, forward_limit):
+        run = cues[anchor_index + 1 : end_index + 1]
+        if not _continuous_cue_run([anchor, *run]):
+            break
+        if run[-1].end - anchor.start > PARTY_TRANSITION_CONTEXT_MAX_SECONDS:
+            break
+        direction_text = " ".join(cue.text.strip() for cue in run)
+        if _journey_direction_destination(direction_text):
+            contexts.append(
+                (
+                    anchor.start,
+                    run[-1].end,
+                    " ".join(cue.text.strip() for cue in [anchor, *run]),
+                )
+            )
+            break
+
+    backward_limit = max(-1, anchor_index - PARTY_TRANSITION_CONTEXT_MAX_CUES - 1)
+    for start_index in range(anchor_index - 1, backward_limit, -1):
+        run = cues[start_index:anchor_index]
+        if not _continuous_cue_run([*run, anchor]):
+            break
+        if anchor.end - run[0].start > PARTY_TRANSITION_CONTEXT_MAX_SECONDS:
+            break
+        direction_text = " ".join(cue.text.strip() for cue in run)
+        if _journey_direction_destination(direction_text):
+            contexts.append(
+                (
+                    run[0].start,
+                    anchor.end,
+                    " ".join(cue.text.strip() for cue in [*run, anchor]),
+                )
+            )
+            break
+
+    if not contexts:
+        return anchor.start, anchor.end, anchor.text
+    return min(
+        contexts,
+        key=lambda item: (
+            item[1] - item[0],
+            0 if item[0] == anchor.start else 1,
+            item[0],
+        ),
+    )
+
+
+def _continuous_cue_run(cues: list[TranscriptCue]) -> bool:
+    return all(
+        right.start - left.end <= 1.8
+        for left, right in zip(cues, cues[1:])
+    )
+
+
+def _journey_direction_destination(text: str) -> bool:
+    normalized = " ".join(text.casefold().split())
+    if not normalized:
+        return False
+    if (
+        _JOURNEY_TRANSITION_QUESTION_PATTERN.search(normalized)
+        or _JOURNEY_TRANSITION_INSTRUCTION_PATTERN.search(normalized)
+        or _GENERIC_JOURNEY_COMMAND_PATTERN.search(normalized)
+    ):
+        return False
+    if _KO_TRANSIT_DIRECTION_PATTERN.search(normalized):
+        return True
+    korean = _KO_NAMED_DIRECTION_PATTERN.search(normalized)
+    if korean is not None:
+        destination = korean.group("destination")
+        return _KO_NON_WAYPOINT_DIRECTION_PATTERN.search(destination) is None
+    if _EN_TRANSIT_DIRECTION_PATTERN.search(normalized):
+        return True
+    english = _EN_NAMED_DIRECTION_PATTERN.search(normalized)
+    if english is not None:
+        destination = english.group("destination")
+        return _EN_NON_WAYPOINT_DIRECTION_PATTERN.search(destination) is None
+    return False
+
+
+def _journey_transition_signal(text: str) -> str | None:
+    normalized = " ".join(text.casefold().split())
+    if not normalized:
+        return None
+    if (
+        _JOURNEY_TRANSITION_QUESTION_PATTERN.search(normalized)
+        or _JOURNEY_TRANSITION_INSTRUCTION_PATTERN.search(normalized)
+        or _GENERIC_JOURNEY_COMMAND_PATTERN.search(normalized)
+        or _NON_LODGING_ASR_PATTERN.search(normalized)
+        or _GENERIC_LODGING_SEARCH_PATTERN.search(normalized)
+    ):
+        return None
+    for signal, pattern in _JOURNEY_TRANSITION_PATTERNS:
+        if pattern.search(normalized):
+            return signal
+    return None
+
+
+def _journey_transition_dedupe_key(signal: str, text: str) -> str:
+    normalized = " ".join(text.casefold().split())
+    detail = "event"
+    if "party_pickup_dropoff_join" in signal:
+        if re.search(r"(?:drop|\ub0b4\ub824\s*\ub4dc\ub9ac|\ubaa8\uc154\ub2e4|\ubc14\ub798\ub2e4|\ub370\ub824\ub2e4)", normalized):
+            detail = "dropoff"
+        elif re.search(r"(?:join|\bmet\b|\ud569\ub958|\ub9cc\ub098\uc11c)", normalized):
+            detail = "join"
+        else:
+            detail = "pickup"
+    elif "rental_pickup_return" in signal:
+        detail = "return" if re.search(r"(?:return|\ubc18\ub0a9|\ub3cc\ub824)", normalized) else "pickup"
+    elif "lodging_checkin_checkout" in signal:
+        detail = "checkout" if re.search(r"(?:check\s*out|\uccb4\ud06c\s*\uc544\uc6c3)", normalized) else "checkin"
+    elif "transit_arrival_departure" in signal:
+        detail = (
+            "departure"
+            if re.search(r"(?:left|leav|depart|\ucd9c\ubc1c|\ub5a0\ub098|\ub098\uc654|\ub098\uc635)", normalized)
+            else "arrival"
+        )
+    elif "transport_boarding_alighting" in signal:
+        action = (
+            "alighting"
+            if re.search(r"(?:got\s+off|getting\s+off|got\s+out|stepped\s+off|\ub0b4\ub838|\ub0b4\ub824|\ud558\ucc28)", normalized)
+            else "boarding"
+        )
+        mode_match = re.search(rf"{_KO_TRANSPORT}|{_EN_TRANSPORT}", normalized)
+        mode = mode_match.group(0) if mode_match is not None else "transport"
+        detail = f"{action}:{mode}"
+    return f"{signal}:{detail}"
 
 
 def _detect_family_interview_events(
@@ -1116,6 +2122,7 @@ def _required_events_payload(
             {
                 "event_id": event.event_id,
                 "kind": "family_interview",
+                "selection_mode": "all",
                 "clip_id": clip.clip_id,
                 "day_key": clip.day_key,
                 "travel_day": clip.travel_day,
@@ -1134,6 +2141,61 @@ def _required_events_payload(
     return payload
 
 
+def _required_meal_events_payload(
+    events: list[_MealEvent],
+    candidates: list[Candidate],
+) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for event in events:
+        candidate_ids = [
+            candidate.candidate_id
+            for candidate in candidates
+            if event.event_id in candidate.required_meal_event_ids
+        ]
+        if not candidate_ids:
+            raise VideoSummaryError(
+                f"필수 식사 사건 후보를 만들지 못했습니다: {event.event_id}"
+            )
+        option_ranges: list[dict[str, Any]] = []
+        for option in event.options:
+            option_candidate_ids = [
+                candidate.candidate_id
+                for candidate in candidates
+                if candidate.clip_id == option.clip_id
+                and event.event_id in candidate.required_meal_event_ids
+                and _ranges_overlap(candidate.start, candidate.end, option.start, option.end)
+            ]
+            if not option_candidate_ids:
+                raise VideoSummaryError(
+                    f"필수 식사 사건 옵션 후보를 만들지 못했습니다: {event.event_id}"
+                )
+            option_ranges.append(
+                {
+                    "clip_id": option.clip_id,
+                    "start": option.start,
+                    "end": option.end,
+                    "confidence": option.confidence,
+                    "signals": list(option.signals),
+                    "candidate_ids": option_candidate_ids,
+                }
+            )
+        payload.append(
+            {
+                "event_id": event.event_id,
+                "kind": "meal",
+                "selection_mode": "one_of",
+                "subtype": event.subtype,
+                "day_key": event.day_key,
+                "travel_day": event.travel_day,
+                "confidence": event.confidence,
+                "signals": list(event.signals),
+                "candidate_ids": candidate_ids,
+                "option_ranges": option_ranges,
+            }
+        )
+    return payload
+
+
 def _candidate_windows(
     clip: Clip,
     cues: list[TranscriptCue],
@@ -1141,6 +2203,8 @@ def _candidate_windows(
     max_per_clip: int,
     *,
     required_events: list[_InterviewEvent] | None = None,
+    transition_windows: list[tuple[float, float, str]] | None = None,
+    meal_windows: list[tuple[float, float, str]] | None = None,
 ) -> list[tuple[float, float, str]]:
     windows: list[tuple[float, float, str]] = []
     for group in _group_cues(cues):
@@ -1182,6 +2246,17 @@ def _candidate_windows(
         (event.start, event.end, "interview")
         for event in required_events or []
     )
+    # Waypoints are added after the ordinary max-per-clip selection so a
+    # meaningful mid-clip handoff cannot disappear merely because the clip's
+    # opener, closer, or a visually stronger window consumed the limit.
+    selected.extend(
+        transition_windows
+        if transition_windows is not None
+        else _detect_journey_transition_windows(clip, cues)
+    )
+    # Meal bodies are semantic options, added after the ordinary per-clip cap.
+    # Setup/closure narration never reaches this list.
+    selected.extend(meal_windows or [])
     return _merge_overlapping_windows(selected)
 
 
@@ -1200,16 +2275,95 @@ def _merge_overlapping_windows(
         components[-1].append((start, end, origin))
 
     merged: list[tuple[float, float, str]] = []
+    semantic_origins = {"transition", "meal"}
     for component in components:
         component_start = min(item[0] for item in component)
         component_end = max(item[1] for item in component)
-        duration = component_end - component_start
-        part_count = max(1, math.ceil(duration / maximum))
-        for part_index in range(part_count):
-            start = component_start + duration * part_index / part_count
-            end = component_start + duration * (part_index + 1) / part_count
-            origin = _merged_window_origin(component, start, end, part_index, part_count)
-            merged.append((start, end, origin))
+        boundaries = {component_start, component_end}
+        if any(origin in semantic_origins for _, _, origin in component):
+            for start, end, origin in component:
+                if origin not in semantic_origins:
+                    continue
+                boundaries.update(
+                    {
+                        max(component_start, min(component_end, start)),
+                        max(component_start, min(component_end, end)),
+                    }
+                )
+        ordered_boundaries = sorted(boundaries)
+        annotated_ranges = [
+            (
+                start,
+                end,
+                frozenset(
+                    origin
+                    for item_start, item_end, origin in component
+                    if origin in semantic_origins
+                    and min(end, item_end) - max(start, item_start) > tolerance
+                ),
+            )
+            for start, end in zip(ordered_boundaries, ordered_boundaries[1:])
+            if end > start
+        ]
+        coalesced_ranges: list[tuple[float, float, frozenset[str]]] = []
+        for start, end, semantic_kinds in annotated_ranges:
+            if coalesced_ranges and coalesced_ranges[-1][2] == semantic_kinds:
+                previous_start, _, _ = coalesced_ranges[-1]
+                coalesced_ranges[-1] = (previous_start, end, semantic_kinds)
+            else:
+                coalesced_ranges.append((start, end, semantic_kinds))
+
+        # Partitioning at semantic boundaries must not create an unusably short
+        # ordinary candidate. Absorb only the sub-0.75s exterior padding into
+        # the adjacent mandatory transition, preserving the exact source union.
+        range_index = 0
+        while range_index < len(coalesced_ranges):
+            start, end, semantic_kinds = coalesced_ranges[range_index]
+            if semantic_kinds or end - start >= 0.75:
+                range_index += 1
+                continue
+            previous_semantic = (
+                coalesced_ranges[range_index - 1][2]
+                if range_index > 0
+                else frozenset()
+            )
+            next_semantic = (
+                coalesced_ranges[range_index + 1][2]
+                if range_index + 1 < len(coalesced_ranges)
+                else frozenset()
+            )
+            if previous_semantic and next_semantic:
+                previous_start = coalesced_ranges[range_index - 1][0]
+                next_end = coalesced_ranges[range_index + 1][1]
+                coalesced_ranges[range_index - 1 : range_index + 2] = [
+                    (previous_start, next_end, previous_semantic | next_semantic)
+                ]
+                range_index = max(0, range_index - 1)
+            elif next_semantic:
+                _, next_end, _ = coalesced_ranges[range_index + 1]
+                coalesced_ranges[range_index : range_index + 2] = [
+                    (start, next_end, next_semantic)
+                ]
+            elif previous_semantic:
+                previous_start = coalesced_ranges[range_index - 1][0]
+                coalesced_ranges[range_index - 1 : range_index + 1] = [
+                    (previous_start, end, previous_semantic)
+                ]
+                range_index = max(0, range_index - 1)
+            else:
+                range_index += 1
+
+        semantic_ranges = [
+            (start, end) for start, end, _ in coalesced_ranges
+        ]
+        for range_start, range_end in semantic_ranges:
+            duration = range_end - range_start
+            part_count = max(1, math.ceil(duration / maximum))
+            for part_index in range(part_count):
+                start = range_start + duration * part_index / part_count
+                end = range_start + duration * (part_index + 1) / part_count
+                origin = _merged_window_origin(component, start, end, part_index, part_count)
+                merged.append((start, end, origin))
     return merged
 
 
@@ -1220,11 +2374,30 @@ def _merged_window_origin(
     part_index: int,
     part_count: int,
 ) -> str:
-    if part_index == 0 and any(origin == "opener" for _, _, origin in component):
+    overlapping_origins = {
+        origin
+        for item_start, item_end, origin in component
+        if min(end, item_end) - max(start, item_start) > 0.001
+    }
+    if "transition" in overlapping_origins:
+        return "transition"
+    if "interview" in overlapping_origins:
+        return "interview"
+    if "meal" in overlapping_origins:
+        return "meal"
+    if part_index == 0 and "opener" in overlapping_origins:
         return "opener"
-    if part_index == part_count - 1 and any(origin == "closer" for _, _, origin in component):
+    if part_index == part_count - 1 and "closer" in overlapping_origins:
         return "closer"
-    priority = {"interview": 4, "speech": 3, "visual": 2, "opener": 1, "closer": 1}
+    priority = {
+        "interview": 5,
+        "transition": 4,
+        "meal": 4,
+        "speech": 3,
+        "visual": 2,
+        "opener": 1,
+        "closer": 1,
+    }
     return max(
         component,
         key=lambda item: (
@@ -1346,7 +2519,11 @@ def _brightness_quality(brightness: float) -> float:
 def _roles(text: str, clip: Clip, start: float, end: float, origin: str) -> list[str]:
     normalized = text.casefold()
     roles: list[str] = []
-    if any(word in normalized for word in JOURNEY_WORDS) or origin in {"opener", "closer"}:
+    if origin == "transition":
+        roles.extend(["transition", "journey"])
+    elif origin == "meal":
+        roles.append("food")
+    elif any(word in normalized for word in JOURNEY_WORDS) or origin in {"opener", "closer"}:
         roles.append("journey")
     if any(word in normalized for word in FUN_WORDS) or text.count("!") >= 1:
         roles.append("fun")
@@ -1374,6 +2551,7 @@ def _score_candidate(
 ) -> float:
     role_bonus = {
         "interview": 0.30,
+        "transition": 0.26,
         "fun": 0.22,
         "food": 0.15,
         "journey": 0.12,

@@ -25,10 +25,13 @@ def analyze_project(
     force: bool = False,
     skip_transcribe: bool = False,
 ) -> dict[str, Any]:
-    if skip_transcribe and bool(config["editing"].get("preserve_family_interviews", True)):
+    preserve_interviews = bool(config["editing"].get("preserve_family_interviews", True))
+    preserve_meals = bool(config["editing"].get("preserve_meal_events", True))
+    if skip_transcribe and (preserve_interviews or preserve_meals):
         raise VideoSummaryError(
-            "가족 인터뷰 자동 보존에는 전사가 필요합니다. --skip-transcribe를 빼거나 "
-            "project.yaml에서 editing.preserve_family_interviews를 false로 설정하세요."
+            "가족 인터뷰와 식사 사건 자동 보존에는 전사가 필요합니다. --skip-transcribe를 빼거나 "
+            "project.yaml에서 editing.preserve_family_interviews와 "
+            "editing.preserve_meal_events를 모두 false로 설정하세요."
         )
     clips = load_clips(paths, config)
     transcript = transcribe_project(paths, clips, config, force=force, skip=skip_transcribe)

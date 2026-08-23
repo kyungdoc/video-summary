@@ -43,7 +43,7 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 18
+RENDER_POLICY_VERSION = 19
 SOURCE_RENDER_POLICY_VERSION = 8
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
@@ -182,6 +182,27 @@ def report_outputs_exist(report: dict[str, Any]) -> bool:
     )
 
 
+def _required_events_of_kind(
+    candidates_payload: dict[str, Any],
+    kind: str,
+) -> list[dict[str, Any]]:
+    raw_events = candidates_payload.get("required_events", [])
+    if not isinstance(raw_events, list):
+        raise VideoSummaryError("candidates.json의 required_events가 잘못되었습니다.")
+    selected: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            raise VideoSummaryError("candidates.json의 required_events가 잘못되었습니다.")
+        event_kind = str(raw_event.get("kind", "family_interview")).strip()
+        if event_kind not in {"family_interview", "meal"}:
+            raise VideoSummaryError(
+                f"candidates.json에 알 수 없는 required event kind가 있습니다: {event_kind}"
+            )
+        if event_kind == kind:
+            selected.append(raw_event)
+    return selected
+
+
 def family_interview_coverage(
     candidates_payload: dict[str, Any],
     candidates: list[Candidate],
@@ -196,7 +217,6 @@ def family_interview_coverage(
         for segment in episode.segments
     }
     candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
-    raw_events = candidates_payload.get("required_events", [])
     if not enabled:
         return {
             "status": "disabled",
@@ -205,8 +225,7 @@ def family_interview_coverage(
             "selected_candidate_count": 0,
             "events": [],
         }
-    if not isinstance(raw_events, list):
-        raise VideoSummaryError("candidates.json의 required_events가 잘못되었습니다.")
+    raw_events = _required_events_of_kind(candidates_payload, "family_interview")
 
     events: list[dict[str, Any]] = []
     required_ids: set[str] = set()
@@ -270,6 +289,97 @@ def family_interview_coverage(
     }
 
 
+def meal_event_coverage(
+    candidates_payload: dict[str, Any],
+    candidates: list[Candidate],
+    plan: EditPlan,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Audit one-of coverage for locally detected meal events."""
+    selected_ids = {
+        segment.candidate_id
+        for episode in plan.episodes
+        for segment in episode.segments
+    }
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    empty = {
+        "detected_event_count": 0,
+        "option_candidate_count": 0,
+        "selected_event_count": 0,
+        "selected_candidate_count": 0,
+        "events": [],
+    }
+    if not enabled:
+        return {"status": "disabled", **empty}
+    meal_events = _required_events_of_kind(candidates_payload, "meal")
+    if not meal_events:
+        return {"status": "not_detected", **empty}
+
+    events: list[dict[str, Any]] = []
+    option_ids: set[str] = set()
+    selected_option_ids: set[str] = set()
+    for raw_event in meal_events:
+        event_id = str(raw_event.get("event_id", "")).strip()
+        selection_mode = str(raw_event.get("selection_mode", "")).strip()
+        candidate_ids_value = raw_event.get("candidate_ids", [])
+        if (
+            not event_id
+            or selection_mode != "one_of"
+            or not isinstance(candidate_ids_value, list)
+            or not candidate_ids_value
+            or any(not isinstance(value, str) or not value.strip() for value in candidate_ids_value)
+        ):
+            raise VideoSummaryError("candidates.json의 식사 이벤트가 잘못되었습니다.")
+        candidate_ids = list(dict.fromkeys(value.strip() for value in candidate_ids_value))
+        missing_catalog = [value for value in candidate_ids if value not in candidate_by_id]
+        if missing_catalog:
+            raise VideoSummaryError(
+                f"식사 이벤트가 알 수 없는 후보를 참조합니다: {event_id}"
+            )
+        selected_event_ids = [value for value in candidate_ids if value in selected_ids]
+        if not selected_event_ids:
+            raise VideoSummaryError(
+                f"필수 식사 이벤트가 최종 plan에서 누락되었습니다: {event_id}"
+            )
+        option_ids.update(candidate_ids)
+        selected_option_ids.update(selected_event_ids)
+        signals_value = raw_event.get("signals", [])
+        signals = (
+            [str(value) for value in signals_value if isinstance(value, str)]
+            if isinstance(signals_value, list)
+            else []
+        )
+        confidence_value = raw_event.get("confidence")
+        confidence = (
+            round(float(confidence_value), 3)
+            if isinstance(confidence_value, (int, float)) and not isinstance(confidence_value, bool)
+            else None
+        )
+        events.append(
+            {
+                "event_id": event_id,
+                "day_key": str(raw_event.get("day_key", "")),
+                "subtype": str(raw_event.get("subtype", "meal")),
+                "source": "local_timeline",
+                "confidence": confidence,
+                "signals": signals,
+                "selection_mode": "one_of",
+                "candidate_ids": candidate_ids,
+                "selected_candidate_ids": selected_event_ids,
+            }
+        )
+
+    return {
+        "status": "satisfied",
+        "detected_event_count": len(events),
+        "option_candidate_count": len(option_ids),
+        "selected_event_count": len(events),
+        "selected_candidate_count": len(selected_option_ids),
+        "events": events,
+    }
+
+
 def render_project(
     paths: ProjectPaths,
     config: dict[str, Any],
@@ -311,7 +421,13 @@ def render_project(
             candidates,
             validated,
             enabled=bool(config["editing"].get("preserve_family_interviews", True)),
-        )
+        ),
+        "meals": meal_event_coverage(
+            candidates_payload,
+            candidates,
+            validated,
+            enabled=bool(config["editing"].get("preserve_meal_events", True)),
+        ),
     }
     trip_intro_signature: list[dict[str, str]] | None = None
     if mode == "trip" and render_config.get("trip_intro_style") == "mosaic":
@@ -483,7 +599,7 @@ def render_project(
                 )
             )
         report = {
-            "version": 4,
+            "version": 5,
             "cache_key": cache_key,
             "project": validated.project,
             "planner": validated.planner,

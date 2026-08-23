@@ -29,6 +29,7 @@ from video_summary.renderer import (
     coalesce_source_selections,
     episode_pieces,
     family_interview_coverage,
+    meal_event_coverage,
     legacy_segment_directories,
     render_cache_key,
     render_card_piece,
@@ -499,7 +500,7 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(card_fade_seconds("trip-outro", 0.4), 0.1)
 
     def test_audio_assembly_policy_invalidates_completed_render_but_reuses_sources(self) -> None:
-        self.assertEqual(RENDER_POLICY_VERSION, 18)
+        self.assertEqual(RENDER_POLICY_VERSION, 19)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
 
     def test_family_interview_coverage_is_satisfied_or_not_detected(self) -> None:
@@ -559,6 +560,87 @@ class RendererTests(unittest.TestCase):
                 plan,
                 enabled=True,
             )
+
+    def test_meal_event_coverage_accepts_one_selected_option(self) -> None:
+        first = candidate("meal-a", "2026-08-19T12:00:00+09:00", 0.0)
+        second = candidate("meal-b", "2026-08-19T12:05:00+09:00", 0.0)
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [
+                Episode(
+                    first.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    30.0,
+                    [PlanSegment("meal-b", "food", "실제 점심 장면")],
+                )
+            ],
+        )
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "day_key": first.day_key,
+                    "subtype": "lunch",
+                    "confidence": 0.93,
+                    "signals": ["meal_setup", "inferred_meal_body"],
+                    "candidate_ids": ["meal-a", "meal-b"],
+                }
+            ]
+        }
+
+        coverage = meal_event_coverage(payload, [first, second], plan, enabled=True)
+
+        self.assertEqual(coverage["status"], "satisfied")
+        self.assertEqual(coverage["detected_event_count"], 1)
+        self.assertEqual(coverage["option_candidate_count"], 2)
+        self.assertEqual(coverage["selected_event_count"], 1)
+        self.assertEqual(coverage["selected_candidate_count"], 1)
+        self.assertEqual(coverage["events"][0]["selected_candidate_ids"], ["meal-b"])
+        self.assertNotIn("transcript", coverage["events"][0])
+
+    def test_meal_event_coverage_rejects_an_unselected_event(self) -> None:
+        meal = candidate("meal", "2026-08-19T12:00:00+09:00", 0.0)
+        plan = EditPlan("Trip", "", "file", "hash", [])
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal"],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(VideoSummaryError, "필수 식사 이벤트"):
+            meal_event_coverage(payload, [meal], plan, enabled=True)
+
+        disabled = meal_event_coverage(payload, [meal], plan, enabled=False)
+        self.assertEqual(disabled["status"], "disabled")
+
+    def test_family_interview_coverage_ignores_meal_events(self) -> None:
+        plan = EditPlan("Trip", "", "local", "hash", [])
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal"],
+                }
+            ]
+        }
+
+        coverage = family_interview_coverage(payload, [], plan, enabled=True)
+        self.assertEqual(coverage["status"], "not_detected")
 
     def test_moment_coverage_changes_render_cache_but_not_source_namespace(self) -> None:
         plan = EditPlan("Trip", "", "local", "hash", [])

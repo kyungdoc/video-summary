@@ -27,6 +27,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "target_minutes_per_day": 4.0,
         "cold_open": True,
         "preserve_family_interviews": True,
+        "preserve_meal_events": True,
         "episode_mode": "daily",
     },
     "analysis": {
@@ -195,6 +196,8 @@ def _validate_config(config: dict[str, Any]) -> None:
         raise VideoSummaryError("episode_mode는 daily 또는 trip이어야 합니다.")
     if type(editing.get("preserve_family_interviews", True)) is not bool:
         raise VideoSummaryError("preserve_family_interviews는 true 또는 false여야 합니다.")
+    if type(editing.get("preserve_meal_events", True)) is not bool:
+        raise VideoSummaryError("preserve_meal_events는 true 또는 false여야 합니다.")
     if render.get("resolution") not in {"720p", "1080p", "2160p"}:
         raise VideoSummaryError("resolution은 720p, 1080p, 2160p 중 하나여야 합니다.")
     if render.get("trip_intro_style") not in {"card", "mosaic"}:

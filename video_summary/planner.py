@@ -36,6 +36,47 @@ CONTACT_SHEET_CANDIDATES = 12
 SHORT_DAY_KEEP_RATIO = 0.80
 
 
+def _normalized_candidate_policy_versions(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): value[key]
+        for key in sorted(value, key=str)
+    }
+
+
+def _plan_cache_key(
+    config: dict[str, Any],
+    *,
+    candidate_set_hash: str,
+    candidate_policy_versions: dict[str, Any],
+    editing_prompt: str,
+    planner_name: str,
+    use_images: bool,
+    plan_file_path: Path | None,
+    plan_file_key: str | None,
+    strict_planner: bool,
+) -> str:
+    return stable_hash(
+        {
+            "version": 14,
+            "project": config["project"]["name"],
+            "candidate_set_hash": candidate_set_hash,
+            "candidate_policy_versions": _normalized_candidate_policy_versions(
+                candidate_policy_versions
+            ),
+            "prompt": editing_prompt,
+            "planner": planner_name,
+            "planner_images": use_images,
+            "target": config["editing"]["target_minutes_per_day"],
+            "cold_open": config["editing"].get("cold_open", True),
+            "plan_file": str(plan_file_path) if plan_file_path else None,
+            "plan_file_key": plan_file_key,
+            "strict_planner": strict_planner,
+        }
+    )
+
+
 def plan_project(
     paths: ProjectPaths,
     config: dict[str, Any],
@@ -50,6 +91,9 @@ def plan_project(
     candidates = load_candidates(paths, config)
     candidates_payload = read_json(paths.candidates)
     candidate_set_hash = str(candidates_payload["candidate_set_hash"])
+    candidate_policy_versions = _normalized_candidate_policy_versions(
+        candidates_payload.get("policy_versions")
+    )
     editing_prompt = (prompt or str(config["editing"].get("prompt", ""))).strip()
     if not editing_prompt:
         raise VideoSummaryError("편집 프롬프트가 비어 있습니다.")
@@ -62,20 +106,16 @@ def plan_project(
 
     plan_file_path = Path(plan_file).expanduser().resolve() if plan_file else None
     plan_file_key = file_fingerprint(plan_file_path) if plan_file_path and plan_file_path.exists() else None
-    cache_key = stable_hash(
-        {
-            "version": 12,
-            "project": config["project"]["name"],
-            "candidate_set_hash": candidate_set_hash,
-            "prompt": editing_prompt,
-            "planner": planner_name,
-            "planner_images": use_images,
-            "target": config["editing"]["target_minutes_per_day"],
-            "cold_open": config["editing"].get("cold_open", True),
-            "plan_file": str(plan_file_path) if plan_file_path else None,
-            "plan_file_key": plan_file_key,
-            "strict_planner": strict_planner,
-        }
+    cache_key = _plan_cache_key(
+        config,
+        candidate_set_hash=candidate_set_hash,
+        candidate_policy_versions=candidate_policy_versions,
+        editing_prompt=editing_prompt,
+        planner_name=planner_name,
+        use_images=use_images,
+        plan_file_path=plan_file_path,
+        plan_file_key=plan_file_key,
+        strict_planner=strict_planner,
     )
     state = StateStore(paths.state)
     if not force and paths.plan.exists() and state.is_complete("plan", cache_key):
@@ -165,11 +205,17 @@ def local_plan(
         use_earliest_hook = bool(config["editing"].get("cold_open", True)) and bool(selected) and "fun" in selected[0].roles
         for index, candidate in enumerate(selected):
             required_interview = _is_required_interview(candidate)
+            required_transition = _is_required_transition(candidate)
+            meal_event_ids = _required_meal_event_ids(candidate)
             role = (
                 "hook"
                 if index == 0 and use_earliest_hook
                 else "interview"
                 if required_interview
+                else "transition"
+                if required_transition
+                else "food"
+                if meal_event_ids
                 else _primary_role(candidate.roles)
             )
             if (
@@ -186,6 +232,8 @@ def local_plan(
                     reason=(
                         "시간순 첫 장면으로 이 날의 분위기를 여는 재미있는 시작"
                         if role == "hook"
+                        else "여행의 식사 경험을 빠짐없이 보존하는 대표 장면"
+                        if meal_event_ids and not required_interview and not required_transition
                         else _selection_reason(candidate)
                     ),
                     location=None if required_interview else candidate.location,
@@ -195,7 +243,11 @@ def local_plan(
             )
         travel_day = day_candidates[0].travel_day
         location_title = locations[0] if locations else "여행의 하루"
-        summary_roles = _role_summary(segments)
+        summary_roles = _role_summary(
+            segments,
+            has_transition=any(_is_required_transition(item) for item in selected),
+            has_meal=any(_required_meal_event_ids(item) for item in selected),
+        )
         episodes.append(
             Episode(
                 day_key=day_key,
@@ -332,6 +384,38 @@ def validate_and_normalize_plan(
                     raise VideoSummaryError(
                         f"필수 가족 인터뷰 후보의 location은 null이어야 합니다: {candidate_id}"
                     )
+            if _is_required_transition(candidate) and not _is_required_interview(candidate):
+                if speed != 1.0:
+                    raise VideoSummaryError(
+                        f"필수 이동 거점 후보는 speed=1.0이어야 합니다: {candidate_id}"
+                    )
+                allowed_transition_roles = {"transition"}
+                if index == 0:
+                    allowed_transition_roles.add("hook")
+                if index == len(raw_segments) - 1:
+                    allowed_transition_roles.add("closing")
+                if role not in allowed_transition_roles:
+                    raise VideoSummaryError(
+                        f"필수 이동 거점 후보는 role=transition이어야 합니다: {candidate_id}"
+                    )
+            if (
+                _required_meal_event_ids(candidate)
+                and not _is_required_interview(candidate)
+                and not _is_required_transition(candidate)
+            ):
+                if speed != 1.0:
+                    raise VideoSummaryError(
+                        f"필수 식사 이벤트 선택 후보는 speed=1.0이어야 합니다: {candidate_id}"
+                    )
+                allowed_meal_roles = {"food"}
+                if index == 0:
+                    allowed_meal_roles.add("hook")
+                if index == len(raw_segments) - 1:
+                    allowed_meal_roles.add("closing")
+                if role not in allowed_meal_roles:
+                    raise VideoSummaryError(
+                        f"필수 식사 이벤트 선택 후보는 role=food여야 합니다: {candidate_id}"
+                    )
             used_candidates.add(candidate_id)
             chronology.append(_candidate_sort_key(candidate))
             runtime += candidate.duration / speed
@@ -391,6 +475,23 @@ def validate_and_normalize_plan(
         raise VideoSummaryError(
             "플래너가 필수 가족 인터뷰 후보를 누락했습니다: " + ", ".join(missing_required)
         )
+    required_transitions = {
+        candidate.candidate_id
+        for candidate in candidates
+        if _is_required_transition(candidate)
+    }
+    missing_transitions = sorted(required_transitions - used_candidates)
+    if missing_transitions:
+        raise VideoSummaryError(
+            "플래너가 필수 이동 거점 후보를 누락했습니다: " + ", ".join(missing_transitions)
+        )
+    for event_id, options in _meal_event_option_groups(candidates).items():
+        option_ids = {candidate.candidate_id for candidate in options}
+        if used_candidates.isdisjoint(option_ids):
+            raise VideoSummaryError(
+                f"플래너가 필수 식사 이벤트 {event_id}의 one_of 후보를 누락했습니다: "
+                + ", ".join(sorted(option_ids))
+            )
     episodes.sort(key=lambda episode: (episode.travel_day, episode.day_key))
     return EditPlan(
         project=str(config["project"]["name"]),
@@ -421,6 +522,13 @@ def build_planner_request(
         "각 날짜의 시간상 가장 이른 후보를 포함해 출발 맥락을 보존하고, 여유가 있으면 가장 늦은 후보도 포함하세요.",
         "required_event_ids가 하나라도 있는 후보는 감지된 가족 인터뷰의 필수 구간입니다. 목표 시간을 넘더라도 해당 candidate_id를 모두 빠짐없이 선택하세요.",
         "필수 가족 인터뷰 후보는 원래 순서를 유지하고 speed=1.0, location=null, caption=null, role=interview로 사용하세요. 단, 그 날짜의 첫 후보라면 role=hook도 허용됩니다.",
+        "roles에 transition이 있는 후보는 출발·픽업·환승·공항·숙소 도착 같은 고신뢰 필수 이동 거점입니다. 목표 시간과 권장 상한을 넘더라도 해당 candidate_id를 모두 선택하세요.",
+        "필수 이동 거점 후보는 원래 순서를 유지하고 speed=1.0, role=transition으로 사용하세요. 단, 그 날짜의 첫 segment라면 role=hook, 마지막 segment라면 role=closing도 허용됩니다.",
+        "한 후보가 필수 가족 인터뷰이면서 transition이기도 하면 더 엄격한 인터뷰 계약(role=interview, speed=1.0, location=null, caption=null)을 우선하세요.",
+        "일반적인 이동 장면을 뜻하는 role=journey만 있는 후보는 필수가 아닙니다. transition으로 표시된 고신뢰 이동 거점만 위 필수 규칙을 적용하세요.",
+        "required_meal_event_ids의 같은 이벤트 ID를 가진 후보들은 하나의 필수 식사 이벤트 option group입니다. 각 이벤트의 one_of 후보 중 최소 1개를 선택하되 반복을 피하려면 가장 적절한 1개만 우선하세요.",
+        "선택한 필수 식사 option은 목표 시간과 권장 상한보다 우선하며 speed=1.0, role=food로 사용하세요. 날짜의 첫 segment는 hook, 마지막 segment는 closing도 허용됩니다.",
+        "식사 option이 필수 인터뷰와 겹치면 인터뷰 계약이, transition과 겹치면 transition 계약이 food 계약보다 우선합니다. 단순히 role=food이지만 required_meal_event_ids가 비어 있는 후보는 필수가 아닙니다.",
         "날짜별 목표 시간은 채워야 하는 할당량이 아니라 상한입니다. 후보 총량이 목표보다 짧은 날은 약한 장면까지 전부 선택하지 마세요.",
         f"짧은 날은 최초·마무리·필수 사건과 완결된 연속 장면을 우선하고 후보 총량의 약 {SHORT_DAY_KEEP_RATIO:.0%}만 권장 분량으로 사용하세요.",
         "각 날짜를 출발/도입 → 탐색/이동 → 핵심 경험 → 마무리의 4단계 이야기로 구성하되 실제 촬영 순서를 바꾸지 마세요.",
@@ -450,7 +558,9 @@ def build_planner_request(
             _adaptive_day_target_seconds(deduped_values, configured_target),
             used_duration(_mandatory_day_candidates(deduped_values)),
         )
-        required_values = [item for item in deduped_values if _is_required_interview(item)]
+        required_values = [item for item in ordered_values if _is_required_interview(item)]
+        transition_values = [item for item in ordered_values if _is_required_transition(item)]
+        meal_event_groups = _meal_event_option_groups(ordered_values)
         lines.extend(
             [
                 "",
@@ -466,6 +576,16 @@ def build_planner_request(
                     for item in required_values
                 )
             )
+        if transition_values:
+            lines.append(
+                "- mandatory transition waypoint candidates: "
+                + ", ".join(item.candidate_id for item in transition_values)
+            )
+        for event_id, options in meal_event_groups.items():
+            lines.append(
+                f"- mandatory meal event {event_id} one_of candidates: "
+                + ", ".join(item.candidate_id for item in options)
+            )
         for candidate in ordered_values:
             transcript = re.sub(r"\s+", " ", candidate.transcript).strip()
             if len(transcript) > 180:
@@ -475,6 +595,7 @@ def build_planner_request(
                 f"source={candidate.clip_id}:{candidate.start:.3f}-{candidate.end:.3f} | "
                 f"roles={','.join(candidate.roles)} | score={candidate.score:.2f} | "
                 f"required_event_ids={','.join(_required_event_ids(candidate)) or '-'} | "
+                f"required_meal_event_ids={','.join(_required_meal_event_ids(candidate)) or '-'} | "
                 f"location={candidate.location or '-'} | transcript={transcript or '[silent]'}"
             )
     lines.extend(
@@ -488,16 +609,41 @@ def build_planner_request(
             f"- 각 episode의 target_duration 필드는 {configured_target:.1f}으로 유지하고, 위 recommended ceiling은 segment 실제 합계에만 적용",
             "- segment에는 candidate_id, role, reason, location, caption, speed를 모두 포함; 표시값이 없으면 location/caption은 null, speed는 1.0",
             "- required_event_ids가 비어 있지 않은 candidate_id는 전부 포함; speed=1.0, location=null, caption=null, role=interview (날짜의 첫 segment만 hook 허용)",
+            "- roles에 transition이 있는 candidate_id는 날짜별로 전부 포함; speed=1.0, role=transition (날짜의 첫 segment는 hook, 마지막 segment는 closing 허용)",
+            "- 필수 인터뷰와 transition이 같은 candidate_id에 함께 있으면 인터뷰 role/location/caption 계약이 우선",
+            "- role=journey만 있는 후보는 위 필수 이동 거점 계약의 대상이 아님",
+            "- 각 required_meal_event_ids 이벤트의 one_of candidate_id 그룹에서 최소 1개를 포함하고, 반복 방지를 위해 가장 적절한 1개만 우선",
+            "- 선택한 식사 option은 speed=1.0, role=food (날짜의 첫 segment는 hook, 마지막 segment는 closing 허용)",
+            "- 식사 option이 필수 인터뷰/transition과 겹치면 각각 interview/transition 계약이 우선; required_meal_event_ids가 없는 role=food 후보는 필수가 아님",
         ]
     )
     return "\n".join(lines).strip() + "\n"
 
 
 def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash: str) -> dict[str, Any]:
+    meal_event_groups = _meal_event_option_groups(candidates)
     return {
         "version": 1,
         "candidate_set_hash": candidate_set_hash,
         "transcript_policy": "whitespace-normalized excerpt, maximum 240 characters per candidate",
+        "meal_event_selection_contract": {
+            "selection_mode": "one_of",
+            "minimum_selected_per_event": 1,
+            "preferred_selected_per_event": 1,
+            "selected_option_speed": 1.0,
+            "selected_option_role": "food",
+            "boundary_role_exceptions": ["hook_if_first", "closing_if_last"],
+            "overlap_precedence": ["interview", "transition", "food"],
+        },
+        "meal_event_option_groups": [
+            {
+                "event_id": event_id,
+                "day_key": options[0].day_key,
+                "selection_mode": "one_of",
+                "one_of_candidate_ids": [item.candidate_id for item in options],
+            }
+            for event_id, options in meal_event_groups.items()
+        ],
         "candidates": [
             {
                 "candidate_id": item.candidate_id,
@@ -511,6 +657,7 @@ def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash:
                 "transcript_excerpt": _transcript_excerpt(item.transcript, 240),
                 "roles": item.roles,
                 "required_event_ids": list(_required_event_ids(item)),
+                "required_meal_event_ids": list(_required_meal_event_ids(item)),
                 "score": item.score,
                 "speech_ratio": item.speech_ratio,
                 "motion_score": item.motion_score,
@@ -804,13 +951,19 @@ def _select_day_candidates(
     # when it fits, before filling the middle by quality and coverage.
     selected: list[Candidate] = list(mandatory)
 
-    if deduped[-1] not in selected and used_duration(selected) + deduped[-1].duration <= target_seconds:
+    if (
+        deduped[-1] not in selected
+        and not _required_meal_event_ids(deduped[-1])
+        and used_duration(selected) + deduped[-1].duration <= target_seconds
+    ):
         selected.append(deduped[-1])
 
     visual_candidates = [
         item
         for item in deduped
-        if item.visual_quality >= 0.62 and ("scenery" in item.roles or item.speech_ratio <= 0.08)
+        if not _required_meal_event_ids(item)
+        and item.visual_quality >= 0.62
+        and ("scenery" in item.roles or item.speech_ratio <= 0.08)
     ]
     if visual_candidates:
         visual_anchor = max(
@@ -831,7 +984,11 @@ def _select_day_candidates(
         for item in selected
     }
     used_time = sum(item.duration for item in selected)
-    remaining = [item for item in deduped if item not in selected]
+    remaining = [
+        item
+        for item in deduped
+        if item not in selected and not _required_meal_event_ids(item)
+    ]
     while remaining:
         affordable = [item for item in remaining if used_time + item.duration <= target_seconds]
         if not affordable:
@@ -915,7 +1072,15 @@ def _selection_continuity_bonus(
 def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
     ranked = sorted(
         candidates,
-        key=lambda item: (_is_required_interview(item), item.score, item.duration),
+        key=lambda item: (
+            _is_required_interview(item) or _is_required_transition(item),
+            _is_required_interview(item),
+            _is_required_transition(item),
+            bool(_required_meal_event_ids(item)),
+            len(_required_meal_event_ids(item)),
+            item.score,
+            item.duration,
+        ),
         reverse=True,
     )
     kept: list[Candidate] = []
@@ -945,6 +1110,22 @@ def _prompt_role_weights(prompt: str) -> dict[str, float]:
         "food": ("음식", "식사", "먹", "맛", "food", "meal"),
         "scenery": ("풍경", "경치", "바다", "자연", "scenery", "view"),
         "journey": ("여정", "이동", "출발", "도착", "journey", "travel"),
+        "transition": (
+            "이동 거점",
+            "픽업",
+            "환승",
+            "공항",
+            "역",
+            "숙소",
+            "체크인",
+            "체크아웃",
+            "waypoint",
+            "pickup",
+            "airport",
+            "station",
+            "hotel",
+            "transition",
+        ),
         "dialogue": ("대화", "사람", "가족", "친구", "dialogue", "people"),
         "interview": ("인터뷰", "소감", "interview", "favorite", "review"),
     }
@@ -957,7 +1138,7 @@ def _candidate_sort_key(candidate: Candidate) -> tuple[float, float, str]:
 
 
 def _primary_role(roles: list[str]) -> str:
-    for role in ("interview", "fun", "food", "journey", "dialogue", "scenery", "moment"):
+    for role in ("interview", "transition", "fun", "food", "journey", "dialogue", "scenery", "moment"):
         if role in roles:
             return role
     return "moment"
@@ -967,6 +1148,7 @@ def _selection_reason(candidate: Candidate) -> str:
     role = _primary_role(candidate.roles)
     reasons = {
         "interview": "가족이 직접 들려주는 여행 소감과 기억을 보존하는 장면",
+        "transition": "출발과 픽업, 환승, 도착을 잇는 중요한 이동 거점 장면",
         "fun": "재미있는 반응이나 감탄이 살아 있는 장면",
         "food": "여행의 식사 흐름과 현장감을 보여주는 장면",
         "journey": "이동과 여정의 진행을 설명하는 장면",
@@ -977,14 +1159,21 @@ def _selection_reason(candidate: Candidate) -> str:
     return reasons[role]
 
 
-def _role_summary(segments: list[PlanSegment]) -> str:
+def _role_summary(
+    segments: list[PlanSegment],
+    *,
+    has_transition: bool = False,
+    has_meal: bool = False,
+) -> str:
     roles = {segment.role for segment in segments}
     parts = []
     if "journey" in roles:
         parts.append("이동과 여정")
+    if "transition" in roles or has_transition:
+        parts.append("주요 이동 거점")
     if "fun" in roles or "hook" in roles:
         parts.append("재미있는 반응")
-    if "food" in roles:
+    if "food" in roles or has_meal:
         parts.append("먹거리")
     if "scenery" in roles:
         parts.append("풍경")
@@ -998,8 +1187,35 @@ def _required_event_ids(candidate: Candidate) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
 
+def _required_meal_event_ids(candidate: Candidate) -> tuple[str, ...]:
+    values = getattr(candidate, "required_meal_event_ids", []) or []
+    return tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _meal_event_option_groups(candidates: list[Candidate]) -> dict[str, list[Candidate]]:
+    groups: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in sorted(candidates, key=_candidate_sort_key):
+        for event_id in _required_meal_event_ids(candidate):
+            groups[event_id].append(candidate)
+    return {event_id: groups[event_id] for event_id in sorted(groups)}
+
+
+def _meal_option_rank(candidate: Candidate) -> tuple[float, float, float, float, str]:
+    return (
+        candidate.score,
+        candidate.visual_quality,
+        candidate.speech_ratio,
+        candidate.duration,
+        candidate.candidate_id,
+    )
+
+
 def _is_required_interview(candidate: Candidate) -> bool:
     return bool(_required_event_ids(candidate))
+
+
+def _is_required_transition(candidate: Candidate) -> bool:
+    return "transition" in candidate.roles
 
 
 def _mandatory_day_candidates(candidates: list[Candidate]) -> list[Candidate]:
@@ -1010,8 +1226,12 @@ def _mandatory_day_candidates(candidates: list[Candidate]) -> list[Candidate]:
     mandatory_ids.update(
         item.candidate_id
         for item in ordered
-        if _is_required_interview(item)
+        if _is_required_interview(item) or _is_required_transition(item)
     )
+    for options in _meal_event_option_groups(ordered).values():
+        option_ids = {item.candidate_id for item in options}
+        if mandatory_ids.isdisjoint(option_ids):
+            mandatory_ids.add(max(options, key=_meal_option_rank).candidate_id)
     return [item for item in ordered if item.candidate_id in mandatory_ids]
 
 

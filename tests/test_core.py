@@ -42,15 +42,31 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(VideoSummaryError, "preserve_family_interviews"):
             _validate_config(config)
 
+    def test_meal_event_preservation_config_requires_boolean(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        self.assertTrue(config["editing"]["preserve_meal_events"])
+        config["editing"]["preserve_meal_events"] = "yes"
+        with self.assertRaisesRegex(VideoSummaryError, "preserve_meal_events"):
+            _validate_config(config)
+
     def test_analyze_rejects_skipped_transcription_when_interviews_are_preserved(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         paths = project_paths("/tmp", "interview-skip-test")
         with self.assertRaisesRegex(VideoSummaryError, "가족 인터뷰"):
             analyze_project(paths, config, skip_transcribe=True)
 
+    def test_analyze_rejects_skipped_transcription_when_meals_are_preserved(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["editing"]["preserve_family_interviews"] = False
+        config["editing"]["preserve_meal_events"] = True
+        paths = project_paths("/tmp", "meal-skip-test")
+        with self.assertRaisesRegex(VideoSummaryError, "식사 사건"):
+            analyze_project(paths, config, skip_transcribe=True)
+
     def test_analyze_allows_skipped_transcription_after_explicit_interview_opt_out(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         config["editing"]["preserve_family_interviews"] = False
+        config["editing"]["preserve_meal_events"] = False
         paths = project_paths("/tmp", "interview-skip-opt-out-test")
         with (
             patch("video_summary.pipeline.load_clips", return_value=[]),
