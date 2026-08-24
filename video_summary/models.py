@@ -72,6 +72,12 @@ class Candidate:
     required_event_ids: list[str] = field(default_factory=list)
     required_meal_event_ids: list[str] = field(default_factory=list)
     required_meal_context_ids: list[str] = field(default_factory=list)
+    origin: str = "legacy"
+    story_event_id: str | None = None
+    story_stage: str = "body"
+    importance: str = "supporting"
+    speed_policy: str = "protected_1x"
+    exclusion_reason: str | None = None
 
     @property
     def duration(self) -> float:

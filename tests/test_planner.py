@@ -8,10 +8,13 @@ from unittest.mock import patch
 
 from video_summary.models import Candidate
 from video_summary.planner import (
+    _adaptive_compression_speeds,
+    _contact_sheet_day_keys,
     _planner_candidates_payload,
     _prompt_role_weights,
     _sample_contact_sheets,
     _select_day_candidates,
+    build_contact_sheets,
     build_planner_request,
     local_plan,
     plan_project,
@@ -230,7 +233,7 @@ class PlannerTests(unittest.TestCase):
         plan = local_plan(self.config, "여정", anchors, "hash")
         self.assertEqual(
             [item.candidate_id for item in plan.episodes[0].segments],
-            ["early", "late"],
+            ["early", "middle", "late"],
         )
 
     def test_local_plan_keeps_a_strong_silent_visual_anchor(self) -> None:
@@ -281,12 +284,12 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(
             [item.candidate_id for item in segments],
-            ["early", "interview_a", "interview_b"],
+            ["early", "interview_a", "interview_b", "late"],
         )
-        self.assertEqual([item.role for item in segments], ["hook", "interview", "interview"])
-        self.assertTrue(all(item.speed == 1.0 for item in segments[1:]))
-        self.assertTrue(all(item.caption is None for item in segments[1:]))
-        self.assertTrue(all(item.location is None for item in segments[1:]))
+        self.assertEqual([item.role for item in segments[1:3]], ["interview", "interview"])
+        self.assertTrue(all(item.speed == 1.0 for item in segments[1:3]))
+        self.assertTrue(all(item.caption is None for item in segments[1:3]))
+        self.assertTrue(all(item.location is None for item in segments[1:3]))
 
     def test_local_plan_pins_transition_waypoints_past_a_tight_soft_maximum(self) -> None:
         self.config["editing"]["soft_max_minutes_per_day"] = 0.1
@@ -304,11 +307,11 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(
             [item.candidate_id for item in segments],
-            ["early", "pickup", "airport"],
+            ["early", "pickup", "airport", "late"],
         )
-        self.assertEqual([item.role for item in segments], ["hook", "transition", "transition"])
-        self.assertTrue(all(item.speed == 1.0 for item in segments[1:]))
-        self.assertTrue(all("이동 거점" in item.reason for item in segments[1:]))
+        self.assertEqual([item.role for item in segments[1:3]], ["transition", "transition"])
+        self.assertTrue(all(item.speed == 1.0 for item in segments[1:3]))
+        self.assertTrue(all("이동 거점" in item.reason for item in segments[1:3]))
         self.assertIn("주요 이동 거점", plan.episodes[0].summary)
 
     def test_local_plan_selects_one_best_meal_option_past_a_tight_soft_maximum(self) -> None:
@@ -329,11 +332,11 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(
             [item.candidate_id for item in segments],
-            ["early", "breakfast_best", "dinner"],
+            ["early", "breakfast_best", "dinner", "late"],
         )
-        self.assertEqual([item.role for item in segments], ["hook", "food", "food"])
-        self.assertTrue(all(item.speed == 1.0 for item in segments[1:]))
-        self.assertTrue(all("식사 경험" in item.reason for item in segments[1:]))
+        self.assertEqual([item.role for item in segments[1:3]], ["food", "food"])
+        self.assertTrue(all(item.speed == 1.0 for item in segments[1:3]))
+        self.assertTrue(all("식사 경험" in item.reason for item in segments[1:3]))
         self.assertIn("먹거리", plan.episodes[0].summary)
 
     def test_local_plan_pins_detected_meal_setup_body_and_closure(self) -> None:
@@ -366,11 +369,11 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(
             [item.candidate_id for item in segments],
-            ["early", "setup_best", "body", "closure"],
+            ["early", "setup_best", "body", "closure", "late"],
         )
-        self.assertEqual([item.role for item in segments], ["hook", "food", "food", "food"])
-        self.assertTrue(all(item.speed == 1.0 for item in segments[1:]))
-        self.assertTrue(all("식사 경험" in item.reason for item in segments[1:]))
+        self.assertEqual([item.role for item in segments[1:4]], ["food", "food", "food"])
+        self.assertTrue(all(item.speed == 1.0 for item in segments[1:4]))
+        self.assertTrue(all("식사 경험" in item.reason for item in segments[1:4]))
 
     def test_local_meal_group_reuses_an_already_mandatory_transition_option(self) -> None:
         self.config["editing"]["soft_max_minutes_per_day"] = 0.1
@@ -447,17 +450,103 @@ class PlannerTests(unittest.TestCase):
         item.transcript = "민감한 대화 " * 80
         payload = _planner_candidates_payload([item], "hash")
         exported = payload["candidates"][0]
-        self.assertEqual(payload["version"], 2)
-        self.assertEqual(payload["story_selection_contract"]["strategy"], "event_first")
+        self.assertEqual(payload["version"], 3)
+        self.assertEqual(
+            payload["story_selection_contract"]["strategy"],
+            "coverage_first_event_flow",
+        )
         self.assertFalse(payload["story_selection_contract"]["fill_quota"])
         self.assertEqual(
-            payload["story_selection_contract"]["soft_ceiling_scope"],
-            "total_day_runtime",
+            payload["story_selection_contract"]["duration_guard_scope"],
+            "review_and_adaptive_compression_only",
+        )
+        self.assertEqual(
+            payload["story_selection_contract"]["compression_ladder"],
+            ["full", "compact", "speed_up", "omit"],
         )
         self.assertTrue(payload["story_event_groups"])
         self.assertNotIn("transcript", exported)
         self.assertLessEqual(len(exported["transcript_excerpt"]), 240)
         self.assertEqual(exported["required_event_ids"], [])
+        self.assertEqual(exported["speed_policy"], "protected_1x")
+        self.assertIn("story_stage", exported)
+        self.assertIn("exclusion_reason", exported)
+
+    def test_external_planner_materials_fully_omit_excluded_candidates(self) -> None:
+        public_story = candidate("public_story", "2026-11-01T08:00:00-05:00")
+        public_story.story_event_id = "public_event"
+        public_meal = meal_candidate(
+            "public_meal",
+            "2026-11-01T09:00:00-05:00",
+            ["shared_meal"],
+        )
+        private_required = meal_candidate(
+            "private_required",
+            "2026-11-01T10:00:00-05:00",
+            ["shared_meal", "private_meal"],
+        )
+        private_required.required_event_ids = ["private_interview"]
+        private_required.roles = ["interview", "transition", "food"]
+        private_required.transcript = "NEVER_EXPORT_PRIVATE_TRANSCRIPT"
+        private_required.exclusion_reason = "private scene"
+        private_story = candidate(
+            "private_story",
+            "2026-11-01T11:00:00-05:00",
+        )
+        private_story.story_event_id = "private_event"
+        private_story.transcript = "NEVER_EXPORT_PRIVATE_STORY"
+        private_story.exclusion_reason = "private scene"
+        items = [public_story, public_meal, private_required, private_story]
+
+        payload = _planner_candidates_payload(items, "hash")
+        request = build_planner_request(
+            ProjectPaths(Path("/tmp"), "project"),
+            self.config,
+            "private scenes must stay private",
+            items,
+            "hash",
+        )
+
+        self.assertEqual(
+            [item["candidate_id"] for item in payload["candidates"]],
+            ["public_story", "public_meal"],
+        )
+        self.assertEqual(
+            payload["meal_event_option_groups"][0]["one_of_candidate_ids"],
+            ["public_meal"],
+        )
+        self.assertNotIn("private_meal", repr(payload))
+        self.assertNotIn("private_event", repr(payload))
+        self.assertNotIn("NEVER_EXPORT_PRIVATE", repr(payload))
+        self.assertNotIn("private_required", request)
+        self.assertNotIn("private_story", request)
+        self.assertNotIn("private_interview", request)
+        self.assertNotIn("private_meal", request)
+        self.assertNotIn("NEVER_EXPORT_PRIVATE", request)
+
+    def test_contact_sheets_never_open_excluded_candidate_frames(self) -> None:
+        public = candidate("public", "2026-11-01T08:00:00-05:00")
+        public.roles = ["journey"]
+        private = candidate("private", "2026-11-02T08:00:00-05:00")
+        private.day_key = "2026-11-02"
+        private.travel_day = 2
+        private.frame_path = "frames/never-open-private.jpg"
+        private.exclusion_reason = "private scene"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            with patch("video_summary.planner.Image.open", side_effect=OSError) as opened:
+                sheets = build_contact_sheets(
+                    paths,
+                    [private, public],
+                    self.config,
+                    output_dir=paths.planner / "filtered-sheets",
+                )
+
+        self.assertEqual(len(sheets), 1)
+        opened.assert_called_once_with(paths.root / public.frame_path)
+        self.assertEqual(_contact_sheet_day_keys([private, public]), [(public.day_key,)])
 
     def test_external_candidate_payload_and_request_expose_the_interview_contract(self) -> None:
         interview = candidate(
@@ -603,6 +692,18 @@ class PlannerTests(unittest.TestCase):
         segment_schema = schema["properties"]["episodes"]["items"]["properties"]["segments"]["items"]
         self.assertEqual(set(segment_schema["required"]), set(segment_schema["properties"]))
         self.assertIn("interview", segment_schema["properties"]["role"]["enum"])
+        self.assertEqual(segment_schema["properties"]["speed"]["maximum"], 4.0)
+        configured_schema = planner_schema(max_speed=3.0)
+        configured_speed = configured_schema["properties"]["episodes"]["items"][
+            "properties"
+        ]["segments"]["items"]["properties"]["speed"]
+        self.assertEqual(configured_speed["minimum"], 0.75)
+        self.assertEqual(configured_speed["maximum"], 3.0)
+        capped_schema = planner_schema(max_speed=8.0)
+        capped_speed = capped_schema["properties"]["episodes"]["items"][
+            "properties"
+        ]["segments"]["items"]["properties"]["speed"]
+        self.assertEqual(capped_speed["maximum"], 4.0)
 
     def test_contact_sheet_sampling_spans_the_full_trip(self) -> None:
         sheets = [Path(f"sheet-{index:03d}.jpg") for index in range(1, 31)]
@@ -663,7 +764,7 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual([segment.candidate_id for segment in plan.episodes[0].segments], ["a", "c"])
 
-    def test_local_selection_prefers_a_contiguous_run_over_an_isolated_score_edge(self) -> None:
+    def test_event_flow_keeps_distinct_meaningful_runs_instead_of_using_score_as_a_cutoff(self) -> None:
         items = [
             candidate("early", "2026-11-01T08:00:00-05:00", 0.0),
             candidate("run_a", "2026-11-01T09:00:00-05:00", 0.0),
@@ -681,9 +782,12 @@ class PlannerTests(unittest.TestCase):
 
         selected = _select_day_candidates(items, 20.0)
 
-        self.assertEqual([item.candidate_id for item in selected], ["early", "run_a", "run_b", "late"])
+        self.assertEqual(
+            [item.candidate_id for item in selected],
+            ["early", "run_a", "run_b", "isolated", "late"],
+        )
 
-    def test_event_first_stops_after_coverage_without_filling_the_soft_maximum(self) -> None:
+    def test_event_flow_omits_only_the_weak_fragment_after_meaningful_coverage(self) -> None:
         items = [
             candidate("early", "2026-11-01T08:00:00-05:00"),
             candidate("strong", "2026-11-01T08:02:00-05:00"),
@@ -705,11 +809,40 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(
             [item.candidate_id for item in selected],
-            ["early", "strong", "closing"],
+            ["early", "strong", "near_duplicate", "closing"],
         )
-        self.assertEqual(sum(item.duration for item in selected), 15.0)
+        self.assertEqual(sum(item.duration for item in selected), 20.0)
 
-    def test_event_first_balances_dense_events_across_the_full_day(self) -> None:
+    def test_event_flow_keeps_a_bounded_coverage_gap_inside_one_source_action(self) -> None:
+        setup = candidate("setup", "2026-11-01T09:00:00-05:00", 0.0)
+        action = candidate("action", "2026-11-01T09:00:05-05:00", 5.0)
+        outcome = candidate("outcome", "2026-11-01T09:00:15-05:00", 15.0)
+        for item in (setup, action, outcome):
+            item.clip_id = "shared"
+            item.story_event_id = "gacha"
+        setup.origin = "speech"
+        setup.story_stage = "setup"
+        setup.score = 0.9
+        action.end = 15.0
+        action.origin = "coverage"
+        action.story_stage = "bridge"
+        action.roles = ["moment"]
+        action.score = 0.2
+        action.speech_ratio = 0.0
+        action.speed_policy = "allow_fast"
+        outcome.origin = "speech"
+        outcome.story_stage = "outcome"
+        outcome.roles = ["fun", "closer"]
+        outcome.score = 0.9
+
+        selected = _select_day_candidates([setup, action, outcome], 5.0)
+
+        self.assertEqual(
+            [item.candidate_id for item in selected],
+            ["setup", "action", "outcome"],
+        )
+
+    def test_soft_guard_never_deletes_dense_unique_events_across_the_full_day(self) -> None:
         items: list[Candidate] = []
         for index in range(13):
             total_minutes = 8 * 60 + index * 31
@@ -732,12 +865,8 @@ class PlannerTests(unittest.TestCase):
             for item in selected
         }
 
-        self.assertLessEqual(sum(item.duration for item in selected), 300.0)
-        self.assertIn(0, selected_indexes)
-        self.assertIn(12, selected_indexes)
-        self.assertTrue(selected_indexes & set(range(1, 4)))
-        self.assertTrue(selected_indexes & set(range(4, 9)))
-        self.assertTrue(selected_indexes & set(range(9, 12)))
+        self.assertGreater(sum(item.duration for item in selected), 300.0)
+        self.assertEqual(selected_indexes, set(range(13)))
 
     def test_soft_maximum_includes_mandatory_runtime_before_story_events(self) -> None:
         items = [
@@ -769,7 +898,7 @@ class PlannerTests(unittest.TestCase):
         )
         self.assertEqual(sum(item.duration for item in selected), 600.0)
 
-    def test_mandatory_runtime_over_soft_maximum_blocks_optional_events(self) -> None:
+    def test_mandatory_runtime_over_soft_guard_does_not_delete_a_unique_optional_event(self) -> None:
         interview = candidate(
             "interview",
             "2026-11-01T08:00:00-05:00",
@@ -784,7 +913,10 @@ class PlannerTests(unittest.TestCase):
 
         selected = _select_day_candidates([interview, optional], 600.0)
 
-        self.assertEqual([item.candidate_id for item in selected], ["interview"])
+        self.assertEqual(
+            [item.candidate_id for item in selected],
+            ["interview", "optional"],
+        )
 
     def test_legacy_target_changes_metadata_but_not_event_selection(self) -> None:
         items = [
@@ -806,7 +938,174 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(five_minute_plan.episodes[0].target_duration, 300.0)
         self.assertEqual(six_minute_plan.episodes[0].target_duration, 360.0)
 
-    def test_external_request_declares_event_first_and_a_separate_soft_ceiling(self) -> None:
+    def test_review_guard_changes_compression_but_not_unique_event_coverage(self) -> None:
+        items = [
+            candidate("anchor", "2026-11-01T08:00:00-05:00"),
+            candidate("walk", "2026-11-01T09:00:00-05:00"),
+            candidate("meal", "2026-11-01T10:00:00-05:00"),
+            candidate("closing", "2026-11-01T11:00:00-05:00"),
+        ]
+        for index, item in enumerate(items):
+            item.story_event_id = f"event_{index}"
+        items[1].end = items[1].start + 60.0
+        items[1].transcript = ""
+        items[1].roles = ["journey"]
+        items[1].score = 0.8
+        items[1].speech_ratio = 0.0
+        items[1].motion_score = 0.02
+        items[1].importance = "bridge"
+        items[1].speed_policy = "allow_fast"
+        items[1].story_stage = "bridge"
+        items[2].roles = ["food"]
+        items[2].speed_policy = "protected_1x"
+        items[3].roles = ["journey", "closer"]
+
+        relaxed = copy.deepcopy(self.config)
+        relaxed["editing"]["soft_max_minutes_per_day"] = 10.0
+        tight = copy.deepcopy(self.config)
+        tight["editing"]["soft_max_minutes_per_day"] = 0.2
+
+        relaxed_plan = local_plan(relaxed, "전체 이벤트 흐름", items, "hash")
+        tight_plan = local_plan(tight, "전체 이벤트 흐름", items, "hash")
+
+        self.assertEqual(
+            [segment.candidate_id for segment in relaxed_plan.episodes[0].segments],
+            [segment.candidate_id for segment in tight_plan.episodes[0].segments],
+        )
+        self.assertEqual(
+            [segment.candidate_id for segment in tight_plan.episodes[0].segments],
+            ["anchor", "walk", "meal", "closing"],
+        )
+        relaxed_speeds = {
+            segment.candidate_id: segment.speed
+            for segment in relaxed_plan.episodes[0].segments
+        }
+        tight_speeds = {
+            segment.candidate_id: segment.speed
+            for segment in tight_plan.episodes[0].segments
+        }
+        self.assertEqual(relaxed_speeds["walk"], 1.0)
+        self.assertGreater(tight_speeds["walk"], 1.0)
+        self.assertEqual(tight_speeds["meal"], 1.0)
+
+    def test_adaptive_compression_only_speeds_eligible_internal_bridges(self) -> None:
+        items = [
+            candidate("anchor", "2026-11-01T08:00:00-05:00"),
+            candidate("bridge", "2026-11-01T09:00:00-05:00"),
+            candidate("activity", "2026-11-01T10:00:00-05:00"),
+            candidate("closing", "2026-11-01T11:00:00-05:00"),
+        ]
+        items[1].end = items[1].start + 90.0
+        items[1].transcript = ""
+        items[1].roles = ["journey"]
+        items[1].speech_ratio = 0.0
+        items[1].motion_score = 0.02
+        items[1].importance = "bridge"
+        items[1].speed_policy = "allow_fast"
+        items[2].end = items[2].start + 60.0
+        items[2].roles = ["fun"]
+        items[2].speed_policy = "protected_1x"
+        items[3].roles = ["journey", "closer"]
+
+        speeds = _adaptive_compression_speeds(
+            items,
+            80.0,
+            enabled=True,
+            max_speed=4.0,
+        )
+
+        self.assertEqual(speeds["anchor"], 1.0)
+        self.assertEqual(speeds["bridge"], 3.0)
+        self.assertEqual(speeds["activity"], 1.0)
+        self.assertEqual(speeds["closing"], 1.0)
+
+    def test_validator_accepts_fast_forward_only_for_allow_fast_candidates(self) -> None:
+        self.candidates[1].transcript = ""
+        self.candidates[1].roles = ["journey"]
+        self.candidates[1].speech_ratio = 0.0
+        self.candidates[1].speed_policy = "allow_fast"
+        payload = self.valid_payload()
+        payload["episodes"][0]["segments"][1].update(
+            {"role": "journey", "speed": 3.0}
+        )
+
+        plan = validate_and_normalize_plan(
+            payload,
+            self.config,
+            "x",
+            self.candidates,
+            "hash",
+            "file",
+        )
+        self.assertEqual(plan.episodes[0].segments[1].speed, 3.0)
+
+        payload["episodes"][0]["segments"][1]["speed"] = 0.75
+        plan = validate_and_normalize_plan(
+            payload,
+            self.config,
+            "x",
+            self.candidates,
+            "hash",
+            "file",
+        )
+        self.assertEqual(plan.episodes[0].segments[1].speed, 0.75)
+
+        payload["episodes"][0]["segments"][1]["speed"] = 3.5
+        with self.assertRaisesRegex(VideoSummaryError, "0.75~3"):
+            validate_and_normalize_plan(
+                payload,
+                self.config,
+                "x",
+                self.candidates,
+                "hash",
+                "file",
+            )
+
+    def test_non_fast_speed_policies_require_exactly_one_x(self) -> None:
+        payload = self.valid_payload()
+        for policy in ("protected_1x", "omit"):
+            self.candidates[1].speed_policy = policy
+            for speed in (0.75, 1.25):
+                with self.subTest(policy=policy, speed=speed):
+                    payload["episodes"][0]["segments"][1]["speed"] = speed
+                    with self.assertRaisesRegex(VideoSummaryError, "speed=1.0"):
+                        validate_and_normalize_plan(
+                            payload,
+                            self.config,
+                            "x",
+                            self.candidates,
+                            "hash",
+                            "file",
+                        )
+
+            payload["episodes"][0]["segments"][1]["speed"] = 1.0
+            plan = validate_and_normalize_plan(
+                payload,
+                self.config,
+                "x",
+                self.candidates,
+                "hash",
+                "file",
+            )
+            self.assertEqual(plan.episodes[0].segments[1].speed, 1.0)
+
+    def test_explicitly_excluded_candidate_is_unselectable_and_not_a_required_anchor(self) -> None:
+        self.candidates[0].exclusion_reason = "사적 장면"
+        payload = self.valid_payload()
+        with self.assertRaisesRegex(VideoSummaryError, "명시적으로 제외된 후보"):
+            validate_and_normalize_plan(
+                payload,
+                self.config,
+                "x",
+                self.candidates,
+                "hash",
+                "file",
+            )
+
+        selected = _select_day_candidates(self.candidates, 600.0)
+        self.assertEqual([item.candidate_id for item in selected], ["c2"])
+
+    def test_external_request_declares_full_event_flow_and_a_review_guard(self) -> None:
         request = build_planner_request(
             ProjectPaths(Path("/tmp"), "project"),
             self.config,
@@ -815,14 +1114,16 @@ class PlannerTests(unittest.TestCase):
             "hash",
         )
 
-        self.assertIn("semantic event group", request)
+        self.assertIn("story_event_id", request)
+        self.assertIn("setup/body/action/outcome/closure", request)
         self.assertIn("채워야 하는 할당량이 아닙니다", request)
-        self.assertIn("약한 fragment나 near-duplicate", request)
-        self.assertIn("usable candidate total: 10.0s", request)
-        self.assertIn("soft maximum: 600.0s", request)
+        self.assertIn("full → compact → speed_up → omit", request)
+        self.assertIn("accounted candidate total: 10.0s", request)
+        self.assertIn("duration review guard: 600.0s", request)
         self.assertIn("Legacy target_duration per day: 0.2 minutes", request)
-        self.assertIn("Soft maximum per day: 10.0 minutes", request)
-        self.assertIn("DAY 전체 runtime은 soft maximum 600.0초 이내", request)
+        self.assertIn("Duration review guard per day: 10.0 minutes", request)
+        self.assertIn("Maximum fast-forward speed: 3.0x", request)
+        self.assertIn("고유 event 보존 때문에 초과해도 허용", request)
         self.assertIn("target_duration 필드는 호환성을 위해 12.0으로 유지", request)
         self.assertIn("location/caption은 null, speed는 1.0", request)
 
@@ -854,7 +1155,7 @@ class PlannerTests(unittest.TestCase):
             ["c1"],
         )
 
-    def test_validator_uses_soft_maximum_instead_of_the_legacy_target(self) -> None:
+    def test_duration_review_guard_does_not_change_the_legacy_target_metadata(self) -> None:
         self.config["editing"]["soft_max_minutes_per_day"] = 3.0
         self.candidates[1].end = self.candidates[1].start + 150.0
 
@@ -869,18 +1170,22 @@ class PlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.episodes[0].target_duration, 12.0)
 
-    def test_validator_rejects_ordinary_runtime_past_remaining_soft_maximum(self) -> None:
+    def test_validator_accepts_ordinary_runtime_past_the_review_guard(self) -> None:
         self.config["editing"]["soft_max_minutes_per_day"] = 0.1
 
-        with self.assertRaisesRegex(VideoSummaryError, "soft maximum 6.0초"):
-            validate_and_normalize_plan(
-                self.valid_payload(),
-                self.config,
-                "x",
-                self.candidates,
-                "hash",
-                "file",
-            )
+        plan = validate_and_normalize_plan(
+            self.valid_payload(),
+            self.config,
+            "x",
+            self.candidates,
+            "hash",
+            "file",
+        )
+
+        self.assertEqual(
+            [segment.candidate_id for segment in plan.episodes[0].segments],
+            ["c1", "c2"],
+        )
 
     def test_meaningful_closing_can_extend_the_soft_maximum(self) -> None:
         self.config["editing"]["soft_max_minutes_per_day"] = 0.1

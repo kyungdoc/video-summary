@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -40,17 +41,21 @@ JOURNEY_TRANSITION_DEDUPE_SECONDS = 60.0
 PARTY_TRANSITION_CONTEXT_POLICY_VERSION = 1
 PARTY_TRANSITION_CONTEXT_MAX_SECONDS = 12.0
 PARTY_TRANSITION_CONTEXT_MAX_CUES = 3
-MEAL_EVENT_POLICY_VERSION = 5
+MEAL_EVENT_POLICY_VERSION = 6
 MEAL_OPTION_MAX_DURATION_SECONDS = 12.0
 MEAL_SETUP_HORIZON_SECONDS = 3.0 * 60.0 * 60.0
 MEAL_DIRECT_CLUSTER_SECONDS = 30.0 * 60.0
-MEAL_INFER_AFTER_SETUP_SECONDS = 60.0 * 60.0
+MEAL_INFER_AFTER_SETUP_SECONDS = 15.0 * 60.0
 MEAL_INFER_BEFORE_CLOSURE_SECONDS = 15.0 * 60.0
 INTERVIEW_DETECTION_POLICY_VERSION = 3
 INTERVIEW_ANSWER_WAIT_SECONDS = 15.0
 INTERVIEW_CONTINUATION_GAP_SECONDS = 12.0
 INTERVIEW_EVENT_MAX_SPAN_SECONDS = 180.0
 INTERVIEW_CONTEXT_EVENT_MAX_DISTANCE_SECONDS = 90.0
+FULL_COVERAGE_PARTITION_POLICY_VERSION = 1
+STORY_EVENT_CATALOG_POLICY_VERSION = 3
+STORY_EVENT_GAP_SECONDS = 5.0 * 60.0
+STORY_EVENT_MAX_SPAN_SECONDS = 45.0 * 60.0
 
 
 _KO_TRAVEL_PARTY = (
@@ -790,6 +795,12 @@ def build_candidates(
                 )
                 speech_ratio = min(1.0, speech_duration / max(0.1, end - start))
                 location = _candidate_location(clip, text, config.get("locations", []))
+                exclusion_reason = _candidate_exclusion_reason(
+                    clip,
+                    start,
+                    end,
+                    config["editing"].get("exclude_ranges", []),
+                )
                 score = _score_candidate(roles, speech_ratio, motion, quality, start, end, clip.duration)
                 candidate_id = "cand_" + stable_hash(
                     {
@@ -828,10 +839,13 @@ def build_candidates(
                         required_event_ids=required_event_ids,
                         required_meal_event_ids=required_meal_event_ids,
                         required_meal_context_ids=required_meal_context_ids,
+                        origin=origin,
+                        exclusion_reason=exclusion_reason,
                     )
                 )
 
         candidates.sort(key=lambda item: (_candidate_timestamp(item), item.candidate_id))
+        _assign_story_event_metadata(candidates)
         if not candidates:
             raise VideoSummaryError("편집 후보를 만들지 못했습니다.")
         required_events = [
@@ -839,12 +853,14 @@ def build_candidates(
             *_required_meal_events_payload(meal_events, candidates),
         ]
         payload = {
-            "version": 4,
+            "version": 5,
             "project": config["project"]["name"],
             "cache_key": cache_key,
             "policy_versions": {
                 "journey_transition": JOURNEY_TRANSITION_POLICY_VERSION,
                 "meal_event": MEAL_EVENT_POLICY_VERSION,
+                "full_coverage_partition": FULL_COVERAGE_PARTITION_POLICY_VERSION,
+                "story_event_catalog": STORY_EVENT_CATALOG_POLICY_VERSION,
             },
             "candidate_set_hash": stable_hash([candidate.to_dict() for candidate in candidates], length=32),
             "count": len(candidates),
@@ -894,7 +910,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 14,
+            "version": 16,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "journey_transition_detection": {
                 "policy": JOURNEY_TRANSITION_POLICY_VERSION,
@@ -908,6 +924,8 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
                 "policy": INTERVIEW_DETECTION_POLICY_VERSION,
                 "preserve": _preserve_family_interviews(config),
             },
+            "full_coverage_partition": FULL_COVERAGE_PARTITION_POLICY_VERSION,
+            "story_event_catalog": STORY_EVENT_CATALOG_POLICY_VERSION,
             "project": config["project"]["name"],
             "clips": [
                 (
@@ -932,8 +950,241 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             "interval": float(analysis.get("sample_interval_seconds", 3.0)),
             "max_per_clip": int(analysis.get("max_candidates_per_clip", 8)),
             "locations": config.get("locations", []),
+            "exclude_ranges": config.get("editing", {}).get("exclude_ranges", []),
         }
     )
+
+
+def _candidate_exclusion_reason(
+    clip: Clip,
+    start: float,
+    end: float,
+    rules: list[dict[str, Any]],
+) -> str | None:
+    relative = clip.relative_path
+    basename = Path(relative).name
+    for rule in rules:
+        pattern = str(rule.get("match", "")).strip()
+        root_pattern = pattern[3:] if pattern.startswith("**/") else pattern
+        if not pattern or not (
+            fnmatch(relative, pattern)
+            or fnmatch(basename, pattern)
+            or (root_pattern != pattern and fnmatch(relative, root_pattern))
+        ):
+            continue
+        rule_start = float(rule.get("start", 0.0))
+        rule_end = float(rule["end"]) if rule.get("end") is not None else clip.duration
+        if min(end, rule_end) - max(start, rule_start) > 0.001:
+            return str(rule.get("reason", "사용자 제외 구간")).strip()
+    return None
+
+
+def _assign_story_event_metadata(candidates: list[Candidate]) -> None:
+    """Attach a stable activity block and auditable compression contract."""
+    by_day: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in sorted(candidates, key=lambda item: (_candidate_timestamp(item), item.candidate_id)):
+        by_day[candidate.day_key].append(candidate)
+
+    for day_key, ordered in by_day.items():
+        explicit_event_ids = _effective_story_event_ids(ordered)
+        clusters: list[list[Candidate]] = []
+        cluster_event_ids: set[str] = set()
+        cluster_activity_kinds: set[str] = set()
+        for candidate_index, candidate in enumerate(ordered):
+            candidate_event_ids = explicit_event_ids[candidate_index]
+            candidate_activity_kinds = _candidate_strong_activity_kinds(candidate)
+            if not clusters:
+                clusters.append([candidate])
+                cluster_event_ids.update(candidate_event_ids)
+                cluster_activity_kinds.update(candidate_activity_kinds)
+                continue
+            current = clusters[-1]
+            previous = current[-1]
+            previous_end = _candidate_timestamp(previous) + previous.duration
+            current_start = _candidate_timestamp(candidate)
+            cluster_start = _candidate_timestamp(current[0])
+            location_changed = bool(
+                previous.location
+                and candidate.location
+                and previous.location != candidate.location
+            )
+            transition_boundary = (
+                candidate.clip_id != previous.clip_id
+                and "transition" in candidate.roles
+            )
+            same_explicit_event = bool(cluster_event_ids & candidate_event_ids)
+            explicit_event_boundary = bool(
+                candidate_event_ids and not same_explicit_event
+            )
+            activity_boundary = bool(
+                cluster_activity_kinds
+                and candidate_activity_kinds
+                and cluster_activity_kinds.isdisjoint(candidate_activity_kinds)
+            )
+            ordinary_boundary = (
+                current_start - previous_end > STORY_EVENT_GAP_SECONDS
+                or current_start - cluster_start > STORY_EVENT_MAX_SPAN_SECONDS
+                or location_changed
+                or transition_boundary
+                or activity_boundary
+            )
+            if explicit_event_boundary or (ordinary_boundary and not same_explicit_event):
+                clusters.append([candidate])
+                cluster_event_ids = set(candidate_event_ids)
+                cluster_activity_kinds = set(candidate_activity_kinds)
+            else:
+                current.append(candidate)
+                cluster_event_ids.update(candidate_event_ids)
+                cluster_activity_kinds.update(candidate_activity_kinds)
+
+        for cluster in clusters:
+            event_id = "story_" + stable_hash(
+                {
+                    "policy": STORY_EVENT_CATALOG_POLICY_VERSION,
+                    "day_key": day_key,
+                    "clip_id": cluster[0].clip_id,
+                    "captured_at": cluster[0].captured_at,
+                },
+                length=18,
+            )
+            event_is_core = any(
+                item.required_event_ids
+                or item.required_meal_event_ids
+                or item.required_meal_context_ids
+                or "transition" in item.roles
+                for item in cluster
+            )
+            for index, item in enumerate(cluster):
+                item.story_event_id = event_id
+                item.story_stage = _candidate_story_stage(item, index, len(cluster))
+                item.importance = _candidate_importance(item, event_is_core)
+                item.speed_policy = _candidate_speed_policy(item)
+
+
+def _candidate_explicit_story_event_ids(candidate: Candidate) -> frozenset[str]:
+    event_ids = {
+        f"interview:{str(value).strip()}"
+        for value in candidate.required_event_ids
+        if str(value).strip()
+    }
+    event_ids.update(
+        f"meal:{str(value).strip()}"
+        for value in candidate.required_meal_event_ids
+        if str(value).strip()
+    )
+    for context_id in candidate.required_meal_context_ids:
+        normalized = str(context_id).strip()
+        if not normalized:
+            continue
+        event_id, separator, stage = normalized.rpartition(":")
+        if separator and event_id and stage in {"setup", "closure"}:
+            normalized = event_id
+        event_ids.add(f"meal:{normalized}")
+    return frozenset(event_ids)
+
+
+def _candidate_strong_activity_kinds(candidate: Candidate) -> frozenset[str]:
+    roles = set(candidate.roles)
+    return frozenset(role for role in ("food", "fun", "scenery") if role in roles)
+
+
+def _effective_story_event_ids(candidates: list[Candidate]) -> list[frozenset[str]]:
+    """Attach silent coverage only when it is bracketed by the same explicit event."""
+    explicit = [_candidate_explicit_story_event_ids(candidate) for candidate in candidates]
+    previous_ids: list[frozenset[str]] = []
+    previous = frozenset()
+    for event_ids in explicit:
+        previous_ids.append(previous)
+        if event_ids:
+            previous = event_ids
+
+    following_ids: list[frozenset[str]] = [frozenset() for _ in candidates]
+    following = frozenset()
+    for index in range(len(candidates) - 1, -1, -1):
+        following_ids[index] = following
+        if explicit[index]:
+            following = explicit[index]
+
+    effective = list(explicit)
+    for index, candidate in enumerate(candidates):
+        if explicit[index] or not _is_silent_story_bridge(candidate):
+            continue
+        shared = previous_ids[index] & following_ids[index]
+        if shared:
+            effective[index] = frozenset(shared)
+    return effective
+
+
+def _is_silent_story_bridge(candidate: Candidate) -> bool:
+    return (
+        candidate.origin == "coverage"
+        and candidate.speech_ratio <= 0.08
+        and not (
+            set(candidate.roles)
+            & {"dialogue", "food", "fun", "scenery", "interview", "transition"}
+        )
+    )
+
+
+def _candidate_story_stage(candidate: Candidate, index: int, count: int) -> str:
+    context_stages = {
+        value.rsplit(":", 1)[-1]
+        for value in candidate.required_meal_context_ids
+    }
+    if "setup" in context_stages:
+        return "setup"
+    if candidate.required_meal_event_ids:
+        return "body"
+    if "closure" in context_stages:
+        return "closure"
+    if candidate.required_event_ids:
+        return "outcome"
+    if "transition" in candidate.roles:
+        return "bridge"
+    if "food" in candidate.roles:
+        return "body"
+    if "fun" in candidate.roles:
+        return "action"
+    if candidate.origin == "coverage":
+        return "bridge"
+    if index == 0:
+        return "setup"
+    if index == count - 1:
+        return "closure"
+    return "body"
+
+
+def _candidate_importance(candidate: Candidate, event_is_core: bool) -> str:
+    if candidate.exclusion_reason:
+        return "discard"
+    if event_is_core or candidate.required_event_ids:
+        return "core"
+    if set(candidate.roles) & {"food", "fun", "dialogue", "scenery"}:
+        return "supporting"
+    return "bridge"
+
+
+def _candidate_speed_policy(candidate: Candidate) -> str:
+    if candidate.exclusion_reason:
+        return "omit"
+    protected_roles = {
+        "interview",
+        "transition",
+        "food",
+        "fun",
+        "dialogue",
+        "scenery",
+    }
+    if (
+        candidate.required_event_ids
+        or candidate.required_meal_event_ids
+        or candidate.required_meal_context_ids
+        or set(candidate.roles) & protected_roles
+        or candidate.speech_ratio > 0.08
+        or candidate.story_stage == "outcome"
+    ):
+        return "protected_1x"
+    return "allow_fast"
 
 
 def _preserve_family_interviews(config: dict[str, Any]) -> bool:
@@ -2667,7 +2918,48 @@ def _candidate_windows(
     # Meal bodies and their detected setup/closure beats are semantic options,
     # added after the ordinary per-clip cap so the full micro-story survives.
     selected.extend(meal_windows or [])
-    return _merge_overlapping_windows(selected)
+    return _partition_full_clip_coverage(
+        _merge_overlapping_windows(selected),
+        clip.duration,
+    )
+
+
+def _partition_full_clip_coverage(
+    selected: list[tuple[float, float, str]],
+    duration: float,
+) -> list[tuple[float, float, str]]:
+    """Keep every source interval auditable without making it mandatory.
+
+    Semantic and scored candidates retain their exact windows.  Any uncovered
+    source time is split into bounded ``coverage`` candidates so later planning
+    can explicitly keep, speed up, compact, or omit it instead of silently
+    losing the interval before event construction.
+    """
+    if duration <= 0:
+        return []
+    ordered = sorted(selected, key=lambda item: (item[0], item[1], item[2]))
+    result: list[tuple[float, float, str]] = []
+    cursor = 0.0
+
+    def append_gap(start: float, end: float) -> None:
+        gap = end - start
+        if gap <= 0.001:
+            return
+        part_count = max(1, math.ceil(gap / MAX_CANDIDATE_DURATION_SECONDS))
+        for index in range(part_count):
+            part_start = start + gap * index / part_count
+            part_end = start + gap * (index + 1) / part_count
+            result.append((part_start, part_end, "coverage"))
+
+    for start, end, origin in ordered:
+        bounded_start = max(0.0, min(duration, start))
+        bounded_end = max(bounded_start, min(duration, end))
+        append_gap(cursor, bounded_start)
+        if bounded_end - bounded_start > 0.001:
+            result.append((bounded_start, bounded_end, origin))
+            cursor = max(cursor, bounded_end)
+    append_gap(cursor, duration)
+    return sorted(result, key=lambda item: (item[0], item[1], item[2]))
 
 
 def _merge_overlapping_windows(

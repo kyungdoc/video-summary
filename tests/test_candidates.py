@@ -7,11 +7,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from video_summary.candidates import (
+    FULL_COVERAGE_PARTITION_POLICY_VERSION,
     INTERVIEW_DETECTION_POLICY_VERSION,
     JOURNEY_TRANSITION_POLICY_VERSION,
     MEAL_EVENT_POLICY_VERSION,
     PARTY_TRANSITION_CONTEXT_POLICY_VERSION,
+    STORY_EVENT_CATALOG_POLICY_VERSION,
     VISUAL_SIGNAL_POLICY_VERSION,
+    _assign_story_event_metadata,
+    _candidate_exclusion_reason,
     _detect_family_interview_events,
     _detect_interview_events,
     _detect_journey_transition_windows,
@@ -23,6 +27,7 @@ from video_summary.candidates import (
     _journey_transition_signal,
     _merge_overlapping_windows,
     _meal_direct_signal,
+    _partition_full_clip_coverage,
     build_candidates,
 )
 from video_summary.models import Candidate, Clip, TranscriptCue
@@ -80,6 +85,12 @@ class CandidateCoverageTests(unittest.TestCase):
         self.assertEqual(candidate.required_event_ids, [])
         self.assertEqual(candidate.required_meal_event_ids, [])
         self.assertEqual(candidate.required_meal_context_ids, [])
+        self.assertEqual(candidate.origin, "legacy")
+        self.assertIsNone(candidate.story_event_id)
+        self.assertEqual(candidate.story_stage, "body")
+        self.assertEqual(candidate.importance, "supporting")
+        self.assertEqual(candidate.speed_policy, "protected_1x")
+        self.assertIsNone(candidate.exclusion_reason)
 
     def test_candidate_cache_key_tracks_visual_signal_policy(self) -> None:
         clip = Clip(
@@ -160,6 +171,38 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertNotEqual(current, disabled)
         self.assertNotEqual(current, changed_policy)
+
+    def test_candidate_cache_key_tracks_full_coverage_event_policies_and_exclusions(self) -> None:
+        clip = _clip(duration=10.0)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            current = _candidate_cache_key(paths, [clip], config)
+            excluded_config = copy.deepcopy(config)
+            excluded_config["editing"]["exclude_ranges"] = [
+                {
+                    "match": "clip.mp4",
+                    "start": 2.0,
+                    "end": 4.0,
+                    "reason": "사적 장면",
+                }
+            ]
+            excluded = _candidate_cache_key(paths, [clip], excluded_config)
+            with patch(
+                "video_summary.candidates.FULL_COVERAGE_PARTITION_POLICY_VERSION",
+                FULL_COVERAGE_PARTITION_POLICY_VERSION + 1,
+            ):
+                changed_partition = _candidate_cache_key(paths, [clip], config)
+            with patch(
+                "video_summary.candidates.STORY_EVENT_CATALOG_POLICY_VERSION",
+                STORY_EVENT_CATALOG_POLICY_VERSION + 1,
+            ):
+                changed_event_catalog = _candidate_cache_key(paths, [clip], config)
+
+        self.assertNotEqual(current, excluded)
+        self.assertNotEqual(current, changed_partition)
+        self.assertNotEqual(current, changed_event_catalog)
 
     def test_meal_direct_signal_requires_filmed_present_food_evidence(self) -> None:
         positives = [
@@ -363,6 +406,26 @@ class CandidateCoverageTests(unittest.TestCase):
             "lunch_setup": [TranscriptCue(0.0, 3.0, "점심 먹으러 갑시다")],
             "sea_view": [TranscriptCue(0.0, 4.0, "바다가 정말 예쁘네요")],
             "lunch_closure": [TranscriptCue(0.0, 3.0, "점심 먹고 나왔어요")],
+        }
+
+        self.assertEqual(_detect_meal_events(clips, cues), [])
+
+    def test_distant_silent_clip_after_restaurant_arrival_is_not_a_meal_body(self) -> None:
+        clips = [
+            _clip(
+                "restaurant",
+                duration=30.0,
+                captured_at="2026-08-20T19:20:00+09:00",
+            ),
+            _clip(
+                "hotel-show",
+                duration=20.0,
+                captured_at="2026-08-20T20:10:00+09:00",
+            ),
+        ]
+        cues = {
+            "restaurant": [TranscriptCue(20.0, 24.0, "저녁 식당에 도착했습니다")],
+            "hotel-show": [],
         }
 
         self.assertEqual(_detect_meal_events(clips, cues), [])
@@ -808,8 +871,16 @@ class CandidateCoverageTests(unittest.TestCase):
         meal_events = [
             event for event in payload["required_events"] if event["kind"] == "meal"
         ]
-        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["version"], 5)
         self.assertEqual(payload["policy_versions"]["meal_event"], MEAL_EVENT_POLICY_VERSION)
+        self.assertEqual(
+            payload["policy_versions"]["full_coverage_partition"],
+            FULL_COVERAGE_PARTITION_POLICY_VERSION,
+        )
+        self.assertEqual(
+            payload["policy_versions"]["story_event_catalog"],
+            STORY_EVENT_CATALOG_POLICY_VERSION,
+        )
         self.assertEqual(len(meal_events), 1)
         event = meal_events[0]
         self.assertEqual(event["selection_mode"], "one_of")
@@ -1482,7 +1553,7 @@ class CandidateCoverageTests(unittest.TestCase):
             ):
                 payload = build_candidates(paths, [clip], config)
 
-        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["version"], 5)
         self.assertEqual(len(payload["required_events"]), 1)
         event = payload["required_events"][0]
         tagged = [
@@ -1902,7 +1973,7 @@ class CandidateCoverageTests(unittest.TestCase):
             all(left[1] == right[0] for left, right in zip(windows, windows[1:]))
         )
 
-    def test_candidate_limit_keeps_start_and_end_coverage(self) -> None:
+    def test_candidate_limit_does_not_truncate_full_source_partition(self) -> None:
         clip = Clip(
             clip_id="clip", path="/tmp/clip.mp4", relative_path="clip.mp4", fingerprint="fp",
             size_bytes=1, duration=90.0, captured_at="2026-08-19T10:00:00+09:00",
@@ -1918,9 +1989,366 @@ class CandidateCoverageTests(unittest.TestCase):
             for index in range(9)
         ]
         windows = _candidate_windows(clip, cues, signals, max_per_clip=3)
-        self.assertEqual(len(windows), 3)
+        self.assertGreater(len(windows), 3)
         self.assertEqual(windows[0][0], 0.0)
         self.assertEqual(windows[-1][1], 90.0)
+        self.assertTrue(
+            all(
+                abs(left[1] - right[0]) <= 0.001
+                for left, right in zip(windows, windows[1:])
+            )
+        )
+        self.assertAlmostEqual(
+            sum(end - start for start, end, _origin in windows),
+            clip.duration,
+            places=6,
+        )
+
+    def test_full_coverage_partition_fills_every_gap_with_bounded_units(self) -> None:
+        windows = _partition_full_clip_coverage(
+            [
+                (5.0, 9.0, "speech"),
+                (20.0, 26.0, "meal"),
+                (50.0, 55.0, "closer"),
+            ],
+            60.0,
+        )
+
+        self.assertEqual(windows[0][0], 0.0)
+        self.assertEqual(windows[-1][1], 60.0)
+        self.assertTrue(all(end > start for start, end, _origin in windows))
+        self.assertTrue(all(end - start <= 18.0 for start, end, _origin in windows))
+        self.assertTrue(
+            all(
+                abs(left[1] - right[0]) <= 0.001
+                for left, right in zip(windows, windows[1:])
+            )
+        )
+        self.assertAlmostEqual(
+            sum(end - start for start, end, _origin in windows),
+            60.0,
+            places=6,
+        )
+        self.assertEqual(
+            [(start, end, origin) for start, end, origin in windows if origin != "coverage"],
+            [
+                (5.0, 9.0, "speech"),
+                (20.0, 26.0, "meal"),
+                (50.0, 55.0, "closer"),
+            ],
+        )
+
+    def test_exclude_ranges_match_relative_or_base_name_and_require_overlap(self) -> None:
+        clip = _clip("private", duration=20.0)
+        clip.relative_path = "DAY 2/private.mp4"
+        rules = [
+            {
+                "match": "**/private.mp4",
+                "start": 4.0,
+                "end": 9.0,
+                "reason": "옷을 갈아입는 사적 장면",
+            }
+        ]
+
+        self.assertEqual(
+            _candidate_exclusion_reason(clip, 6.0, 8.0, rules),
+            "옷을 갈아입는 사적 장면",
+        )
+        self.assertIsNone(_candidate_exclusion_reason(clip, 9.001, 12.0, rules))
+
+        basename_rule = [{"match": "private.mp4", "reason": "전체 제외"}]
+        self.assertEqual(
+            _candidate_exclusion_reason(clip, 0.0, 2.0, basename_rule),
+            "전체 제외",
+        )
+
+        root_clip = _clip("private", duration=20.0)
+        self.assertEqual(
+            _candidate_exclusion_reason(root_clip, 6.0, 8.0, rules),
+            "옷을 갈아입는 사적 장면",
+        )
+
+    def test_story_event_metadata_protects_body_and_allows_only_silent_coverage_to_speed(self) -> None:
+        first = Candidate(
+            candidate_id="setup",
+            clip_id="clip",
+            day_key="2026-08-20",
+            travel_day=1,
+            start=0.0,
+            end=5.0,
+            captured_at="2026-08-20T10:00:00+09:00",
+            transcript="식당에 도착했어요",
+            roles=["food", "dialogue"],
+            score=0.8,
+            speech_ratio=0.6,
+            motion_score=0.2,
+            visual_quality=0.7,
+            location="식당",
+            frame_path="frames/setup.jpg",
+            required_meal_context_ids=["meal_1:setup"],
+            origin="meal_setup",
+        )
+        body = Candidate.from_dict(
+            {
+                **first.to_dict(),
+                "candidate_id": "body",
+                "start": 5.0,
+                "end": 12.0,
+                "captured_at": "2026-08-20T10:00:05+09:00",
+                "transcript": "",
+                "speech_ratio": 0.0,
+                "required_meal_context_ids": [],
+                "required_meal_event_ids": ["meal_1"],
+                "origin": "meal",
+            }
+        )
+        bridge = Candidate.from_dict(
+            {
+                **first.to_dict(),
+                "candidate_id": "bridge",
+                "start": 12.0,
+                "end": 30.0,
+                "captured_at": "2026-08-20T10:00:12+09:00",
+                "transcript": "",
+                "roles": ["moment"],
+                "speech_ratio": 0.0,
+                "required_meal_context_ids": [],
+                "origin": "coverage",
+            }
+        )
+
+        _assign_story_event_metadata([first, body, bridge])
+
+        self.assertEqual(len({first.story_event_id, body.story_event_id, bridge.story_event_id}), 1)
+        self.assertEqual(first.story_stage, "setup")
+        self.assertEqual(body.story_stage, "body")
+        self.assertEqual(first.speed_policy, "protected_1x")
+        self.assertEqual(body.speed_policy, "protected_1x")
+        self.assertEqual(bridge.story_stage, "bridge")
+        self.assertEqual(bridge.speed_policy, "allow_fast")
+
+    def test_story_event_metadata_splits_separate_activities_after_five_minutes(self) -> None:
+        first = Candidate(
+            candidate_id="pool-a",
+            clip_id="pool-a",
+            day_key="2026-08-20",
+            travel_day=1,
+            start=0.0,
+            end=10.0,
+            captured_at="2026-08-20T10:00:00+09:00",
+            transcript="수영장에서 놀아요",
+            roles=["fun", "dialogue"],
+            score=0.8,
+            speech_ratio=0.3,
+            motion_score=0.5,
+            visual_quality=0.7,
+            location=None,
+            frame_path="frames/pool-a.jpg",
+        )
+        second = Candidate.from_dict(
+            {
+                **first.to_dict(),
+                "candidate_id": "pool-b",
+                "clip_id": "pool-b",
+                "captured_at": "2026-08-20T10:06:00+09:00",
+                "frame_path": "frames/pool-b.jpg",
+            }
+        )
+
+        _assign_story_event_metadata([first, second])
+
+        self.assertNotEqual(first.story_event_id, second.story_event_id)
+
+    def test_story_event_metadata_splits_strong_activity_changes_inside_one_clip(self) -> None:
+        food = Candidate(
+            candidate_id="food",
+            clip_id="continuous",
+            day_key="2026-08-20",
+            travel_day=1,
+            start=0.0,
+            end=5.0,
+            captured_at="2026-08-20T10:00:00+09:00",
+            transcript="식사 중",
+            roles=["food", "dialogue"],
+            score=0.8,
+            speech_ratio=0.3,
+            motion_score=0.2,
+            visual_quality=0.7,
+            location=None,
+            frame_path="frames/food.jpg",
+        )
+        fun = Candidate.from_dict(
+            {
+                **food.to_dict(),
+                "candidate_id": "fun",
+                "start": 5.0,
+                "end": 10.0,
+                "captured_at": "2026-08-20T10:00:05+09:00",
+                "transcript": "놀이 시작",
+                "roles": ["fun", "dialogue"],
+                "frame_path": "frames/fun.jpg",
+            }
+        )
+        scenery = Candidate.from_dict(
+            {
+                **food.to_dict(),
+                "candidate_id": "scenery",
+                "start": 10.0,
+                "end": 15.0,
+                "captured_at": "2026-08-20T10:00:10+09:00",
+                "transcript": "바깥 풍경",
+                "roles": ["scenery", "dialogue"],
+                "frame_path": "frames/scenery.jpg",
+            }
+        )
+
+        _assign_story_event_metadata([food, fun, scenery])
+
+        self.assertEqual(len({food.story_event_id, fun.story_event_id, scenery.story_event_id}), 3)
+
+    def test_story_event_metadata_keeps_same_meal_arc_across_silent_coverage(self) -> None:
+        setup = Candidate(
+            candidate_id="meal-setup",
+            clip_id="meal",
+            day_key="2026-08-20",
+            travel_day=1,
+            start=0.0,
+            end=5.0,
+            captured_at="2026-08-20T10:00:00+09:00",
+            transcript="식당에 도착",
+            roles=["food", "dialogue"],
+            score=0.8,
+            speech_ratio=0.3,
+            motion_score=0.2,
+            visual_quality=0.7,
+            location=None,
+            frame_path="frames/meal-setup.jpg",
+            required_meal_context_ids=["meal_1:setup"],
+            origin="meal_setup",
+        )
+        bridge = Candidate.from_dict(
+            {
+                **setup.to_dict(),
+                "candidate_id": "meal-bridge",
+                "start": 5.0,
+                "end": 10.0,
+                "captured_at": "2026-08-20T10:00:05+09:00",
+                "transcript": "",
+                "roles": ["moment"],
+                "speech_ratio": 0.0,
+                "required_meal_context_ids": [],
+                "origin": "coverage",
+                "frame_path": "frames/meal-bridge.jpg",
+            }
+        )
+        body = Candidate.from_dict(
+            {
+                **setup.to_dict(),
+                "candidate_id": "meal-body",
+                "start": 10.0,
+                "end": 15.0,
+                "captured_at": "2026-08-20T10:00:10+09:00",
+                "transcript": "아이들이 즐거워해요",
+                "roles": ["fun", "dialogue"],
+                "required_meal_context_ids": [],
+                "required_meal_event_ids": ["meal_1"],
+                "origin": "meal",
+                "frame_path": "frames/meal-body.jpg",
+            }
+        )
+        closure = Candidate.from_dict(
+            {
+                **setup.to_dict(),
+                "candidate_id": "meal-closure",
+                "start": 15.0,
+                "end": 20.0,
+                "captured_at": "2026-08-20T10:00:15+09:00",
+                "transcript": "식사 뒤 풍경",
+                "roles": ["scenery", "dialogue"],
+                "required_meal_context_ids": ["meal_1:closure"],
+                "origin": "meal_closure",
+                "frame_path": "frames/meal-closure.jpg",
+            }
+        )
+
+        _assign_story_event_metadata([setup, bridge, body, closure])
+
+        self.assertEqual(
+            len(
+                {
+                    setup.story_event_id,
+                    bridge.story_event_id,
+                    body.story_event_id,
+                    closure.story_event_id,
+                }
+            ),
+            1,
+        )
+
+    def test_story_event_metadata_splits_distinct_meal_and_interview_ids(self) -> None:
+        meal_one = Candidate(
+            candidate_id="meal-one",
+            clip_id="continuous",
+            day_key="2026-08-20",
+            travel_day=1,
+            start=0.0,
+            end=5.0,
+            captured_at="2026-08-20T10:00:00+09:00",
+            transcript="첫 번째 식사",
+            roles=["food", "dialogue"],
+            score=0.8,
+            speech_ratio=0.3,
+            motion_score=0.2,
+            visual_quality=0.7,
+            location=None,
+            frame_path="frames/meal-one.jpg",
+            required_meal_event_ids=["meal_1"],
+            origin="meal",
+        )
+        meal_two = Candidate.from_dict(
+            {
+                **meal_one.to_dict(),
+                "candidate_id": "meal-two",
+                "start": 5.0,
+                "end": 10.0,
+                "captured_at": "2026-08-20T10:00:05+09:00",
+                "transcript": "두 번째 식사",
+                "required_meal_event_ids": ["meal_2"],
+                "frame_path": "frames/meal-two.jpg",
+            }
+        )
+        interview_one = Candidate.from_dict(
+            {
+                **meal_one.to_dict(),
+                "candidate_id": "interview-one",
+                "start": 10.0,
+                "end": 15.0,
+                "captured_at": "2026-08-20T10:00:10+09:00",
+                "transcript": "첫 번째 인터뷰",
+                "roles": ["interview", "dialogue"],
+                "required_meal_event_ids": [],
+                "required_event_ids": ["interview_1"],
+                "origin": "interview",
+                "frame_path": "frames/interview-one.jpg",
+            }
+        )
+        interview_two = Candidate.from_dict(
+            {
+                **interview_one.to_dict(),
+                "candidate_id": "interview-two",
+                "start": 15.0,
+                "end": 20.0,
+                "captured_at": "2026-08-20T10:00:15+09:00",
+                "transcript": "두 번째 인터뷰",
+                "required_event_ids": ["interview_2"],
+                "frame_path": "frames/interview-two.jpg",
+            }
+        )
+
+        _assign_story_event_metadata([meal_one, meal_two, interview_one, interview_two])
+
+        self.assertNotEqual(meal_one.story_event_id, meal_two.story_event_id)
+        self.assertNotEqual(interview_one.story_event_id, interview_two.story_event_id)
 
 
 if __name__ == "__main__":

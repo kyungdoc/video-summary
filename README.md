@@ -91,13 +91,17 @@ uv run --frozen video-summary render \
 
 날짜별로 선택된 source 구간은 첫 장면부터 마지막 장면까지 실제 촬영 시간순을 지킵니다. `cold_open: true`는 선택된 source 중 가장 이른 장면만 `hook`으로 강조할 수 있다는 뜻이며, 뒷시점의 장면을 앞으로 이동시키지 않습니다. `hook`도 시각 카드 뒤에 나오는 첫 source입니다.
 
-플래너는 event-first로 동작합니다. 각 DAY에서 고신뢰로 탐지된 인터뷰·식사·이동 거점 사건과 그 완결에 필요한 source를 먼저 모아 실제 촬영 시간순으로 구성한 뒤, 여정을 설명하는 풍경·대화·재미있는 반응 같은 일반 후보를 보강합니다. `target_minutes_per_day`는 `edit-plan.json`의 `target_duration` 호환·표시값이며 영상을 그 길이까지 채우라는 quota도 실제 선택 상한도 아닙니다. 일반 후보 선택에는 기본 `soft_max_minutes_per_day: 10`을 소프트 상한으로 사용하지만, 필수 사건을 온전히 담는 데 필요하면 이를 넘을 수 있습니다. 모든 일반 사건이 상한 안에 들어가지 않으면 오전부터 예산을 소진하지 않고 초반·중반·후반을 고르게 대표하도록 선택합니다. 충분한 사건과 좋은 후보가 더 없으면 10분을 채우지 않고 멈추며 약한 반복 화면이나 단편 대화를 억지로 넣지 않습니다. 대사가 적거나 없어도 `scenery`로 분류되거나 밝기·대비 등 화면 품질이 좋은 안정적인 장면은 날짜별 시각 앵커로 우선 검토하고, 점수가 조금 높은 고립 장면보다 같은 원본에서 맞닿아 이어지는 후보 묶음에 가중치를 주어 대화와 동작의 흐름을 보존합니다. 외부 플래너에도 같은 사건 우선순위와 소프트 상한을 전달합니다.
+플래너는 **전체 원본 event accounting**을 먼저 수행하는 event-flow 방식으로 동작합니다. 점수가 높은 장면부터 고르는 대신, 각 DAY의 원본 시간축을 먼저 훑어 실제로 촬영된 활동을 시간순 `story_event_id`로 묶고 모든 후보와 후보로 덮이지 않은 원본 구간의 상태를 회계합니다. 후보가 없는 구간을 “사건이 없다”고 간주하지 않고 contact sheet와 원본 시간축에서 후보 hole로 검토합니다. 그런 다음에야 인터뷰·식사·놀이·만남·이동 거점·풍경·대화를 여정 흐름에 맞게 구성합니다.
 
-여행 중간이나 마지막에 가족이 한 명씩 여행 소감·가장 좋았던 순간 등을 묻고 답하는 인터뷰가 전사에서 확실하게 탐지되면, `preserve_family_interviews: true` 기본값이 그 답변 묶음을 필수 모먼트로 지정합니다. 일반 선택의 소프트 상한을 넘거나 후보 점수가 낮아도 완결된 연속 구간을 모두 선택하며, local뿐 아니라 Codex/Claude/file 플랜도 누락하거나 배속하면 검증에서 거부합니다. 인터뷰가 탐지되지 않으면 기존 방식으로 정상 진행합니다. 얼굴 인식이나 화자 분리를 하지 않으므로 실제 가족 구성원 수를 판별하는 기능은 아니며, 질문·답변이 이어지는 source 구간을 개인 인터뷰 단위로 보존합니다. 이 보장을 사용할 때는 전사가 필요하므로 `--skip-transcribe`를 함께 쓸 수 없습니다.
+각 사건은 촬영된 범위 안에서 `setup → body/action → reaction/outcome → closure`로 읽습니다. 모든 단계가 항상 필요한 것은 아니지만, 도착·주문·입장 같은 setup이나 퇴장·후기 같은 closure가 핵심 body/action을 대신했다고 판정하지 않습니다. 원본/contact sheet 감사에서 핵심 활동이 실제로 촬영되지 않았다고 판단하면 검수 메모에 `not_filmed`로 남깁니다. 이는 현재 파이프라인이 자동 생성하는 필드를 의미하지 않습니다. “식사를 하는 장면”을 조작해 낸 듯 연결하지 않으며 “식사 후”·“잠시 쉬어 간 뒤” 같은 정직한 카드·캡션·나레이션 브리지만 사용합니다.
 
-`preserve_meal_events: true` 기본값은 전사와 인접 타임라인에서 탐지된 서로 다른 조식·점심·저녁·카페·디저트·간식 사건을 필수 모먼트로 보존합니다. 사건마다 실제 식탁·음식·먹는 반응인 body 후보를 하나의 `one_of` 그룹으로 묶어 최소 하나를 촬영시간순·원속도로 선택합니다. 연결된 식당 도착과 주문은 setup으로, 퇴장·감사 인사뿐 아니라 음식명 또는 식사명과 결합된 맛 반응·식사 회고는 closure로 묶고, 탐지된 각 맥락 그룹에서도 최소 한 장면을 선택합니다. 따라서 흐름은 가능한 경우 `setup → 실제 식사 body → closure`가 되며, setup이나 closure 같은 context는 body를 대신할 수 없습니다. local뿐 아니라 Codex/Claude/file 플랜도 탐지된 body나 연결 맥락 그룹을 건너뛸 수 없고, 필요한 완결 구간은 일반 선택의 10분 소프트 상한보다 우선합니다. 넓은 `food` role 전체를 강제로 넣지는 않으므로 요리책 대사, 막연한 식사 계획, 음식명과 연결되지 않은 과거 회고 같은 오탐으로 영상을 채우지 않습니다. 전사 근거가 없는 visual-only 식사는 자동 탐지 결과만으로 확정할 수 없으므로, 최종 렌더 전 DAY별 전체 후보 contact sheet를 검수해 실제 식사 사건별 body와 자연스러운 전후 서사를 plan에 보강해야 합니다. `not_detected`는 식사가 없었다는 뜻이 아니라 자동 탐지 근거가 없었다는 뜻입니다. 이 보장을 켠 상태에서는 `--skip-transcribe`를 함께 쓸 수 없습니다.
+길이는 사건을 누락시키는 선택 예산이 아니라 완성본 검토 guard입니다. `target_minutes_per_day`는 `edit-plan.json`의 `target_duration` 호환·표시값이며 fill quota가 아니고, 기본 `soft_max_minutes_per_day: 10`은 사건 흐름을 모두 구성한 뒤 속도와 밀도를 다시 보라는 DAY별 review guard입니다. 10분을 넘는다고 뒤의 사건을 자동 삭제하지 않고, 각 사건을 `full → compact → speed_up → omit`의 순서로 검토합니다. `compact`는 원속도로 setup/body/action/reaction/closure의 핵심 run을 짧게 다듬는 것이고, `speed_up`은 대사가 없고 화면 변화가 적은 이동·대기·반복 풍경에만 적용합니다. 식사·놀이(수영장, 야외 구경, 탈것 등)·인터뷰·사람의 합류/만남·핵심 반응은 `speed=1.0`으로 보호합니다. `omit`은 의미를 반복하거나 사적·기술적으로 사용할 수 없는 구간에 대한 마지막 선택입니다. 기대되는 결과가 guard를 넘어도 흐름이 완전하면 그 길이를 유지하며, 반대로 더 보여 줄 사건이 없으면 10분을 채우지 않습니다.
 
-여정을 이해하는 데 필요한 고신뢰 이동 거점도 항상 mandatory-if-detected 정책을 따릅니다. 전사에서 가족·일행을 픽업하거나 합류하는 순간, 환승·경유, 렌터카 인수·반납, 숙소 체크인·체크아웃, 공항·역·터미널의 명시적인 출발·도착·승차·하차가 확인되면, `transition`으로 태그된 해당 연결 구간을 실제 촬영 시간순·원속도로 모두 선택합니다. 이 규칙은 DAY별 soft duration ceiling보다 우선하며 local·Codex·Claude·file 플랜 모두에서 누락·배속·부적절한 role을 거부합니다. 단, DAY의 첫·마지막 source인 경우에는 기존 `hook`·`closing` role을 유지할 수 있고, 같은 후보가 필수 가족 인터뷰이기도 하면 더 엄격한 인터뷰 role·표시 규칙을 우선합니다.
+여행 중간이나 마지막에 가족이 한 명씩 여행 소감·가장 좋았던 순간 등을 묻고 답하는 인터뷰가 전사에서 확실하게 탐지되면, `preserve_family_interviews: true` 기본값이 그 답변 묶음을 필수 모먼트로 지정합니다. 10분 review guard를 넘거나 후보 점수가 낮아도 완결된 연속 구간을 모두 선택하며, local뿐 아니라 Codex/Claude/file 플랜도 누락하거나 배속하면 검증에서 거부합니다. 인터뷰가 탐지되지 않으면 기존 방식으로 정상 진행합니다. 얼굴 인식이나 화자 분리를 하지 않으므로 실제 가족 구성원 수를 판별하는 기능은 아니며, 질문·답변이 이어지는 source 구간을 개인 인터뷰 단위로 보존합니다. 이 보장을 사용할 때는 전사가 필요하므로 `--skip-transcribe`를 함께 쓸 수 없습니다.
+
+`preserve_meal_events: true` 기본값은 전사와 인접 타임라인에서 탐지된 서로 다른 조식·점심·저녁·카페·디저트·간식 사건을 필수 모먼트로 보존합니다. 사건마다 실제 식탁·음식·먹는 반응인 body 후보를 하나의 `one_of` 그룹으로 묶어 최소 하나를 촬영시간순·원속도로 선택합니다. 연결된 식당 도착과 주문은 setup으로, 퇴장·감사 인사뿐 아니라 음식명 또는 식사명과 결합된 맛 반응·식사 회고는 closure로 묶고, 탐지된 각 맥락 그룹에서도 최소 한 장면을 선택합니다. 따라서 흐름은 가능한 경우 `setup → 실제 식사 body/reaction → closure`가 되며, setup이나 closure 같은 context는 body를 대신할 수 없습니다. local뿐 아니라 Codex/Claude/file 플랜도 탐지된 body나 연결 맥락 그룹을 건너뛸 수 없고, 필요한 완결 구간은 10분 review guard보다 우선합니다. 넓은 `food` role 전체를 강제로 넣지는 않으므로 요리책 대사, 막연한 식사 계획, 음식명과 연결되지 않은 과거 회고 같은 오탐으로 영상을 채우지 않습니다. 전사 근거가 없는 visual-only 식사는 자동 탐지 결과만으로 확정할 수 없으므로, 최종 렌더 전 DAY별 전체 후보 contact sheet를 검수해 실제 식사 사건별 body와 자연스러운 전후 서사를 plan에 보강해야 합니다. 원본에 body가 없다면 인접 무음 클립을 body로 오인하지 말고 검수 메모에 `not_filmed`로 남긴 뒤 정직한 브리지를 사용합니다. `not_detected`는 식사가 없었다는 뜻이 아니라 자동 탐지 근거가 없었다는 뜻입니다. 이 보장을 켠 상태에서는 `--skip-transcribe`를 함께 쓸 수 없습니다.
+
+여정을 이해하는 데 필요한 고신뢰 이동 거점도 항상 mandatory-if-detected 정책을 따릅니다. 전사에서 가족·일행을 픽업하거나 합류하는 순간, 환승·경유, 렌터카 인수·반납, 숙소 체크인·체크아웃, 공항·역·터미널의 명시적인 출발·도착·승차·하차가 확인되면, `transition`으로 태그된 해당 연결 구간을 실제 촬영 시간순·원속도로 모두 선택합니다. 이 규칙은 DAY별 review guard보다 우선하며 local·Codex·Claude·file 플랜 모두에서 누락·배속·부적절한 role을 거부합니다. 단, DAY의 첫·마지막 source인 경우에는 기존 `hook`·`closing` role을 유지할 수 있고, 같은 후보가 필수 가족 인터뷰이기도 하면 더 엄격한 인터뷰 role·표시 규칙을 우선합니다.
 
 단순히 “어디 가?”처럼 묻는 말, 구체적 연결점이 없는 일반적인 이동 언급, 공항·차량의 안내방송, 식당·관광지에 도착했다는 말만으로는 필수 이동 거점으로 지정하지 않습니다. 자동 탐지는 명시적인 전사만 사용하며, 알려진 위치는 후속 수동·플래너 검토의 맥락으로만 사용합니다. 실제 GPS 이동 경로나 영상 속 승하차를 자동 인식하지 않으므로 전사되지 않은 이동 거점은 보장할 수 없습니다.
 
@@ -115,7 +119,15 @@ uv run --frozen video-summary render \
 editing:
   cold_open: true
   target_minutes_per_day: 4.0       # plan 표시 호환값이며 fill quota가 아님
-  soft_max_minutes_per_day: 10.0    # 일반 선택 상한; 필수 사건 완결에는 초과 가능
+  soft_max_minutes_per_day: 10.0    # 사건 선택 상한이 아닌 DAY 페이싱 review guard
+  selection_strategy: event_flow
+  adaptive_fast_forward: true       # guard 초과 시 allow_fast 브리지만 배속
+  max_fast_forward_speed: 3.0
+  exclude_ranges:
+    - match: "**/IMG_1234.MOV"     # source 상대경로 또는 basename glob
+      start: 12.4                   # 클립 기준 초; 생략 시 0
+      end: 28.0                     # 생략 시 클립 끝
+      reason: "옷 갈아입는 사적 장면"
   preserve_family_interviews: true  # 탐지된 가족 회고 인터뷰는 반드시 원속도로 포함
   preserve_meal_events: true        # 탐지된 식사마다 setup/body/closure 서사를 원속도로 보존
   episode_mode: trip
@@ -131,7 +143,7 @@ render:
   transition_seconds: 0.18
 ```
 
-`target_minutes_per_day`와 `soft_max_minutes_per_day`는 모두 0.1~180 사이의 유한한 숫자여야 합니다.
+`target_minutes_per_day`와 `soft_max_minutes_per_day`는 모두 0.1~180 사이의 유한한 숫자여야 합니다. `max_fast_forward_speed`는 1~4배이며, 이 값이 크더라도 `protected_1x`로 표시된 식사·놀이·인터뷰·만남·대화·핵심 반응은 배속하지 않습니다. `exclude_ranges`의 각 규칙은 `match`와 1~160자 `reason`이 필수이며, 지정 시간과 겹치는 후보는 plan·render에 들어가지 않고 event accounting에 “명시적 제외”로 남습니다.
 
 ```yaml
 project:
@@ -250,6 +262,8 @@ WORKSPACE/
 기본 `episode_mode: daily`는 날짜별 파일을 만들고, `trip`은 `trip-summary.mp4` 하나와 같은 이름의 `.vtt`, `.chapters.txt`, `.timeline.txt`, `.description.md`를 만듭니다. `render.music_file`에 합법적으로 사용할 수 있는 음악을 지정하면 대화 구간에서 자동 ducking합니다. YouTube 저작권 확인 책임은 사용자에게 있습니다.
 
 `render-report.json`의 `moment_coverage.family_interviews`는 인터뷰가 있으면 `satisfied`, 없으면 `not_detected`를 기록하고, 필수·선택 candidate 수와 개인정보를 최소화한 탐지 근거를 남깁니다. `moment_coverage.meals`도 같은 상태와 함께 자동 탐지된 식사 사건 수, body option 수, 탐지된 setup/closure 맥락 그룹 수, 각 그룹의 실제 선택 ID를 기록합니다. body와 탐지된 맥락 그룹이 모두 선택되어야 `satisfied`입니다. 이때 `not_detected`는 수동 시각 검수를 대체하지 않습니다. 명시적으로 각 보존 기능을 끈 경우에는 `disabled`입니다. 이동 거점은 별도 coverage schema 대신 후보의 `transition` role과 최종 plan으로 검증합니다.
+
+`render-report.json.moment_coverage.story_flow`는 전체 원본 길이, 후보로 회계된 길이와 후보 hole, 이벤트 수/대표 수, 명시적 제외 수, 원본 선택 길이와 배속 후 출력 길이, 배속으로 줄인 시간을 DAY별로 기록합니다. 이벤트별 실제 treatment는 `full`, `full_speed_up`, `compact`, `compact_speed_up`, `omit`으로 기록합니다. DAY 출력이 review guard를 넘으면 실패가 아니라 `review`로 표시합니다. 핵심 사건 누락이나 `protected_1x` 배속은 `unsatisfied`이며, 수상한 후보 hole이 있으면 원본/contact sheet를 다시 보고 사건과 후보를 복구한 뒤 draft를 재생성합니다.
 
 MP4의 인트로·날짜·아웃트로 카드는 영상 프레임에 직접 렌더되는 시각 요소입니다. 반면 `.chapters.txt`는 YouTube 설명란에 복사할 timestamp 텍스트이며 MP4에 embedded chapter metadata로 넣지 않습니다. 파일이 자동으로 YouTube에 업로드되지도 않습니다.
 

@@ -7,8 +7,8 @@
 1. `scan`: 원본을 재귀 검색하고 ffprobe 메타데이터, 촬영시각, 여행일, 위치 규칙을 manifest로 정규화
 2. `analyze/transcribe`: 자연어 `.srt/.vtt`, whisper.cpp 또는 faster-whisper로 클립별 전사
 3. `analyze/visual`: 폭 96px 저해상도 프레임을 스트리밍하여 밝기·대비·움직임 신호 계산
-4. `candidates`: 전사 구간과 무음 풍경/이동 구간을 함께 후보화하고, 고신뢰 여정 이동 거점과 식사 setup/body/closure 구간을 사건으로 태그하며 대표 프레임 생성
-5. `plan`: local 규칙 또는 Codex/Claude가 날짜별 후보 ID를 선택
+4. `candidates`: 전사 구간과 무음 풍경/이동 구간을 함께 후보화하고, 원본 시간축의 모든 활동을 `story_event_id`와 `setup/body/action/reaction/outcome/closure/bridge` 단계로 회계하며 제외·후보 hole을 기록
+5. `plan`: local 규칙 또는 Codex/Claude가 모든 사건의 시간순 스토리 스파인을 먼저 구성한 뒤 `full → compact → speed_up → omit` 순으로 압축
 6. `validate`: candidate ID, 날짜, 시간순, 중복·같은 원본 시간 겹침, 길이와 allowlist를 검증
 7. `render`: 한 세그먼트씩 동일 규격으로 렌더하고 concat stream-copy로 날짜별 영상 조립
 8. `package`: VTT, YouTube 설명란용 chapters, description 초안과 `moment_coverage`를 포함한 render report 생성
@@ -16,11 +16,16 @@
 ## Stable invariants
 
 - 각 여행일의 모든 source 구간은 첫 장면부터 마지막 장면까지 실제 촬영 시간순입니다. `cold_open`도 이 순서를 깨지 않으며, 선택된 후보 중 가장 이른 하나만 첫 source인 `hook`이 될 수 있습니다.
-- plan은 event-first입니다. 각 DAY에서 고신뢰 인터뷰·식사·이동 거점 사건과 그 완결에 필요한 후보를 먼저 모아 실제 촬영 시간순으로 배치한 뒤 일반 풍경·대화·재미 후보를 보강합니다. `target_minutes_per_day`는 episode `target_duration` 호환·표시값이지 fill quota나 실제 선택 상한이 아닙니다. 일반 후보 선택에는 `soft_max_minutes_per_day: 10` 기본값을 소프트 상한으로 적용하되 필수 사건 완결은 이를 초과할 수 있고, 가치 있는 후보가 부족하면 상한까지 억지로 채우지 않습니다. 모든 일반 사건이 상한 안에 들어가지 않을 때는 초반·중반·후반의 시간축 범위를 고르게 대표합니다. 화면 품질이 충분한 무대사·저대사 `scenery` 후보를 시각 앵커로 검토하고, 고립된 점수 상위 조각보다 같은 원본에서 맞닿는 후보 run을 우선합니다. 외부 planner에도 같은 사건 우선순위와 상한 계약을 제공합니다.
+- plan은 coverage-first event-flow입니다. 선택 예산을 보기 전에 각 DAY의 전체 원본을 훑어 실제 활동을 시간순 `story_event_id`로 묶고, 모든 후보를 사건/단계/중요도/속도 정책에 할당합니다. 후보로 덮이지 않는 원본 길이는 `unassigned_source_seconds`로 드러내며, candidate hole이 사건 부재를 의미하지 않으므로 contact sheet/원본 시간축을 재검수합니다. 전체 사건 스파인을 구성한 뒤에야 편집 방법을 결정합니다.
+- 사건의 서사 단위는 `setup → body/action → reaction/outcome → closure`입니다. 사건 성격과 실제 촬영 범위에 따라 단계가 생략될 수는 있지만 setup/closure로 body/action을 대체하지 않습니다. 원본/contact sheet 감사에서 body/action이 촬영되지 않았다고 판단하면 검수 메모에 `not_filmed`로 남기고, setup과 closure만으로 완결된 활동처럼 연출하지 않습니다. `not_filmed`는 현재 파이프라인이 자동 생성하는 필드가 아닙니다. 필요하면 “식사 후”·“잠시 쉬어 간 뒤”처럼 편집 공백을 명시하는 정직한 카드·캡션·나레이션 브리지만 사용합니다.
+- 편집 압축 사다리는 `full → compact → speed_up → omit`입니다. 먼저 사건을 충분히 원속도로 담고, 길면 사건 내부의 중복만 잘라 핵심 run을 원속도로 `compact`하며, 그래도 길 때만 대사 없는 low-change 이동·대기·반복 풍경 브리지를 `speed_up`합니다. 식사·놀이·인터뷰·만남/합류·대화·핵심 행동과 반응은 `protected_1x`이며, `omit`은 의미 중복·사적 장면·사용 불가 구간에 대한 마지막 선택입니다. story-flow 보고서의 event treatment는 실제 결과를 `full`, `full_speed_up`, `compact`, `compact_speed_up`, `omit`으로 기록하며, `_speed_up`은 해당 사건의 허용된 브리지에만 배속이 쓰였음을 뜻합니다.
+- `target_minutes_per_day`는 episode `target_duration` 호환·표시값이지 fill quota나 실제 선택 상한이 아닙니다. `soft_max_minutes_per_day: 10`은 완성된 DAY의 페이싱과 압축 여지를 다시 보는 review guard입니다. guard 초과는 삭제 명령이 아니며, 고유한 사건을 뒤에서부터 자동으로 떨어뜨리지 않습니다. 전체 흐름이 필요하면 guard를 넘고, 반복 외에 더 보여 줄 것이 없으면 guard 아래에서 멈춥니다. 외부 planner에도 같은 계약을 제공합니다.
 - `editing.preserve_family_interviews: true`이면 로컬 전사에서 고신뢰 여행 회고 질문·답변으로 탐지된 모든 인터뷰 source run을 필수 사건으로 고정합니다. 해당 후보는 원속도·촬영시간순으로 모두 선택하며 `soft_max_minutes_per_day`보다 우선합니다. 외부/file planner의 누락이나 배속은 validate에서 거부하고, 탐지 결과가 0개면 기존 선택을 그대로 수행합니다. 얼굴 인식·화자 분리는 하지 않으므로 사람 수가 아니라 별도의 Q&A run을 인터뷰 단위로 취급합니다.
-- `editing.preserve_meal_events: true`이면 전사 직접 근거 또는 인접 타임라인에서 탐지된 조식·점심·저녁·카페·디저트·간식을 시간순 사건으로 묶습니다. 실제 식탁·음식·먹는 반응인 body option 중 사건마다 하나 이상을 원속도로 선택합니다. 식당 도착·주문은 setup, 퇴장·감사 또는 음식명/식사명과 결합된 맛 반응·회고는 closure context로 묶고, 탐지된 각 그룹도 하나 이상 선택합니다. 이 필수 흐름은 `soft_max_minutes_per_day`보다 우선하며 setup/closure context만으로 body를 대신할 수 없습니다. broad `food` role 전체를 필수화하지 않고, 외부/file planner가 body나 탐지된 맥락 그룹을 누락하면 validate에서 거부합니다. 전사 근거가 없는 visual-only 식사는 자동 탐지 결과만으로 확정하지 않으므로, 최종 렌더 전 DAY별 전체 candidate contact sheet 시각 인벤토리와 file-plan 보강을 필수 검수 단계로 둡니다. `not_detected`는 자동 근거가 없음을 뜻할 뿐 식사가 없음을 보장하지 않습니다.
-- 로컬 전사에서 고신뢰로 확인된 여정의 연결 거점은 항상 `transition`·`journey` role을 갖는 필수 후보입니다. 가족·일행 픽업/합류, 환승/경유, 렌터카 인수/반납, 숙소 체크인/체크아웃, 공항·역·터미널의 명시적 출발/도착/승차/하차가 해당합니다. 태그된 후보를 원속도·촬영시간순으로 모두 선택하고 soft ceiling보다 우선하며, 외부/file planner의 누락·배속·role 위반은 validate에서 거부합니다.
+- `editing.preserve_meal_events: true`이면 전사 직접 근거 또는 인접 타임라인에서 탐지된 조식·점심·저녁·카페·디저트·간식을 시간순 사건으로 묶습니다. 실제 식탁·음식·먹는 반응인 body option 중 사건마다 하나 이상을 원속도로 선택합니다. 식당 도착·주문은 setup, 퇴장·감사 또는 음식명/식사명과 결합된 맛 반응·회고는 closure context로 묶고, 탐지된 각 그룹도 하나 이상 선택합니다. 이 필수 흐름은 review guard보다 우선하며 setup/closure context만으로 body를 대신할 수 없습니다. broad `food` role 전체를 필수화하지 않고, 외부/file planner가 body나 탐지된 맥락 그룹을 누락하면 validate에서 거부합니다. 전사 근거가 없는 visual-only 식사는 자동 탐지 결과만으로 확정하지 않으므로, 최종 렌더 전 DAY별 전체 candidate contact sheet 시각 인벤토리와 file-plan 보강을 필수 검수 단계로 둡니다. body가 원본에 없다면 검수 메모에 `not_filmed`로 남기고 인접 무음 클립을 body로 오인하지 않으며, 정직한 브리지로만 다음 사건을 연결합니다. `not_detected`는 자동 근거가 없음을 뜻할 뿐 식사가 없음을 보장하지 않습니다.
+- 로컬 전사에서 고신뢰로 확인된 여정의 연결 거점은 항상 `transition`·`journey` role을 갖는 필수 후보입니다. 가족·일행 픽업/합류, 환승/경유, 렌터카 인수/반납, 숙소 체크인/체크아웃, 공항·역·터미널의 명시적 출발/도착/승차/하차가 해당합니다. 태그된 후보를 원속도·촬영시간순으로 모두 선택하고 review guard보다 우선하며, 외부/file planner의 누락·배속·role 위반은 validate에서 거부합니다.
+- 식사·놀이(수영장, 야외 구경, 탈것)·가족 인터뷰·사람의 만남/합류·핵심 반응과 대화는 항상 `speed=1.0`으로 보호합니다. 화면 변화가 적은 generic 이동·대기·반복 풍경만 `allow_fast`이며, 이동이라도 픽업/합류·승하차·렌터카 인수/반납·체크인/체크아웃 같은 사건 행동은 배속하지 않습니다.
 - 단순 질문, 구체적 연결점이 없는 generic 이동, 안내방송, 식당·관광지 도착은 필수 이동 거점으로 태그하지 않습니다. 자동 탐지는 명시적인 전사만 사용하며, 알려진 위치는 후속 수동·플래너 검토의 맥락으로만 사용합니다. 무전사 waypoint를 행동·GPS 경로·위치만으로 추론해 필수화하지는 않습니다.
+- `editing.exclude_ranges`는 옷 갈아입기·의료/위생·민감 정보·명시적 사용 금지 같은 구간을 source 상대경로/파일명 glob, 클립 기준 `start`/`end` 초, 필수 `reason`으로 지정합니다. 범위와 겹치는 candidate는 `exclusion_reason`과 `speed_policy=omit`을 가지고 plan/render에서 제외되며, story-flow 보고서에는 명시적 제외로 회계됩니다.
 - 카메라 달력이 초기화된 여행은 `date_overrides`의 폴더 glob, 현지 날짜와 IANA timezone으로 보정할 수 있습니다. 폴더 날짜를 회차 경계로 쓸 때는 `day_start_hour: 0`을 사용합니다.
 - 인트로 표시명은 내부 project ID와 분리합니다. `project.destination`이 비어 있으면 source 폴더명에서 선행 날짜와 일반 영상 토큰을 제거하고 더 구체적인 지명이 남을 때만 국가 접두어도 제외해 여행지를 추론하며, 실패하면 project 이름을 사용합니다. 기간은 폴더명 숫자가 아니라 scan이 보정한 전체 `day_key`의 최솟값·최댓값이며, trip은 전체 범위, daily는 해당 DAY 날짜를 표시합니다.
 - 원본 파일은 읽기만 하며 모든 파생물은 workspace 아래에 저장합니다.
@@ -42,12 +47,20 @@
 
 ## Planner boundary
 
-Planner가 반환할 수 있는 것은 프로젝트/후보 해시, 날짜별 제목·요약, candidate ID와 편집 메타데이터(role/reason 및 선택적 location/caption/speed)뿐입니다. `role=hook`은 해당 DAY의 첫 번째 source이자 선택된 후보 중 실제 촬영 시각이 가장 이른 후보에만 허용됩니다. 탐지된 필수 인터뷰 후보는 `role=interview`(첫 hook 예외), 필수 이동 거점 후보는 기본 `role=transition`으로, 모두 `speed=1.0`과 실제 촬영 시간순을 지켜 포함해야 합니다. 이동 거점이 DAY의 첫·마지막 source이면 각각 `hook`·`closing`을 예외로 허용하고, 필수 인터뷰와 겹치면 인터뷰 계약을 우선합니다. 일반 `journey` 후보는 그 이유만으로 필수가 아닙니다. 외부 planner도 필수 사건을 먼저 모두 배치한 뒤 일반 후보만 DAY 소프트 상한 안에서 선택하며, `target_duration`을 채우기 위해 반복 장면을 추가해서는 안 됩니다. 원본 경로·시간 범위·FFmpeg 인자는 반환할 수 없으며 renderer가 검증된 catalog에서 다시 조회합니다. Codex/Claude planner는 이 판단을 위해 필수 이동 거점을 드러내는 제한된 전사 발췌와 메타데이터를 받을 수 있습니다.
+Planner가 반환할 수 있는 것은 프로젝트/후보 해시, 날짜별 제목·요약, candidate ID와 편집 메타데이터(role/reason 및 선택적 location/caption/speed)뿐입니다. `role=hook`은 해당 DAY의 첫 번째 source이자 선택된 후보 중 실제 촬영 시각이 가장 이른 후보에만 허용됩니다. 탐지된 필수 인터뷰 후보는 `role=interview`(첫 hook 예외), 필수 이동 거점 후보는 기본 `role=transition`으로, 모두 `speed=1.0`과 실제 촬영 시간순을 지켜 포함해야 합니다. 이동 거점이 DAY의 첫·마지막 source이면 각각 `hook`·`closing`을 예외로 허용하고, 필수 인터뷰와 겹치면 인터뷰 계약을 우선합니다. 일반 `journey` 후보는 그 이유만으로 필수가 아닙니다. 외부 planner도 전체 사건과 촬영된 서사 단계를 먼저 시간순으로 구성하고, review guard를 넘을 때는 `full → compact → speed_up → omit` 순으로 압축 여지를 검토합니다. 중복 외의 사건을 guard 때문에 누락하거나 `target_duration`을 채우기 위해 반복 장면을 추가해서는 안 됩니다. `speed>1.0`은 `speed_policy=allow_fast`인 low-change 무대사 브리지에만 허용하고 `exclusion_reason`이 있는 후보는 선택할 수 없습니다. 원본 경로·시간 범위·FFmpeg 인자는 반환할 수 없으며 renderer가 검증된 catalog에서 다시 조회합니다. Codex/Claude planner는 이 판단을 위해 사건·단계·중요도·속도 정책·제외 이유와 제한된 전사 발췌를 받을 수 있습니다.
 
 ```yaml
 editing:
   target_minutes_per_day: 4.0     # plan target_duration 호환·표시값
-  soft_max_minutes_per_day: 10.0  # 일반 선택 상한; 필수 사건 완결에는 초과 가능
+  soft_max_minutes_per_day: 10.0  # 선택 상한이 아닌 페이싱 review guard
+  selection_strategy: event_flow
+  adaptive_fast_forward: true
+  max_fast_forward_speed: 3.0
+  exclude_ranges:
+    - match: "**/IMG_1234.MOV"
+      start: 12.4
+      end: 28.0
+      reason: "사적 장면"
 ```
 
 두 값은 0.1~180 사이의 유한한 숫자여야 합니다.

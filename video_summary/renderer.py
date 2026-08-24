@@ -43,9 +43,9 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 20
+RENDER_POLICY_VERSION = 22
 SOURCE_RENDER_POLICY_VERSION = 8
-RENDER_REPORT_VERSION = 6
+RENDER_REPORT_VERSION = 8
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
 YOUTUBE_MIN_CHAPTERS = 3
@@ -248,6 +248,15 @@ def family_interview_coverage(
             raise VideoSummaryError(
                 f"가족 인터뷰 이벤트가 알 수 없는 후보를 참조합니다: {event_id}"
             )
+        candidate_ids = [
+            value
+            for value in candidate_ids
+            if not candidate_by_id[value].exclusion_reason
+        ]
+        if not candidate_ids:
+            # Explicit exclusions outrank otherwise mandatory interview
+            # coverage.  The planner applies the same eligibility rule.
+            continue
         selected_event_ids = [value for value in candidate_ids if value in selected_ids]
         missing_selected = [value for value in candidate_ids if value not in selected_ids]
         if missing_selected:
@@ -346,6 +355,15 @@ def meal_event_coverage(
             raise VideoSummaryError(
                 f"식사 이벤트가 알 수 없는 후보를 참조합니다: {event_id}"
             )
+        candidate_ids = [
+            value
+            for value in candidate_ids
+            if not candidate_by_id[value].exclusion_reason
+        ]
+        if not candidate_ids:
+            # An event whose complete body option set was explicitly excluded
+            # is intentionally outside the required render contract.
+            continue
         selected_event_ids = [value for value in candidate_ids if value in selected_ids]
         if not selected_event_ids:
             raise VideoSummaryError(
@@ -390,6 +408,15 @@ def meal_event_coverage(
                 raise VideoSummaryError(
                     f"식사 서사 그룹이 알 수 없는 후보를 참조합니다: {context_id}"
                 )
+            group_candidate_ids = [
+                value
+                for value in group_candidate_ids
+                if not candidate_by_id[value].exclusion_reason
+            ]
+            if not group_candidate_ids:
+                # Setup/closure may be privately excluded independently of
+                # the filmed meal body.  Do not resurrect it at render time.
+                continue
             selected_group_ids = [
                 value for value in group_candidate_ids if value in selected_ids
             ]
@@ -438,7 +465,7 @@ def meal_event_coverage(
         )
 
     return {
-        "status": "satisfied",
+        "status": "satisfied" if events else "not_detected",
         "detected_event_count": len(events),
         "option_candidate_count": len(option_ids),
         "selected_event_count": len(events),
@@ -447,6 +474,207 @@ def meal_event_coverage(
         "selected_context_group_count": len(selected_context_ids),
         "context_candidate_count": len(context_candidate_ids),
         "selected_context_candidate_count": len(selected_context_candidate_ids),
+        "events": events,
+    }
+
+
+def story_flow_coverage(
+    candidates: list[Candidate],
+    clips: list[Clip],
+    plan: EditPlan,
+    *,
+    review_guard_seconds: float,
+) -> dict[str, Any]:
+    """Report complete source accounting and adaptive compression decisions."""
+    selected_segments = {
+        segment.candidate_id: segment
+        for episode in plan.episodes
+        for segment in episode.segments
+    }
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    event_ids = {
+        candidate.story_event_id
+        for candidate in candidates
+        if candidate.story_event_id and not candidate.exclusion_reason
+    }
+    selected_event_ids = {
+        candidate_by_id[candidate_id].story_event_id
+        for candidate_id in selected_segments
+        if candidate_id in candidate_by_id
+        and candidate_by_id[candidate_id].story_event_id
+    }
+    core_event_ids = {
+        candidate.story_event_id
+        for candidate in candidates
+        if candidate.story_event_id
+        and candidate.importance == "core"
+        and not candidate.exclusion_reason
+    }
+    accounted_seconds = sum(candidate.duration for candidate in candidates)
+    raw_seconds = sum(max(0.0, clip.duration) for clip in clips)
+    selected_source_seconds = sum(
+        candidate_by_id[candidate_id].duration
+        for candidate_id in selected_segments
+        if candidate_id in candidate_by_id
+    )
+    selected_output_seconds = sum(
+        candidate_by_id[candidate_id].duration / segment.speed
+        for candidate_id, segment in selected_segments.items()
+        if candidate_id in candidate_by_id
+    )
+    fast_forwarded = [
+        (candidate_by_id[candidate_id], segment)
+        for candidate_id, segment in selected_segments.items()
+        if candidate_id in candidate_by_id and segment.speed > 1.0
+    ]
+    by_day: list[dict[str, Any]] = []
+    for episode in sorted(plan.episodes, key=lambda item: (item.travel_day, item.day_key)):
+        values = [
+            (candidate_by_id[segment.candidate_id], segment)
+            for segment in episode.segments
+            if segment.candidate_id in candidate_by_id
+        ]
+        source_runtime = sum(candidate.duration for candidate, _ in values)
+        output_runtime = sum(candidate.duration / segment.speed for candidate, segment in values)
+        by_day.append(
+            {
+                "day_key": episode.day_key,
+                "selected_source_seconds": round(source_runtime, 3),
+                "selected_output_seconds": round(output_runtime, 3),
+                "review_guard_seconds": round(review_guard_seconds, 3),
+                "status": "review" if output_runtime > review_guard_seconds + 1e-6 else "within_guard",
+                "fast_forward_candidate_count": sum(segment.speed > 1.0 for _, segment in values),
+            }
+        )
+    omitted_event_ids = event_ids - selected_event_ids
+    omitted_core_event_ids = core_event_ids - selected_event_ids
+    protected_speed_violations = [
+        candidate.candidate_id
+        for candidate, segment in fast_forwarded
+        if candidate.speed_policy != "allow_fast"
+    ]
+    events: list[dict[str, Any]] = []
+    incomplete_represented_event_ids: list[str] = []
+    for event_id in sorted(
+        event_ids,
+        key=lambda value: min(
+            source_segment_sort_key(
+                PlanSegment(candidate.candidate_id, "journey", ""),
+                candidate_by_id,
+            )
+            for candidate in candidates
+            if candidate.story_event_id == value
+            and not candidate.exclusion_reason
+        ),
+    ):
+        source_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.story_event_id == event_id
+            and not candidate.exclusion_reason
+        ]
+        selected_values = [
+            (candidate, selected_segments[candidate.candidate_id])
+            for candidate in source_candidates
+            if candidate.candidate_id in selected_segments
+        ]
+        selected_ids = {
+            candidate.candidate_id for candidate, _ in selected_values
+        }
+        all_ids = {candidate.candidate_id for candidate in source_candidates}
+        any_fast = any(segment.speed > 1.0 for _, segment in selected_values)
+        if not selected_values:
+            treatment = "omit"
+        elif selected_ids == all_ids and any_fast:
+            treatment = "full_speed_up"
+        elif selected_ids == all_ids:
+            treatment = "full"
+        elif any_fast:
+            treatment = "compact_speed_up"
+        else:
+            treatment = "compact"
+        available_stages = sorted(
+            {candidate.story_stage for candidate in source_candidates}
+        )
+        selected_stages = sorted(
+            {candidate.story_stage for candidate, _ in selected_values}
+        )
+        activity_stages = {"body", "action", "outcome"}
+        has_filmed_activity = bool(activity_stages.intersection(available_stages))
+        has_selected_activity = bool(activity_stages.intersection(selected_stages))
+        activity_stage_satisfied = (
+            not selected_values
+            or not has_filmed_activity
+            or has_selected_activity
+        )
+        if selected_values and not activity_stage_satisfied:
+            incomplete_represented_event_ids.append(event_id)
+        events.append(
+            {
+                "event_id": event_id,
+                "day_key": source_candidates[0].day_key,
+                "importance": (
+                    "core"
+                    if any(candidate.importance == "core" for candidate in source_candidates)
+                    else "supporting"
+                    if any(candidate.importance == "supporting" for candidate in source_candidates)
+                    else "bridge"
+                ),
+                "treatment": treatment,
+                "available_stages": available_stages,
+                "selected_stages": selected_stages,
+                "filmed_activity_stage_available": has_filmed_activity,
+                "selected_activity_stage_present": has_selected_activity,
+                "activity_stage_status": (
+                    "satisfied" if activity_stage_satisfied else "missing"
+                ),
+                "source_candidate_count": len(source_candidates),
+                "selected_candidate_count": len(selected_values),
+                "source_seconds": round(
+                    sum(candidate.duration for candidate in source_candidates), 3
+                ),
+                "selected_source_seconds": round(
+                    sum(candidate.duration for candidate, _ in selected_values), 3
+                ),
+                "selected_output_seconds": round(
+                    sum(
+                        candidate.duration / segment.speed
+                        for candidate, segment in selected_values
+                    ),
+                    3,
+                ),
+                "fast_forward_candidate_count": sum(
+                    segment.speed > 1.0 for _, segment in selected_values
+                ),
+            }
+        )
+    return {
+        "status": (
+            "satisfied"
+            if not omitted_core_event_ids
+            and not incomplete_represented_event_ids
+            and not protected_speed_violations
+            else "unsatisfied"
+        ),
+        "raw_source_seconds": round(raw_seconds, 3),
+        "accounted_candidate_seconds": round(accounted_seconds, 3),
+        "unassigned_source_seconds": round(max(0.0, raw_seconds - accounted_seconds), 3),
+        "event_count": len(event_ids),
+        "represented_event_count": len(event_ids & selected_event_ids),
+        "omitted_event_count": len(omitted_event_ids),
+        "omitted_core_event_ids": sorted(omitted_core_event_ids),
+        "incomplete_represented_event_ids": sorted(
+            incomplete_represented_event_ids
+        ),
+        "selected_source_seconds": round(selected_source_seconds, 3),
+        "selected_output_seconds": round(selected_output_seconds, 3),
+        "compression_saved_seconds": round(selected_source_seconds - selected_output_seconds, 3),
+        "fast_forward_candidate_count": len(fast_forwarded),
+        "protected_speed_violation_candidate_ids": protected_speed_violations,
+        "explicitly_excluded_candidate_count": sum(
+            candidate.exclusion_reason is not None for candidate in candidates
+        ),
+        "days": by_day,
         "events": events,
     }
 
@@ -498,6 +726,15 @@ def render_project(
             candidates,
             validated,
             enabled=bool(config["editing"].get("preserve_meal_events", True)),
+        ),
+        "story_flow": story_flow_coverage(
+            candidates,
+            clips,
+            validated,
+            review_guard_seconds=float(
+                config["editing"].get("soft_max_minutes_per_day", 10.0)
+            )
+            * 60.0,
         ),
     }
     trip_intro_signature: list[dict[str, str]] | None = None
@@ -764,11 +1001,21 @@ def episode_pieces(
             show_location if member_index == 0 and show_location else member.segment.role
             for member_index, member in enumerate(group)
         ]
+        previous_group = groups[group_index - 1] if group_index > 0 else None
+        next_group = groups[group_index + 1] if group_index + 1 < len(groups) else None
+        fade_in = not (
+            previous_group
+            and source_groups_share_contiguous_story(previous_group, group)
+        )
+        fade_out = (
+            not next_group
+            or not source_groups_share_contiguous_story(group, next_group)
+        )
         pieces.append(
             render_source_piece(
                 segment, candidate, clip_by_id[candidate.clip_id], segments_dir, overlays_dir,
                 width, height, fps, encoder, bitrate, config, location_overlay=show_location, force=force,
-                fade_in=True, fade_out=True,
+                fade_in=fade_in, fade_out=fade_out,
                 coalesced_selections=tuple(group), member_labels=tuple(member_labels),
                 legacy_segments_dirs=legacy_segments_dirs,
             )
@@ -833,6 +1080,27 @@ def source_selections_are_contiguous(
         == effective_source_location(current.segment, current.candidate)
         and effective_source_caption(previous.segment, previous.candidate)
         == effective_source_caption(current.segment, current.candidate)
+    )
+
+
+def source_groups_share_contiguous_story(
+    previous: list[SourceSelection],
+    current: list[SourceSelection],
+    *,
+    tolerance: float = 0.001,
+) -> bool:
+    """Suppress black only across a real contiguous cut in one source event."""
+    if not previous or not current:
+        return False
+    left = previous[-1].candidate
+    right = current[0].candidate
+    event_id = left.story_event_id
+    gap = right.start - left.end
+    return bool(
+        event_id
+        and event_id == right.story_event_id
+        and left.clip_id == right.clip_id
+        and -tolerance - 1e-9 <= gap <= tolerance + 1e-9
     )
 
 
@@ -1474,7 +1742,7 @@ def render_source_piece(
         filters.append(
             f"[0:a:0]asetpts=PTS-STARTPTS,aresample=48000,"
             f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-            f"atempo={segment.speed:.6f},{audio_start_pad}"
+            f"{atempo_filter_chain(segment.speed)},{audio_start_pad}"
             "loudnorm=I=-16:LRA=11:TP=-1.5,"
             # Some FFmpeg loudnorm builds emit non-finite floats for digital silence.
             # Quantizing once prevents those values from reaching the AAC encoder.
@@ -1522,6 +1790,22 @@ def render_source_piece(
         segment,
         source_members=source_members,
     )
+
+
+def atempo_filter_chain(speed: float) -> str:
+    """Build a portable audio tempo chain for 0.75x through 4x playback."""
+    if not math.isfinite(speed) or speed <= 0:
+        raise VideoSummaryError("audio speed가 잘못되었습니다.")
+    remaining = speed
+    factors: list[float] = []
+    while remaining > 2.0 + 1e-9:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5 - 1e-9:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
 def source_output_timing(duration: float, fps: int) -> tuple[int, float]:
