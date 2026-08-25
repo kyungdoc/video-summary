@@ -1,6 +1,6 @@
 # Video Summary
 
-오즈모·액션캠으로 촬영한 여행 영상을 날짜별로 정리해, 여정과 재미있는 순간이 함께 보이는 YouTube용 요약 영상을 만드는 로컬 우선 CLI입니다.
+오즈모·액션캠·iPhone으로 촬영한 여행 영상을 날짜별로 정리해, 여정과 재미있는 순간이 함께 보이는 YouTube용 요약 영상을 만드는 로컬 우선 CLI입니다.
 
 기본 결과는 여행 날짜별 MP4입니다. 인트로, 날짜 카드, 위치 lower-third, 아웃트로와 함께 `.vtt` 자막, YouTube 설명란에 붙일 `.chapters.txt`, 설명문 초안도 생성합니다. 업로드 자체는 자동으로 수행하지 않습니다.
 
@@ -97,6 +97,12 @@ uv run --frozen video-summary render \
 
 길이는 사건을 누락시키는 선택 예산이 아니라 완성본 검토 guard입니다. `target_minutes_per_day`는 `edit-plan.json`의 `target_duration` 호환·표시값이며 fill quota가 아니고, 기본 `soft_max_minutes_per_day: 10`은 사건 흐름을 모두 구성한 뒤 속도와 밀도를 다시 보라는 DAY별 review guard입니다. 10분을 넘는다고 뒤의 사건을 자동 삭제하지 않고, 각 사건을 `full → compact → speed_up → omit`의 순서로 검토합니다. `compact`는 원속도로 setup/body/action/reaction/closure의 핵심 run을 짧게 다듬는 것이고, `speed_up`은 대사가 없고 화면 변화가 적은 이동·대기·반복 풍경에만 적용합니다. 식사·놀이(수영장, 야외 구경, 탈것 등)·인터뷰·사람의 합류/만남·핵심 반응은 `speed=1.0`으로 보호합니다. `omit`은 의미를 반복하거나 사적·기술적으로 사용할 수 없는 구간에 대한 마지막 선택입니다. 기대되는 결과가 guard를 넘어도 흐름이 완전하면 그 길이를 유지하며, 반대로 더 보여 줄 사건이 없으면 10분을 채우지 않습니다.
 
+기본 편집 조합은 `pacing_profile: gentle`과 `tone_profile: playful`입니다. Gentle은 사건을 길게 늘이는 뜻이 아니라 인터뷰·식사·놀이·이동·대화·풍경의 맥락을 이해할 만큼 남기는 호흡입니다. Playful은 사건 수나 길이 envelope를 늘리지 않고 같은 사건 안에서 선택·행동·결과·반응, 가족 상호작용과 화면 변화가 있는 후보를 반복·정지 구간보다 우선합니다. 선택과 공개 사이의 실제 행동 및 공개 뒤 반응을 시간순으로 살리고, `allow_fast`인 변화 적은 브리지만 Gentle 상한 2배 안에서 조금 더 경쾌하게 처리합니다. `tone_profile: calm`은 동일한 사건과 필수 단계를 유지하면서 공간과 대화의 자연스러운 맥락을 우선합니다.
+
+새 plan은 두 profile을 메타데이터에 기록합니다. profile 필드가 생기기 전에 만든 기존 plan은 당시 동작과 3배속 호환성을 보존하기 위해 `balanced + calm`으로 해석하므로, 새 기본값을 적용하려면 `plan`을 다시 실행해야 합니다.
+
+원본 폴더 아래 `iphone/`에 export한 영상은 재귀 scan으로 같은 촬영 시간축에 합쳐집니다. Playful local plan은 같은 사건의 주 촬영 장면과 45초 이내인 2~8초 iPhone 후보를 envelope 안에서 사건당 최대 한 컷의 보조 시점으로 사용할 수 있습니다. 인터뷰에는 자동 cutaway를 추가하지 않고 필수 식사 body를 다른 각도로 대체하지 않습니다. 세로 영상은 기본 `render.portrait_layout: blur`로 가로 캔버스에 배치하며 `pillarbox`와 `crop`도 선택할 수 있습니다. macOS에서는 iPhone HLG/PQ를 VideoToolbox로 BT.709 SDR에 맞추고 최종 H.264에도 BT.709 색상 태그를 기록합니다.
+
 여행 중간이나 마지막에 가족이 한 명씩 여행 소감·가장 좋았던 순간 등을 묻고 답하는 인터뷰가 전사에서 확실하게 탐지되면, `preserve_family_interviews: true` 기본값이 그 답변 묶음을 필수 모먼트로 지정합니다. 10분 review guard를 넘거나 후보 점수가 낮아도 완결된 연속 구간을 모두 선택하며, local뿐 아니라 Codex/Claude/file 플랜도 누락하거나 배속하면 검증에서 거부합니다. 인터뷰가 탐지되지 않으면 기존 방식으로 정상 진행합니다. 얼굴 인식이나 화자 분리를 하지 않으므로 실제 가족 구성원 수를 판별하는 기능은 아니며, 질문·답변이 이어지는 source 구간을 개인 인터뷰 단위로 보존합니다. 이 보장을 사용할 때는 전사가 필요하므로 `--skip-transcribe`를 함께 쓸 수 없습니다.
 
 `preserve_meal_events: true` 기본값은 전사와 인접 타임라인에서 탐지된 서로 다른 조식·점심·저녁·카페·디저트·간식 사건을 필수 모먼트로 보존합니다. 사건마다 실제 식탁·음식·먹는 반응인 body 후보를 하나의 `one_of` 그룹으로 묶어 최소 하나를 촬영시간순·원속도로 선택합니다. 연결된 식당 도착과 주문은 setup으로, 퇴장·감사 인사뿐 아니라 음식명 또는 식사명과 결합된 맛 반응·식사 회고는 closure로 묶고, 탐지된 각 맥락 그룹에서도 최소 한 장면을 선택합니다. 따라서 흐름은 가능한 경우 `setup → 실제 식사 body/reaction → closure`가 되며, setup이나 closure 같은 context는 body를 대신할 수 없습니다. local뿐 아니라 Codex/Claude/file 플랜도 탐지된 body나 연결 맥락 그룹을 건너뛸 수 없고, 필요한 완결 구간은 10분 review guard보다 우선합니다. 넓은 `food` role 전체를 강제로 넣지는 않으므로 요리책 대사, 막연한 식사 계획, 음식명과 연결되지 않은 과거 회고 같은 오탐으로 영상을 채우지 않습니다. 전사 근거가 없는 visual-only 식사는 자동 탐지 결과만으로 확정할 수 없으므로, 최종 렌더 전 DAY별 전체 후보 contact sheet를 검수해 실제 식사 사건별 body와 자연스러운 전후 서사를 plan에 보강해야 합니다. 원본에 body가 없다면 인접 무음 클립을 body로 오인하지 말고 검수 메모에 `not_filmed`로 남긴 뒤 정직한 브리지를 사용합니다. `not_detected`는 식사가 없었다는 뜻이 아니라 자동 탐지 근거가 없었다는 뜻입니다. 이 보장을 켠 상태에서는 `--skip-transcribe`를 함께 쓸 수 없습니다.
@@ -121,7 +127,9 @@ editing:
   target_minutes_per_day: 4.0       # plan 표시 호환값이며 fill quota가 아님
   soft_max_minutes_per_day: 10.0    # 사건 선택 상한이 아닌 DAY 페이싱 review guard
   selection_strategy: event_flow
-  adaptive_fast_forward: true       # guard 초과 시 allow_fast 브리지만 배속
+  pacing_profile: gentle            # gentle 또는 balanced
+  tone_profile: playful             # playful 또는 calm
+  adaptive_fast_forward: true       # allow_fast 브리지만 profile/tone 범위에서 배속
   max_fast_forward_speed: 3.0
   exclude_ranges:
     - match: "**/IMG_1234.MOV"     # source 상대경로 또는 basename glob
@@ -133,6 +141,7 @@ editing:
   episode_mode: trip
 
 render:
+  portrait_layout: blur         # blur, pillarbox, crop 중 선택
   trip_intro_style: mosaic
   trip_intro_candidate_ids: []  # 비우면 DAY 커버리지 우선으로 자동 선택
   trip_intro_grid_size: 7       # 6, 7, 8 중 선택
@@ -160,7 +169,7 @@ project:
 
 같은 원본에서 겹치거나 맞닿은 후보 창은 후보 생성 때 하나의 연속 구간으로 합치고, planner 검증에서도 같은 원본의 실시간 구간이 1ms를 넘게 겹치는 선택을 거부합니다. 렌더러는 각 source 길이를 목표 fps의 가장 가까운 정수 프레임으로 맞춘 뒤 fps·PTS를 정규화하고 부족한 끝 프레임을 보충한 다음 정확한 프레임 수로 자릅니다. 완성된 캐시도 fps·프레임 수·영상/음성 길이를 다시 확인하므로, concat에서 마지막 프레임이 붙잡혀 반복처럼 보이는 현상을 막습니다.
 
-`transition_seconds`의 기본값은 `0.18`초이고 허용 범위는 0~1초입니다. 같은 원본에서 정확히 맞닿고 편집 속도·표시가 같은 후보들은 먼저 하나의 연속 source로 합칩니다. 합쳐지지 않은 DAY 내부 장면 경계에서는 앞 source가 블랙·무음으로 짧게 빠지고 다음 source가 다시 들어오며, 날짜 카드 앞뒤에도 같은 전환을 적용합니다. 조립 단계에서 여러 4K 영상을 동시에 디코드하는 실제 crossfade 대신 각 조각의 길이를 보존하는 저메모리 fade-through-black 방식입니다. 값을 `0`으로 두면 모든 경계 페이드를 끕니다.
+`transition_seconds`의 기본값은 `0.18`초이고 허용 범위는 0~1초입니다. 같은 원본에서 정확히 맞닿고 편집 속도·표시가 같은 후보들은 먼저 하나의 연속 source로 합칩니다. 같은 사건 ID라도 실제 촬영 간격이 30초를 넘으면 hard cut으로 붙이지 않고, 합쳐지지 않은 DAY 내부 장면 경계와 날짜 카드 앞뒤에는 짧은 블랙·무음 전환을 적용합니다. 조립 단계에서 여러 4K 영상을 동시에 디코드하는 실제 crossfade 대신 각 조각의 길이를 보존하는 저메모리 fade-through-black 방식입니다. 값을 `0`으로 두면 모든 경계 페이드를 끕니다.
 
 ## 로컬 전사
 
@@ -278,4 +287,4 @@ CLI stdout은 기본적으로 clip/candidate 수와 출력 경로만 요약합�
 - 의미 기반 전체 영상 비전 모델이나 온라인 GPS 역지오코딩은 포함하지 않습니다.
 - 위치는 파일/날짜/전사 키워드 규칙 또는 외부 플래너의 label을 사용합니다.
 - 필수 이동 거점의 자동 탐지는 명시적인 전사에 의존합니다. 위치는 후속 검토에만 도움을 주며, 무전사 장면을 행동·경로·위치만으로 추론해 필수화하지는 않습니다.
-- D-Log M/HLG 자동 색보정은 추측하지 않습니다. 필요한 LUT/color pipeline은 후속 기능입니다.
+- D-Log M 색보정은 추측하지 않습니다. iPhone HLG/PQ → BT.709 변환은 macOS VideoToolbox 경로에서만 지원하며, 필요한 변환 필터가 없으면 잘못된 색으로 계속하지 않고 중단합니다.

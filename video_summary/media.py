@@ -19,7 +19,7 @@ from .utils import VideoSummaryError, file_fingerprint, print_status, read_json,
 
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mts", ".m2ts", ".avi", ".mkv"}
-_CAPTURE_TIME_POLICY_VERSION = 3
+_CAPTURE_TIME_POLICY_VERSION = 4
 VISUAL_SIGNAL_POLICY_VERSION = 2
 _FILENAME_PATTERNS = (
     re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])[_-]?([0-2]\d)([0-5]\d)([0-5]\d)(?!\d)"),
@@ -55,7 +55,7 @@ def scan_project(
     project_config = config["project"]
     cache_key = stable_hash(
         {
-            "version": 2,
+            "version": 3,
             "capture_time_policy": _CAPTURE_TIME_POLICY_VERSION,
             "project": config["project"]["name"],
             "source": str(source),
@@ -132,6 +132,12 @@ def scan_project(
                     audio_sample_rate=int(audio.get("sample_rate", 0) or 0) if audio else None,
                     location=location,
                     warnings=warnings,
+                    pix_fmt=_optional_probe_text(video.get("pix_fmt")),
+                    color_space=_optional_probe_text(video.get("color_space")),
+                    color_transfer=_optional_probe_text(video.get("color_transfer")),
+                    color_primaries=_optional_probe_text(video.get("color_primaries")),
+                    color_range=_optional_probe_text(video.get("color_range")),
+                    dolby_vision_profile=_dolby_vision_profile(video),
                 )
             )
 
@@ -661,6 +667,27 @@ def _rotation(video: dict[str, Any]) -> int:
             except (TypeError, ValueError):
                 continue
     return 0
+
+
+def _optional_probe_text(value: Any) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _dolby_vision_profile(video: dict[str, Any]) -> int | None:
+    for side_data in video.get("side_data_list", []):
+        if not isinstance(side_data, dict):
+            continue
+        if str(side_data.get("side_data_type", "")).casefold() != "dovi configuration record":
+            continue
+        value = side_data.get("dv_profile")
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _scan_config_signature(config: dict[str, Any]) -> str:

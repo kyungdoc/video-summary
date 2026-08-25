@@ -8,9 +8,12 @@ from unittest.mock import patch
 
 from video_summary.models import Candidate
 from video_summary.planner import (
+    PACING_REVEAL_CUES,
     _adaptive_compression_speeds,
+    _clip_source_families,
     _contact_sheet_day_keys,
     _planner_candidates_payload,
+    _pacing_cue_count,
     _prompt_role_weights,
     _sample_contact_sheets,
     _select_day_candidates,
@@ -117,6 +120,14 @@ class PlannerTests(unittest.TestCase):
         )
         self.assertEqual(plan.episodes[0].target_duration, 12.0)
         self.assertEqual(len(plan.episodes[0].segments), 2)
+        self.assertEqual(plan.pacing_profile, "balanced")
+        self.assertEqual(plan.tone_profile, "calm")
+
+    def test_new_local_plan_records_gentle_playful_defaults(self) -> None:
+        plan = local_plan(self.config, "여행의 재미와 흐름", self.candidates, "hash")
+
+        self.assertEqual(plan.pacing_profile, "gentle")
+        self.assertEqual(plan.tone_profile, "playful")
 
     def test_plan_cache_tracks_candidate_policy_versions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -167,6 +178,50 @@ class PlannerTests(unittest.TestCase):
                 plan_project(paths, self.config)
 
             self.assertEqual(planned.call_count, 2)
+
+    def test_tone_profile_change_invalidates_plan_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            write_json(
+                paths.candidates,
+                {
+                    "version": 2,
+                    "candidate_set_hash": "unchanged-candidates",
+                    "policy_versions": {},
+                },
+            )
+            with (
+                patch("video_summary.planner.load_candidates", return_value=self.candidates),
+                patch("video_summary.planner.local_plan", wraps=local_plan) as planned,
+            ):
+                plan_project(paths, self.config)
+                self.config["editing"]["tone_profile"] = "calm"
+                plan_project(paths, self.config)
+                plan_project(paths, self.config)
+
+            self.assertEqual(planned.call_count, 2)
+
+    def test_source_family_classifies_only_the_iphone_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            write_json(
+                paths.manifest,
+                {
+                    "clips": [
+                        {"clip_id": "phone", "relative_path": "iphone/IMG_0001.MOV"},
+                        {"clip_id": "osmo", "relative_path": "day1/DJI_0001.MP4"},
+                        {"clip_id": "name_only", "relative_path": "iphone-shot.MOV"},
+                    ]
+                },
+            )
+
+            families = _clip_source_families(paths)
+
+        self.assertEqual(families["phone"], "iphone")
+        self.assertEqual(families["osmo"], "primary")
+        self.assertEqual(families["name_only"], "primary")
 
     def test_hash_and_required_fields_are_strict(self) -> None:
         payload = self.valid_payload()
@@ -450,7 +505,7 @@ class PlannerTests(unittest.TestCase):
         item.transcript = "민감한 대화 " * 80
         payload = _planner_candidates_payload([item], "hash")
         exported = payload["candidates"][0]
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 4)
         self.assertEqual(
             payload["story_selection_contract"]["strategy"],
             "coverage_first_event_flow",
@@ -463,6 +518,15 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(
             payload["story_selection_contract"]["compression_ladder"],
             ["full", "compact", "speed_up", "omit"],
+        )
+        profiled = _planner_candidates_payload([item], "hash", self.config)
+        self.assertEqual(
+            profiled["story_selection_contract"]["pacing_profile"],
+            "gentle",
+        )
+        self.assertEqual(
+            profiled["story_selection_contract"]["tone_profile"],
+            "playful",
         )
         self.assertTrue(payload["story_event_groups"])
         self.assertNotIn("transcript", exported)
@@ -689,6 +753,9 @@ class PlannerTests(unittest.TestCase):
     def test_planner_schema_const_fields_also_declare_their_json_type(self) -> None:
         schema = planner_schema()
         self.assertEqual(schema["properties"]["version"], {"type": "integer", "const": 1})
+        self.assertTrue(
+            {"pacing_profile", "tone_profile"}.issubset(schema["required"])
+        )
         segment_schema = schema["properties"]["episodes"]["items"]["properties"]["segments"]["items"]
         self.assertEqual(set(segment_schema["required"]), set(segment_schema["properties"]))
         self.assertIn("interview", segment_schema["properties"]["role"]["enum"])
@@ -699,6 +766,19 @@ class PlannerTests(unittest.TestCase):
         ]["segments"]["items"]["properties"]["speed"]
         self.assertEqual(configured_speed["minimum"], 0.75)
         self.assertEqual(configured_speed["maximum"], 3.0)
+        fixed_profiles = planner_schema(
+            max_speed=2.0,
+            pacing_profile="gentle",
+            tone_profile="playful",
+        )
+        self.assertEqual(
+            fixed_profiles["properties"]["pacing_profile"],
+            {"type": "string", "const": "gentle"},
+        )
+        self.assertEqual(
+            fixed_profiles["properties"]["tone_profile"],
+            {"type": "string", "const": "playful"},
+        )
         capped_schema = planner_schema(max_speed=8.0)
         capped_speed = capped_schema["properties"]["episodes"]["items"][
             "properties"
@@ -984,9 +1064,414 @@ class PlannerTests(unittest.TestCase):
             segment.candidate_id: segment.speed
             for segment in tight_plan.episodes[0].segments
         }
-        self.assertEqual(relaxed_speeds["walk"], 1.0)
+        self.assertGreater(relaxed_speeds["walk"], 1.0)
         self.assertGreater(tight_speeds["walk"], 1.0)
         self.assertEqual(tight_speeds["meal"], 1.0)
+
+    def test_balanced_compacts_more_than_gentle_without_losing_events_or_activity(self) -> None:
+        stages = ["setup", "body", "body", "outcome", "closure"]
+        items: list[Candidate] = []
+        for index, stage in enumerate(stages):
+            item = candidate(
+                f"meal_{index}",
+                f"2026-11-01T08:{index:02d}:00-05:00",
+            )
+            item.end = 10.0
+            item.roles = ["food"]
+            item.story_event_id = "event_meal"
+            item.story_stage = stage
+            item.speed_policy = "protected_1x"
+            items.append(item)
+        scenery = candidate("scenery", "2026-11-01T09:00:00-05:00")
+        scenery.roles = ["scenery"]
+        scenery.story_event_id = "event_scenery"
+        scenery.story_stage = "body"
+        scenery.speed_policy = "protected_1x"
+        items.append(scenery)
+
+        gentle = copy.deepcopy(self.config)
+        gentle["editing"]["pacing_profile"] = "gentle"
+        balanced = copy.deepcopy(self.config)
+        balanced["editing"]["pacing_profile"] = "balanced"
+
+        gentle_plan = local_plan(gentle, "식사와 풍경", items, "hash")
+        balanced_plan = local_plan(balanced, "식사와 풍경", items, "hash")
+        catalog = {item.candidate_id: item for item in items}
+        gentle_ids = [item.candidate_id for item in gentle_plan.episodes[0].segments]
+        balanced_ids = [item.candidate_id for item in balanced_plan.episodes[0].segments]
+        gentle_seconds = sum(catalog[value].duration for value in gentle_ids)
+        balanced_seconds = sum(catalog[value].duration for value in balanced_ids)
+
+        self.assertGreater(gentle_seconds, balanced_seconds)
+        self.assertEqual(
+            {catalog[value].story_event_id for value in gentle_ids},
+            {catalog[value].story_event_id for value in balanced_ids},
+        )
+        self.assertIn(
+            "body",
+            {catalog[value].story_stage for value in balanced_ids if catalog[value].story_event_id == "event_meal"},
+        )
+        self.assertTrue(
+            all(segment.speed == 1.0 for segment in balanced_plan.episodes[0].segments)
+        )
+
+    def test_playful_prefers_reaction_inside_the_same_gentle_event(self) -> None:
+        stages = ["setup", "body", "reaction", "reaction", "closure"]
+        items: list[Candidate] = []
+        for index, stage in enumerate(stages):
+            item = candidate(
+                f"beat_{index}",
+                f"2026-11-01T08:00:{index * 10:02d}-05:00",
+            )
+            item.end = item.start + 20.0
+            item.roles = ["fun", "dialogue"]
+            item.story_event_id = "event_play"
+            item.story_stage = stage
+            item.transcript = "차분한 설명"
+            items.append(item)
+        items[2].score = 0.86
+        items[3].score = 0.80
+        items[3].transcript = "마음에 들어? 하하"
+
+        calm = _select_day_candidates(
+            items,
+            600.0,
+            pacing_profile="gentle",
+            tone_profile="calm",
+        )
+        playful = _select_day_candidates(
+            items,
+            600.0,
+            pacing_profile="gentle",
+            tone_profile="playful",
+        )
+        calm_ids = {item.candidate_id for item in calm}
+        playful_ids = {item.candidate_id for item in playful}
+
+        self.assertIn("beat_2", calm_ids)
+        self.assertNotIn("beat_3", calm_ids)
+        self.assertIn("beat_3", playful_ids)
+        self.assertEqual(
+            {item.story_event_id for item in calm},
+            {item.story_event_id for item in playful},
+        )
+
+    def test_playful_cues_do_not_create_a_new_weak_event(self) -> None:
+        anchor = candidate("anchor", "2026-11-01T08:00:00-05:00")
+        anchor.story_event_id = "event_anchor"
+        weak_reaction = candidate("weak", "2026-11-01T09:00:00-05:00")
+        weak_reaction.story_event_id = "event_weak"
+        weak_reaction.story_stage = "reaction"
+        weak_reaction.transcript = "마음에 들어? 하하"
+        weak_reaction.score = 0.1
+        weak_reaction.visual_quality = 0.1
+        weak_reaction.motion_score = 0.0
+        closing = candidate("closing", "2026-11-01T10:00:00-05:00")
+        closing.roles = ["journey", "closer"]
+        closing.story_event_id = "event_closing"
+
+        calm = _select_day_candidates(
+            [anchor, weak_reaction, closing],
+            600.0,
+            pacing_profile="gentle",
+            tone_profile="calm",
+        )
+        playful = _select_day_candidates(
+            [anchor, weak_reaction, closing],
+            600.0,
+            pacing_profile="gentle",
+            tone_profile="playful",
+        )
+
+        self.assertEqual(
+            {item.story_event_id for item in calm},
+            {item.story_event_id for item in playful},
+        )
+        self.assertNotIn("weak", {item.candidate_id for item in playful})
+
+    def test_playful_reveal_rejects_restaurant_and_hotel_exit(self) -> None:
+        exit_candidate = candidate("exit", "2026-11-01T08:00:00-05:00")
+        for transcript in (
+            "식당에서 나왔네",
+            "카페에서 나왔다",
+            "호텔에서 나온 거 같아",
+        ):
+            with self.subTest(transcript=transcript):
+                exit_candidate.transcript = transcript
+                self.assertEqual(
+                    _pacing_cue_count(exit_candidate, PACING_REVEAL_CUES),
+                    0,
+                )
+        exit_candidate.transcript = "토끼가 나왔네"
+        self.assertEqual(
+            _pacing_cue_count(exit_candidate, PACING_REVEAL_CUES),
+            1,
+        )
+
+    def test_playful_keeps_ordered_action_reveal_reaction_chain(self) -> None:
+        specs = [
+            ("setup", "setup", "이제 시작해 보자", 0.50),
+            ("choice", "bridge", "하영이가 하나를 골라 보자", 0.75),
+            ("body", "body", "기계 앞에 섰어요", 0.85),
+            ("action", "bridge", "", 0.45),
+            ("anticipation", "bridge", "좋은 게 나와야 할 텐데", 0.70),
+            ("reveal", "bridge", "토끼가 나왔네", 0.70),
+            ("reaction", "bridge", "마음에 들어? 하하", 0.55),
+            ("closure", "closure", "이제 가자", 0.80),
+        ]
+        items: list[Candidate] = []
+        for index, (candidate_id, stage, transcript, score) in enumerate(specs):
+            item = candidate(
+                candidate_id,
+                f"2026-11-01T08:00:{index * 5:02d}-05:00",
+            )
+            item.end = item.start + 8.0
+            item.roles = ["fun", "dialogue"]
+            item.story_event_id = "event_gacha"
+            item.story_stage = stage
+            item.transcript = transcript
+            item.score = score
+            item.motion_score = 0.7 if candidate_id == "action" else 0.2
+            items.append(item)
+
+        config = copy.deepcopy(self.config)
+        plan = local_plan(config, "뽑기 결과와 반응", items, "hash")
+        segment_ids = [
+            segment.candidate_id for segment in plan.episodes[0].segments
+        ]
+
+        chain = ["choice", "action", "anticipation", "reveal", "reaction"]
+        self.assertTrue(set(chain).issubset(segment_ids))
+        self.assertEqual(
+            [segment_ids.index(candidate_id) for candidate_id in chain],
+            sorted(segment_ids.index(candidate_id) for candidate_id in chain),
+        )
+        self.assertTrue(
+            all(
+                segment.speed == 1.0
+                for segment in plan.episodes[0].segments
+                if segment.candidate_id in chain
+            )
+        )
+
+    def test_playful_adds_one_nearby_iphone_cutaway_inside_event(self) -> None:
+        primary_setup = candidate("setup", "2026-11-01T08:00:00-05:00")
+        primary_body = candidate("body", "2026-11-01T08:00:10-05:00")
+        iphone = candidate("iphone", "2026-11-01T08:00:12-05:00")
+        closing = candidate("closing", "2026-11-01T08:00:20-05:00")
+        for item, stage in (
+            (primary_setup, "setup"),
+            (primary_body, "body"),
+            (iphone, "bridge"),
+            (closing, "closure"),
+        ):
+            item.roles = ["fun"]
+            item.story_event_id = "event_pool"
+            item.story_stage = stage
+            item.transcript = ""
+        closing.roles.append("closer")
+        iphone.end = iphone.start + 5.0
+        iphone.score = 0.2
+        iphone.visual_quality = 0.8
+        iphone.motion_score = 0.5
+        source_families = {
+            primary_setup.clip_id: "primary",
+            primary_body.clip_id: "primary",
+            closing.clip_id: "primary",
+            iphone.clip_id: "iphone",
+        }
+
+        calm = _select_day_candidates(
+            [primary_setup, primary_body, iphone, closing],
+            600.0,
+            pacing_profile="gentle",
+            tone_profile="calm",
+            source_family_by_clip=source_families,
+        )
+        playful = _select_day_candidates(
+            [primary_setup, primary_body, iphone, closing],
+            600.0,
+            pacing_profile="gentle",
+            tone_profile="playful",
+            source_family_by_clip=source_families,
+        )
+
+        self.assertNotIn("iphone", {item.candidate_id for item in calm})
+        self.assertIn("iphone", {item.candidate_id for item in playful})
+        self.assertEqual(
+            {item.story_event_id for item in calm},
+            {item.story_event_id for item in playful},
+        )
+
+    def test_playful_does_not_promote_a_distant_iphone_cutaway(self) -> None:
+        primary = candidate("primary", "2026-11-01T08:00:00-05:00")
+        iphone = candidate("iphone", "2026-11-01T08:02:00-05:00")
+        closing = candidate("closing", "2026-11-01T08:00:20-05:00")
+        for item, stage in (
+            (primary, "body"),
+            (iphone, "bridge"),
+            (closing, "closure"),
+        ):
+            item.roles = ["fun"]
+            item.story_event_id = "event_view"
+            item.story_stage = stage
+            item.transcript = ""
+        closing.roles.append("closer")
+        iphone.end = iphone.start + 5.0
+        iphone.score = 0.1
+        selected = _select_day_candidates(
+            [primary, iphone, closing],
+            600.0,
+            pacing_profile="gentle",
+            tone_profile="playful",
+            source_family_by_clip={
+                primary.clip_id: "primary",
+                iphone.clip_id: "iphone",
+                closing.clip_id: "primary",
+            },
+        )
+
+        self.assertNotIn("iphone", {item.candidate_id for item in selected})
+
+    def test_playful_adds_rhythm_only_to_eligible_bridge_below_guard(self) -> None:
+        items = [
+            candidate("anchor", "2026-11-01T08:00:00-05:00"),
+            candidate("bridge", "2026-11-01T08:01:00-05:00"),
+            candidate("closing", "2026-11-01T08:02:00-05:00"),
+        ]
+        items[1].end = items[1].start + 5.0
+        items[1].transcript = ""
+        items[1].roles = ["journey"]
+        items[1].speech_ratio = 0.0
+        items[1].motion_score = 0.20
+        items[1].speed_policy = "allow_fast"
+
+        calm = _adaptive_compression_speeds(
+            items,
+            600.0,
+            enabled=True,
+            max_speed=2.0,
+            pacing_profile="gentle",
+            tone_profile="calm",
+        )
+        playful = _adaptive_compression_speeds(
+            items,
+            600.0,
+            enabled=True,
+            max_speed=2.0,
+            pacing_profile="gentle",
+            tone_profile="playful",
+        )
+
+        self.assertEqual(calm["bridge"], 1.5)
+        self.assertEqual(playful["bridge"], 2.0)
+        self.assertEqual(playful["anchor"], 1.0)
+        self.assertEqual(playful["closing"], 1.0)
+
+    def test_balanced_keeps_activity_when_day_anchor_is_only_a_setup(self) -> None:
+        setup = candidate("setup", "2026-11-01T08:00:00-05:00")
+        setup.roles = ["scenery"]
+        setup.story_event_id = "event_view"
+        setup.story_stage = "setup"
+        body = candidate("body", "2026-11-01T08:00:10-05:00")
+        body.roles = ["scenery"]
+        body.story_event_id = "event_view"
+        body.story_stage = "body"
+
+        selected = _select_day_candidates(
+            [setup, body],
+            600.0,
+            pacing_profile="balanced",
+        )
+
+        self.assertEqual(
+            {item.candidate_id for item in selected},
+            {"setup", "body"},
+        )
+
+    def test_contiguous_fragment_merge_preserves_each_story_event(self) -> None:
+        first = candidate("first", "2026-11-01T08:00:00-05:00", 0.0)
+        second = candidate("second", "2026-11-01T08:00:10-05:00", 10.0)
+        for item, event_id in ((first, "event_a"), (second, "event_b")):
+            item.clip_id = "shared_clip"
+            item.end = item.start + 10.0
+            item.roles = ["scenery"]
+            item.story_event_id = event_id
+            item.story_stage = "body"
+
+        selected = _select_day_candidates(
+            [first, second],
+            600.0,
+            pacing_profile="balanced",
+        )
+
+        self.assertEqual(
+            {item.story_event_id for item in selected},
+            {"event_a", "event_b"},
+        )
+
+    def test_compaction_preserves_choice_anticipation_and_reveal_cues(self) -> None:
+        beats = [
+            candidate("choice", "2026-11-01T08:00:00-05:00", 0.0),
+            candidate("anticipation", "2026-11-01T08:00:05-05:00", 5.0),
+            candidate("reveal", "2026-11-01T08:00:10-05:00", 10.0),
+            candidate("reaction", "2026-11-01T08:00:15-05:00", 15.0),
+        ]
+        transcripts = [
+            "하영이의 원픽을 골라 보자",
+            "예쁜 게 나와야 할 텐데",
+            "뭐가 나올까요? 토끼가 나왔네",
+            "마음에 들어?",
+        ]
+        for index, (item, transcript) in enumerate(zip(beats, transcripts)):
+            item.clip_id = "gacha_clip"
+            item.end = item.start + 5.0
+            item.roles = ["fun", "dialogue"]
+            item.story_event_id = "event_gacha_a" if index < 2 else "event_gacha_b"
+            item.story_stage = "action" if index == 0 else "body" if index == 3 else "bridge"
+            item.transcript = transcript
+
+        selected = _select_day_candidates(
+            beats,
+            600.0,
+            pacing_profile="balanced",
+        )
+        selected_ids = {item.candidate_id for item in selected}
+
+        self.assertTrue(
+            {"choice", "anticipation", "reveal"}.issubset(selected_ids)
+        )
+
+    def test_plan_profiles_control_validation_and_are_preserved(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["editing"]["pacing_profile"] = "gentle"
+        self.candidates[1].roles = ["journey"]
+        self.candidates[1].speed_policy = "allow_fast"
+        payload = self.valid_payload()
+        payload["pacing_profile"] = "balanced"
+        payload["tone_profile"] = "calm"
+        payload["episodes"][0]["segments"][1].update(
+            {"role": "journey", "speed": 3.0}
+        )
+
+        plan = validate_and_normalize_plan(
+            payload, config, "x", self.candidates, "hash", "file"
+        )
+
+        self.assertEqual(plan.pacing_profile, "balanced")
+        self.assertEqual(plan.tone_profile, "calm")
+        self.assertEqual(plan.episodes[0].segments[1].speed, 3.0)
+        payload["pacing_profile"] = {}
+        with self.assertRaisesRegex(VideoSummaryError, "pacing_profile"):
+            validate_and_normalize_plan(
+                payload, config, "x", self.candidates, "hash", "file"
+            )
+        payload["pacing_profile"] = "balanced"
+        payload["tone_profile"] = []
+        with self.assertRaisesRegex(VideoSummaryError, "tone_profile"):
+            validate_and_normalize_plan(
+                payload, config, "x", self.candidates, "hash", "file"
+            )
 
     def test_adaptive_compression_only_speeds_eligible_internal_bridges(self) -> None:
         items = [
@@ -1122,7 +1607,10 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("duration review guard: 600.0s", request)
         self.assertIn("Legacy target_duration per day: 0.2 minutes", request)
         self.assertIn("Duration review guard per day: 10.0 minutes", request)
-        self.assertIn("Maximum fast-forward speed: 3.0x", request)
+        self.assertIn("Pacing profile: gentle", request)
+        self.assertIn("Tone profile: playful", request)
+        self.assertIn("Maximum fast-forward speed: 2.0x", request)
+        self.assertIn("행동 → 결과 → 리액션", request)
         self.assertIn("고유 event 보존 때문에 초과해도 허용", request)
         self.assertIn("target_duration 필드는 호환성을 위해 12.0으로 유지", request)
         self.assertIn("location/caption은 null, speed는 1.0", request)

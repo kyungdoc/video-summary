@@ -26,6 +26,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "prompt": "날짜 순서를 지키고 여정, 재미있는 대화, 음식과 풍경이 균형 있게 드러나는 여행 브이로그",
         "target_minutes_per_day": 4.0,
         "soft_max_minutes_per_day": 10.0,
+        "pacing_profile": "gentle",
+        "tone_profile": "playful",
         "selection_strategy": "event_flow",
         "adaptive_fast_forward": True,
         "max_fast_forward_speed": 3.0,
@@ -53,6 +55,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "trip_intro_grid_size": 7,
         "trip_intro_animation": "flow",
         "trip_intro_candidate_ids": [],
+        "portrait_layout": "blur",
         "transition_seconds": 0.18,
         "intro_seconds": 4.0,
         "date_card_seconds": 3.0,
@@ -203,6 +206,12 @@ def _validate_config(config: dict[str, Any]) -> None:
     )
     if not 0.1 <= soft_max <= 180:
         raise VideoSummaryError("soft_max_minutes_per_day는 0.1~180 사이여야 합니다.")
+    pacing_profile = editing.get("pacing_profile", "gentle")
+    if not isinstance(pacing_profile, str) or pacing_profile not in {"gentle", "balanced"}:
+        raise VideoSummaryError("pacing_profile은 gentle 또는 balanced여야 합니다.")
+    tone_profile = editing.get("tone_profile", "playful")
+    if not isinstance(tone_profile, str) or tone_profile not in {"calm", "playful"}:
+        raise VideoSummaryError("tone_profile은 calm 또는 playful이어야 합니다.")
     if editing.get("selection_strategy", "event_flow") != "event_flow":
         raise VideoSummaryError("selection_strategy는 event_flow여야 합니다.")
     if type(editing.get("adaptive_fast_forward", True)) is not bool:
@@ -249,6 +258,8 @@ def _validate_config(config: dict[str, Any]) -> None:
         raise VideoSummaryError("trip_intro_grid_size는 6, 7, 8 중 하나여야 합니다.")
     if render.get("trip_intro_animation", "flow") not in {"static", "flow"}:
         raise VideoSummaryError("trip_intro_animation은 static 또는 flow여야 합니다.")
+    if render.get("portrait_layout", "blur") not in {"blur", "pillarbox", "crop"}:
+        raise VideoSummaryError("portrait_layout은 blur, pillarbox, crop 중 하나여야 합니다.")
     intro_candidate_ids = render.get("trip_intro_candidate_ids", [])
     if (
         not isinstance(intro_candidate_ids, list)

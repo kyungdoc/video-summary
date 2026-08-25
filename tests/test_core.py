@@ -99,6 +99,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(args.episode_mode, "trip")
         self.assertEqual(args.destination, "Okinawa")
 
+    def test_render_accepts_safe_daily_variant_options(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "render", "--project", "trip", "--day-key", "2025-02-05",
+                "--plan-file", "/tmp/gentle.json", "--output-tag", "gentle",
+            ]
+        )
+        self.assertEqual(args.day_key, "2025-02-05")
+        self.assertEqual(args.output_tag, "gentle")
+
     def test_planner_images_are_explicit_opt_in(self) -> None:
         parser = build_parser()
         default_args = parser.parse_args(["plan", "--project", "trip", "--planner", "codex"])
@@ -107,6 +117,22 @@ class CoreTests(unittest.TestCase):
         )
         self.assertFalse(default_args.planner_images)
         self.assertTrue(image_args.planner_images)
+
+    def test_plan_accepts_independent_pacing_and_tone_profiles(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "plan",
+                "--project",
+                "trip",
+                "--pacing-profile",
+                "gentle",
+                "--tone-profile",
+                "playful",
+            ]
+        )
+
+        self.assertEqual(args.pacing_profile, "gentle")
+        self.assertEqual(args.tone_profile, "playful")
 
     def test_osmo_filename_timestamp_and_invalid_date(self) -> None:
         timezone = ZoneInfo("Asia/Seoul")
@@ -290,6 +316,22 @@ class CoreTests(unittest.TestCase):
             ):
                 _validate_config(config)
 
+    def test_pacing_and_portrait_profiles_have_safe_defaults_and_are_validated(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["editing"]["pacing_profile"], "gentle")
+        self.assertEqual(DEFAULT_CONFIG["editing"]["tone_profile"], "playful")
+        self.assertEqual(DEFAULT_CONFIG["render"]["portrait_layout"], "blur")
+        for section, key, value, message in (
+            ("editing", "pacing_profile", "slow", "pacing_profile"),
+            ("editing", "pacing_profile", [], "pacing_profile"),
+            ("editing", "tone_profile", "dramatic", "tone_profile"),
+            ("editing", "tone_profile", {}, "tone_profile"),
+            ("render", "portrait_layout", "stretch", "portrait_layout"),
+        ):
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config[section][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(VideoSummaryError, message):
+                _validate_config(config)
+
     def test_legacy_config_without_soft_maximum_loads_with_the_new_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = project_paths(tmpdir, "legacy")
@@ -303,6 +345,9 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(config["editing"]["target_minutes_per_day"], 6.0)
         self.assertEqual(config["editing"]["soft_max_minutes_per_day"], 10.0)
+        self.assertEqual(config["editing"]["pacing_profile"], "gentle")
+        self.assertEqual(config["editing"]["tone_profile"], "playful")
+        self.assertEqual(config["render"]["portrait_layout"], "blur")
 
     def test_config_validates_date_override_contract(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)

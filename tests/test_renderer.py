@@ -24,6 +24,8 @@ from video_summary.renderer import (
     SOURCE_RENDER_POLICY_VERSION,
     SourceMember,
     SourceSelection,
+    _scoped_render_plan,
+    _validated_output_tag,
     atempo_filter_chain,
     assemble_output,
     cached_piece_is_usable,
@@ -199,6 +201,28 @@ class RendererTests(unittest.TestCase):
             "intro-day-1", "date-day-1", "early", "late", "outro-day-1",
         ])
         self.assertEqual(pieces[1].day_chapter, "DAY 1 · 2026-08-19 · 서울")
+
+    def test_scoped_render_plan_preserves_pacing_profile(self) -> None:
+        episode = Episode("2026-08-19", 1, "DAY 1", "", "", 10.0, [])
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [episode],
+            pacing_profile="gentle",
+            tone_profile="playful",
+        )
+
+        scoped = _scoped_render_plan(plan, episode.day_key)
+
+        self.assertEqual(scoped.pacing_profile, "gentle")
+        self.assertEqual(scoped.tone_profile, "playful")
+
+    def test_variant_output_tag_rejects_path_components(self) -> None:
+        for value in ("../gentle", "gentle/../../escape", "/tmp/gentle"):
+            with self.subTest(value=value), self.assertRaises(VideoSummaryError):
+                _validated_output_tag(value)
 
     def test_daily_intro_uses_destination_and_day_while_date_card_stays_unchanged(self) -> None:
         episode = Episode(
@@ -390,7 +414,7 @@ class RendererTests(unittest.TestCase):
             [(True, False), (False, True), (True, True)],
         )
 
-    def test_episode_keeps_fades_between_discontinuous_sources_in_same_story_event(self) -> None:
+    def test_episode_restores_fades_when_same_story_event_has_large_time_gap(self) -> None:
         first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
         second = candidate("second", "2026-08-19T08:05:00+09:00", 0.0)
         first.clip_id = "clip-a"
@@ -672,9 +696,9 @@ class RendererTests(unittest.TestCase):
             moment_coverage=coverage,
         )
 
-        self.assertEqual(RENDER_POLICY_VERSION, 22)
+        self.assertEqual(RENDER_POLICY_VERSION, 23)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
-        self.assertEqual(RENDER_REPORT_VERSION, 8)
+        self.assertEqual(RENDER_REPORT_VERSION, 9)
         self.assertNotEqual(previous, current)
 
     def test_story_flow_report_accounts_for_full_source_speedup_exclusions_and_review_status(self) -> None:
@@ -1284,6 +1308,47 @@ class RendererTests(unittest.TestCase):
         report = self.assemble_with_probe(self.media_probe())
         self.assertEqual(report["duration"], 6.021)
 
+    def test_assembled_output_uses_effective_variant_episode_mode_for_chapters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = ProjectPaths(root, "trip")
+            paths.ensure()
+            source = root / "piece.mp4"
+            source.write_bytes(b"x" * 2048)
+            pieces = [Piece(source, 4.0, "one"), Piece(source, 2.0, "two")]
+            output = paths.exports / "summary.mp4"
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config["editing"]["episode_mode"] = "trip"
+
+            def fake_run(args: list[str], *, cwd: Path | None = None):
+                destination = Path(args[-1])
+                if not destination.is_absolute() and cwd is not None:
+                    destination = cwd / destination
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"o" * 2048)
+
+            with (
+                patch("video_summary.renderer.run_command", side_effect=fake_run),
+                patch("video_summary.renderer.probe_media", return_value=self.media_probe()),
+                patch("video_summary.renderer.write_chapters", return_value=[]) as daily,
+                patch("video_summary.renderer.write_trip_day_chapters", return_value=[]) as trip,
+            ):
+                assemble_output(
+                    pieces,
+                    output,
+                    Episode("2026-08-19", 1, "DAY 1", "", "", 6.0, []),
+                    paths,
+                    config,
+                    paths.render / "assembly",
+                    1280,
+                    720,
+                    False,
+                    episode_mode="daily",
+                )
+
+            daily.assert_called_once()
+            trip.assert_not_called()
+
     def test_assembled_output_uses_timestamp_fallbacks_for_na_durations(self) -> None:
         probe = self.media_probe(video_duration="N/A", audio_duration="N/A", format_duration="N/A")
         video, audio = probe["streams"]
@@ -1392,6 +1457,30 @@ class RendererTests(unittest.TestCase):
                 90,
                 False,
             )
+            rendered_probe = json.loads(
+                subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_streams",
+                        "-of",
+                        "json",
+                        str(output),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            )
+            rendered_video = next(
+                stream
+                for stream in rendered_probe["streams"]
+                if stream["codec_type"] == "video"
+            )
+            self.assertEqual(rendered_video.get("color_space"), "bt709")
+            self.assertEqual(rendered_video.get("color_transfer"), "bt709")
+            self.assertEqual(rendered_video.get("color_primaries"), "bt709")
             decoded = subprocess.run(
                 [
                     "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(output),
@@ -1569,6 +1658,64 @@ class RendererTests(unittest.TestCase):
         )
         self.assertIn("iw*sar", filters)
         self.assertIn("setsar=1", filters)
+
+    def test_source_piece_retries_sdr_without_hardware_decode(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        item = candidate("hardware-fallback", "2026-08-19T08:00:00+09:00", 0.0)
+        item.end = 5.0
+        segment = PlanSegment(item.candidate_id, "journey", "")
+        clip = Clip(
+            clip_id="clip",
+            path="/hardware-fallback-source.mp4",
+            relative_path="hardware-fallback-source.mp4",
+            fingerprint="hardware-fallback-fp",
+            size_bytes=1,
+            duration=10.0,
+            captured_at=item.captured_at,
+            capture_source="filename",
+            day_key=item.day_key,
+            travel_day=1,
+            width=3840,
+            height=2160,
+            fps=60.0,
+            codec="hevc",
+            rotation=0,
+            has_audio=True,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("video_summary.renderer.cached_piece_is_usable", side_effect=[False, True]),
+            patch(
+                "video_summary.renderer.run_command",
+                side_effect=[VideoSummaryError("hardware failed"), None],
+            ) as run,
+            patch("video_summary.renderer.os.replace"),
+        ):
+            render_source_piece(
+                segment,
+                item,
+                clip,
+                Path(tmpdir),
+                Path(tmpdir),
+                1280,
+                720,
+                30,
+                "h264_videotoolbox",
+                "4M",
+                config,
+                location_overlay=None,
+                fade_in=False,
+                fade_out=False,
+                force=False,
+            )
+
+        hardware_args = run.call_args_list[0].args[0]
+        software_args = run.call_args_list[1].args[0]
+        self.assertEqual(
+            hardware_args[hardware_args.index("-hwaccel") + 1],
+            "videotoolbox",
+        )
+        self.assertNotIn("-hwaccel", software_args)
 
     def test_atempo_filter_chain_supports_three_and_four_times_speed(self) -> None:
         self.assertEqual(atempo_filter_chain(1.0), "atempo=1.000000")

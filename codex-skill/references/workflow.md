@@ -42,6 +42,10 @@ Read an event as the stages actually filmed: `setup → body/action → reaction
 
 Build the complete chronological story spine first, then apply the compression ladder `full → compact → speed_up → omit`. Start with enough normal-speed footage to understand each event. If it drags, compact repetition within that event while keeping its useful setup/body/action/reaction/closure run at normal speed. If further compression is useful, accelerate only low-change, non-dialogue travel, waiting, or repetitive scenery marked `allow_fast`. Meals/eating, play and exploration (pool, outdoor sightseeing, rides), family interviews, people meeting or joining, dialogue, key actions, and meaningful reactions are `protected_1x`. Omission is the last resort for true semantic repetition, explicitly excluded private material, or unusable footage; never delete a later unique event merely because earlier events used more runtime.
 
+Use `editing.pacing_profile` to tune the amount of repetition retained inside each event, not to remove events. The default `gentle` profile uses source-time soft envelopes of 120/60/70/30/45/20 seconds for interview/meal/play/waypoint/dialogue/scenery and caps acceleration at 2×. `balanced` uses 90/45/50/20/30/15 seconds and may compress eligible `allow_fast` bridges more assertively within the configured maximum. Mandatory stages and useful contiguous core runs may exceed these envelopes, and `protected_1x` footage remains at normal speed in either profile.
+
+The default `editing.tone_profile: playful` changes ranking only inside already represented events. Prefer chronological choice/action/reveal/reaction chains, family interaction, and visible change over repetition without adding events or increasing the envelope. A nearby 2–8 second candidate under a source-side `iphone/` folder may be used as at most one optional cutaway per event inside the remaining envelope; never add one automatically to an interview or use it to replace required meal footage. `calm` keeps the same event/contract coverage while favoring natural spatial and dialogue context. New plans record both profiles; profile-less legacy plans retain their historical `balanced + calm` meaning.
+
 `target_minutes_per_day` remains the episode `target_duration` compatibility/display value; it is neither a fill quota nor a selection ceiling. `soft_max_minutes_per_day`, default 10 minutes, is a DAY review guard. Exceeding it starts a pacing/compression audit and may remain the correct result when complete flow needs the time. Stop below it when the remaining footage adds only weak repetition. The story-flow report records the resulting event treatment as `full`, `full_speed_up`, `compact`, `compact_speed_up`, or `omit`; these report values describe which rungs were actually combined, while the editorial decision order remains full, compact, speed-up, then omit.
 
 Family travel-review interviews are mandatory-if-detected by default. Local transcript analysis identifies high-confidence question-and-answer runs, tags every candidate needed to keep each answer complete, and requires local, Codex, Claude, and file plans to include them chronologically at normal speed. A project with no detected interview proceeds normally. This is not face recognition or speaker identification; separate Q&A runs are the auditable unit. Keep `editing.preserve_family_interviews: true` and do not combine it with `--skip-transcribe` when this guarantee is required.
@@ -63,6 +67,8 @@ editing:
   target_minutes_per_day: 4.0     # compatibility/display target; not a fill quota
   soft_max_minutes_per_day: 10.0  # pacing review guard; not a selection ceiling
   selection_strategy: event_flow
+  pacing_profile: gentle          # gentle or balanced
+  tone_profile: playful           # playful or calm
   adaptive_fast_forward: true
   max_fast_forward_speed: 3.0
   exclude_ranges:
@@ -72,6 +78,7 @@ editing:
       reason: "private changing-clothes footage"
 
 render:
+  portrait_layout: blur           # blur, pillarbox, or crop
   trip_intro_style: mosaic
   trip_intro_candidate_ids: []  # empty means automatic DAY-coverage-first selection
   trip_intro_grid_size: 7       # 6, 7, or 8
@@ -96,7 +103,9 @@ Overlapping or touching candidate windows from the same source are unioned befor
 
 Both editing duration values must be finite numbers from 0.1 through 180. Changing `target_minutes_per_day` changes only the compatibility/display target stored in the plan; changing `soft_max_minutes_per_day` changes the pacing review guard. Neither is a minimum or selection ceiling. `max_fast_forward_speed` accepts 1 through 4, but it never authorizes acceleration of a `protected_1x` candidate. Preserve all unique events and their useful contiguous narrative runs, then stop when the remaining footage would only add repetition or fragmentary dialogue.
 
-`transition_seconds` defaults to `0.18` and accepts 0–1 seconds. Exactly contiguous selections with compatible speed, location, and caption are coalesced first. Every remaining source-group boundary and card boundary uses a short video/audio fade-through-black. This is not a multi-input crossfade graph, so durations and low-memory sequential rendering remain intact. Set the value to `0` to disable boundary fades.
+Source discovery is recursive, so clips exported into a source-side `iphone/` directory join the same capture-time timeline automatically. The playful local planner uses that relative-folder family only for the bounded optional cutaway rule above; it does not expose the local path to an external planner. `render.portrait_layout` controls how portrait footage fills a landscape canvas: `blur` (default), `pillarbox`, or `crop`. On macOS, HLG/PQ iPhone sources are converted through VideoToolbox `scale_vt` to BT.709 SDR, and the assembled H.264 carries BT.709 color tags. Fail explicitly if the required HDR conversion filter is unavailable instead of silently producing incorrect color.
+
+`transition_seconds` defaults to `0.18` and accepts 0–1 seconds. Exactly contiguous selections with compatible speed, location, and caption are coalesced first. Fragments of the same semantic event use a hard cut only when their real capture-time gap is within 30 seconds; distant fragments with an accidentally reused event ID, other source-group boundaries, and card boundaries use a short video/audio fade-through-black. This is not a multi-input crossfade graph, so durations and low-memory sequential rendering remain intact. Set the value to `0` to disable boundary fades.
 
 Intro, date, and outro cards are rendered into the MP4 frames. The matching `.chapters.txt` is timestamp text to paste into a YouTube description; it is not embedded MP4 chapter metadata, is not an upload instruction, and is not uploaded automatically. A trip summary has one chapter per DAY: DAY 1 starts at `00:00` and includes the trip intro, while later DAYs start at their date cards.
 
@@ -116,6 +125,27 @@ bash /absolute/path/to/this-skill/scripts/run-video-summary.sh plan \
 bash /absolute/path/to/this-skill/scripts/run-video-summary.sh render \
   --project "sample-trip" \
   --draft
+```
+
+To compare pacing profiles on one DAY without rerunning analysis, preserve each generated plan and render tagged variants. The renderer validates the full plan before applying `--day-key`; tagged outputs and companion files are written under `exports/<project>/comparisons/`.
+
+```bash
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh plan \
+  --project "sample-trip" --planner local --pacing-profile gentle
+cp .video-summary/sample-trip/edit-plan.json .video-summary/sample-trip/edit-plan-gentle.json
+
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh plan \
+  --project "sample-trip" --planner local --pacing-profile balanced
+cp .video-summary/sample-trip/edit-plan.json .video-summary/sample-trip/edit-plan-balanced.json
+
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh render \
+  --project "sample-trip" --day-key 2025-02-05 \
+  --plan-file .video-summary/sample-trip/edit-plan-gentle.json \
+  --output-tag gentle --draft
+bash /absolute/path/to/this-skill/scripts/run-video-summary.sh render \
+  --project "sample-trip" --day-key 2025-02-05 \
+  --plan-file .video-summary/sample-trip/edit-plan-balanced.json \
+  --output-tag balanced --draft
 ```
 
 The external planner is optional and requires the user's explicit opt-in. `local` is fully local; `codex` and `claude` send prompt/bounded candidate excerpts and metadata from an isolated request directory, with reduced contact sheets only when `--planner-images` is supplied. The bounded excerpts may include language that reveals a family interview, pickup, transfer, lodging stay, or terminal movement.

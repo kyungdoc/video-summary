@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import math
+import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,9 +44,9 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 22
+RENDER_POLICY_VERSION = 23
 SOURCE_RENDER_POLICY_VERSION = 8
-RENDER_REPORT_VERSION = 8
+RENDER_REPORT_VERSION = 9
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
 YOUTUBE_MIN_CHAPTERS = 3
@@ -181,6 +182,63 @@ def report_outputs_exist(report: dict[str, Any]) -> bool:
         and all(isinstance(item.get(key), str) and Path(item[key]).exists() for key in required)
         for item in outputs
     )
+
+
+def _validated_output_tag(value: str | None) -> str | None:
+    normalized = " ".join((value or "").split())
+    if not normalized:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}", normalized):
+        raise VideoSummaryError(
+            "output-tag는 영문/숫자로 시작하는 1~40자의 영문·숫자·_·-만 허용합니다."
+        )
+    return normalized
+
+
+def _scoped_render_plan(plan: EditPlan, day_key: str | None) -> EditPlan:
+    if not day_key:
+        return plan
+    matches = [episode for episode in plan.episodes if episode.day_key == day_key]
+    if not matches:
+        available = ", ".join(episode.day_key for episode in plan.episodes)
+        raise VideoSummaryError(
+            f"plan에 day-key {day_key}가 없습니다. 사용 가능 날짜: {available}"
+        )
+    return EditPlan(
+        project=plan.project,
+        prompt=plan.prompt,
+        planner=plan.planner,
+        candidate_set_hash=plan.candidate_set_hash,
+        episodes=matches,
+        version=plan.version,
+        pacing_profile=plan.pacing_profile,
+        tone_profile=plan.tone_profile,
+    )
+
+
+def _scoped_candidates_payload(
+    payload: dict[str, Any],
+    day_keys: set[str],
+    candidate_ids: set[str],
+) -> dict[str, Any]:
+    scoped = dict(payload)
+    raw_events = payload.get("required_events", [])
+    if not isinstance(raw_events, list):
+        scoped["required_events"] = raw_events
+        return scoped
+    scoped["required_events"] = [
+        event
+        for event in raw_events
+        if isinstance(event, dict)
+        and (
+            str(event.get("day_key", "")) in day_keys
+            or any(
+                isinstance(value, str) and value in candidate_ids
+                for value in event.get("candidate_ids", [])
+            )
+        )
+    ]
+    return scoped
 
 
 def _required_events_of_kind(
@@ -685,14 +743,23 @@ def render_project(
     *,
     draft: bool = False,
     force: bool = False,
+    day_key: str | None = None,
+    plan_file: str | Path | None = None,
+    output_tag: str | None = None,
 ) -> dict[str, Any]:
-    if not paths.plan.exists():
+    normalized_tag = _validated_output_tag(output_tag)
+    if plan_file and not normalized_tag:
+        raise VideoSummaryError("variant --plan-file 렌더에는 --output-tag가 필요합니다.")
+    if normalized_tag and not day_key:
+        raise VideoSummaryError("--output-tag 비교 렌더에는 --day-key가 필요합니다.")
+    plan_path = Path(plan_file).expanduser().resolve() if plan_file else paths.plan
+    if not plan_path.exists():
         raise VideoSummaryError("먼저 plan 또는 run을 실행하세요.")
     candidates = load_candidates(paths, config)
     clips = load_clips(paths, config)
     candidates_payload = read_json(paths.candidates)
-    raw_plan = read_json(paths.plan)
-    validated = validate_and_normalize_plan(
+    raw_plan = read_json(plan_path)
+    validated_full = validate_and_normalize_plan(
         raw_plan,
         config,
         str(raw_plan.get("prompt") or config["editing"].get("prompt", "")),
@@ -700,13 +767,25 @@ def render_project(
         str(candidates_payload["candidate_set_hash"]),
         str(raw_plan.get("planner", "file")),
     )
+    validated = _scoped_render_plan(validated_full, day_key)
+    render_day_keys = {episode.day_key for episode in validated.episodes}
+    scoped_candidates = [
+        candidate for candidate in candidates if candidate.day_key in render_day_keys
+    ]
+    scoped_clip_ids = {candidate.clip_id for candidate in scoped_candidates}
+    scoped_clips = [clip for clip in clips if clip.clip_id in scoped_clip_ids]
+    scoped_candidates_payload = _scoped_candidates_payload(
+        candidates_payload,
+        render_day_keys,
+        {candidate.candidate_id for candidate in scoped_candidates},
+    )
     render_config = dict(config["render"])
     width, height = resolution("720p" if draft else str(render_config["resolution"]))
     fps = int(render_config.get("fps", 30))
     bitrate = "4M" if draft else str(render_config.get("video_bitrate", "14M"))
     encoder = resolve_encoder(str(render_config.get("encoder", "auto")))
-    mode = str(config["editing"].get("episode_mode", "daily"))
-    candidate_by_id = {item.candidate_id: item for item in candidates}
+    mode = "daily" if day_key else str(config["editing"].get("episode_mode", "daily"))
+    candidate_by_id = {item.candidate_id: item for item in scoped_candidates}
     ordered_episodes = sorted(validated.episodes, key=lambda item: (item.travel_day, item.day_key))
     manifest = read_json(paths.manifest)
     intro_metadata = resolve_intro_metadata(
@@ -716,20 +795,20 @@ def render_project(
     )
     moment_coverage = {
         "family_interviews": family_interview_coverage(
-            candidates_payload,
-            candidates,
+            scoped_candidates_payload,
+            scoped_candidates,
             validated,
             enabled=bool(config["editing"].get("preserve_family_interviews", True)),
         ),
         "meals": meal_event_coverage(
-            candidates_payload,
-            candidates,
+            scoped_candidates_payload,
+            scoped_candidates,
             validated,
             enabled=bool(config["editing"].get("preserve_meal_events", True)),
         ),
         "story_flow": story_flow_coverage(
-            candidates,
-            clips,
+            scoped_candidates,
+            scoped_clips,
             validated,
             review_guard_seconds=float(
                 config["editing"].get("soft_max_minutes_per_day", 10.0)
@@ -755,7 +834,7 @@ def render_project(
             for candidate, path in selected_intro_frames
         ]
     cache_key = render_cache_key(
-        validated, clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
+        validated, scoped_clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
         version=RENDER_POLICY_VERSION,
         font_signature=render_font_signature(config),
         trip_intro_signature=trip_intro_signature,
@@ -763,18 +842,27 @@ def render_project(
         moment_coverage=moment_coverage,
     )
     legacy_cache_key = render_cache_key(
-        validated, clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
+        validated, scoped_clips, render_config, mode, draft, width, height, fps, encoder, bitrate,
         version=5,
     )
-    report_path = paths.root / "render-report.json"
+    if normalized_tag:
+        report_dir = paths.root / "render-reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / (
+            f"{day_key}-{normalized_tag}{'-draft' if draft else ''}.json"
+        )
+        state_stage = f"render:{day_key}:{normalized_tag}:{'draft' if draft else 'full'}"
+    else:
+        report_path = paths.root / "render-report.json"
+        state_stage = "render"
     state = StateStore(paths.state)
-    if not force and report_path.exists() and state.is_complete("render", cache_key):
+    if not force and report_path.exists() and state.is_complete(state_stage, cache_key):
         report = read_json(report_path)
         if report.get("cache_key") == cache_key and report_outputs_exist(report):
             print_status("render: 캐시 사용")
             return report
 
-    state.mark_running("render", cache_key, {"encoder": encoder, "resolution": [width, height]})
+    state.mark_running(state_stage, cache_key, {"encoder": encoder, "resolution": [width, height]})
     try:
         render_root = paths.render / cache_key
         segments_dir = paths.render / "content" / "segments" / source_cache_namespace(
@@ -785,7 +873,7 @@ def render_project(
         overlays_dir = render_root / "overlays"
         for directory in (segments_dir, cards_dir, overlays_dir):
             directory.mkdir(parents=True, exist_ok=True)
-        clip_by_id = {item.clip_id: item for item in clips}
+        clip_by_id = {item.clip_id: item for item in scoped_clips}
         outputs: list[dict[str, Any]] = []
         trip_intro_report: dict[str, Any] | None = None
         if mode == "daily":
@@ -813,11 +901,20 @@ def render_project(
                     force=force,
                     legacy_segments_dirs=legacy_segments_dirs,
                 )
-                filename = f"{episode.day_key}-day-{episode.travel_day:02d}{'-draft' if draft else ''}.mp4"
+                if normalized_tag:
+                    output_dir = paths.exports / "comparisons"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    filename = (
+                        f"{episode.day_key}-{normalized_tag}"
+                        f"{'-draft' if draft else ''}.mp4"
+                    )
+                else:
+                    output_dir = paths.exports
+                    filename = f"{episode.day_key}-day-{episode.travel_day:02d}{'-draft' if draft else ''}.mp4"
                 outputs.append(
                     assemble_output(
                         pieces,
-                        paths.exports / filename,
+                        output_dir / filename,
                         episode,
                         paths,
                         config,
@@ -825,6 +922,7 @@ def render_project(
                         width,
                         height,
                         draft,
+                        episode_mode=mode,
                     )
                 )
         else:
@@ -904,6 +1002,7 @@ def render_project(
                     width,
                     height,
                     draft,
+                    episode_mode=mode,
                 )
             )
         report = {
@@ -916,6 +1015,13 @@ def render_project(
             "fps": fps,
             "mode": mode,
             "draft": draft,
+            "day_key": day_key,
+            "output_tag": normalized_tag,
+            "plan_source": str(plan_path),
+            "pacing_profile": validated.pacing_profile
+            or config["editing"].get("pacing_profile", "gentle"),
+            "tone_profile": validated.tone_profile
+            or config["editing"].get("tone_profile", "playful"),
             "intro_metadata": intro_metadata.to_dict(),
             "moment_coverage": moment_coverage,
             "outputs": outputs,
@@ -923,10 +1029,10 @@ def render_project(
         if trip_intro_report is not None:
             report["trip_intro"] = trip_intro_report
         write_json(report_path, report)
-        state.mark_complete("render", cache_key, {"output_count": len(outputs), "encoder": encoder})
+        state.mark_complete(state_stage, cache_key, {"output_count": len(outputs), "encoder": encoder})
         return report
     except BaseException as exc:
-        state.mark_failed("render", cache_key, str(exc))
+        state.mark_failed(state_stage, cache_key, str(exc))
         raise
 
 
@@ -940,6 +1046,17 @@ def resolve_encoder(requested: str) -> str:
     if requested not in available:
         raise VideoSummaryError(f"현재 FFmpeg가 {requested} encoder를 지원하지 않습니다.")
     return requested
+
+
+@lru_cache(maxsize=32)
+def ffmpeg_filter_available(name: str) -> bool:
+    completed = run_command(["ffmpeg", "-hide_banner", "-filters"])
+    available = completed.stdout + completed.stderr
+    return any(
+        line.split()[1:2] == [name]
+        for line in available.splitlines()
+        if line.strip() and not line.lstrip().startswith("Filters:")
+    )
 
 
 def episode_pieces(
@@ -1089,19 +1206,35 @@ def source_groups_share_contiguous_story(
     *,
     tolerance: float = 0.001,
 ) -> bool:
-    """Suppress black only across a real contiguous cut in one source event."""
+    """Use a clean hard cut between beats of the same semantic event.
+
+    Contiguous selections are already coalesced. Remaining nearby groups may
+    be a jump cut or a complementary camera angle; a fade-to-black between
+    them makes one activity feel artificially slow and fragmented. Event IDs
+    are inferred and can accidentally span unrelated moments, so a distant
+    timestamp must still receive a transition.
+    """
     if not previous or not current:
         return False
     left = previous[-1].candidate
     right = current[0].candidate
     event_id = left.story_event_id
-    gap = right.start - left.end
-    return bool(
-        event_id
-        and event_id == right.story_event_id
-        and left.clip_id == right.clip_id
-        and -tolerance - 1e-9 <= gap <= tolerance + 1e-9
-    )
+    if not event_id or event_id != right.story_event_id:
+        return False
+    try:
+        left_start = datetime.fromisoformat(left.captured_at.replace("Z", "+00:00"))
+        right_start = datetime.fromisoformat(right.captured_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if left_start.tzinfo is None:
+        left_start = left_start.replace(tzinfo=timezone.utc)
+    if right_start.tzinfo is None:
+        right_start = right_start.replace(tzinfo=timezone.utc)
+    gap = (
+        right_start.astimezone(timezone.utc)
+        - left_start.astimezone(timezone.utc)
+    ).total_seconds() - left.duration
+    return -30.0 - tolerance <= gap <= 30.0 + tolerance
 
 
 def coalesce_source_selections(
@@ -1137,6 +1270,34 @@ def legacy_segment_directories(render_root: Path, preferred_key: str) -> tuple[P
 
 def resolution(value: str) -> tuple[int, int]:
     return {"720p": (1280, 720), "1080p": (1920, 1080), "2160p": (3840, 2160)}[value]
+
+
+def clip_display_dimensions(clip: Clip) -> tuple[int, int]:
+    if clip.rotation % 180 == 90:
+        return clip.height, clip.width
+    return clip.width, clip.height
+
+
+def clip_is_portrait(clip: Clip) -> bool:
+    width, height = clip_display_dimensions(clip)
+    return height > width
+
+
+def clip_requires_hdr_to_sdr(clip: Clip) -> bool:
+    return str(clip.color_transfer or "").casefold() in {
+        "arib-std-b67",
+        "smpte2084",
+        "smpte-st-2084",
+    }
+
+
+def videotoolbox_rotation_filter(rotation: int) -> str | None:
+    normalized = rotation % 360
+    return {
+        90: "transpose_vt=cclock",
+        180: "transpose_vt=reversal",
+        270: "transpose_vt=clock",
+    }.get(normalized)
 
 
 def configured_mosaic_grid_size(render_config: dict[str, Any]) -> int:
@@ -1637,23 +1798,38 @@ def render_source_piece(
     transition = source_transition_seconds(config, output_duration)
     transition_in = transition if fade_in else 0.0
     transition_out = transition if fade_out else 0.0
-    key = stable_hash(
-        {
-            "version": SOURCE_RENDER_POLICY_VERSION,
-            "clip": clip.fingerprint,
-            "source": [source_start, source_end, clip.has_audio],
-            "members": [
-                [member.candidate.candidate_id, member.candidate.start, member.candidate.end]
-                for member in source_members
-            ],
-            "speed": segment.speed,
-            "transitions": [transition_in, transition_out],
-            "stream_start_delays": [video_start_delay, audio_start_delay],
-            "location_overlay": location_overlay,
-            "format": [width, height, fps, encoder, bitrate],
-        },
-        length=28,
-    )
+    portrait = clip_is_portrait(clip)
+    portrait_layout = str(config["render"].get("portrait_layout", "blur"))
+    hdr_to_sdr = clip_requires_hdr_to_sdr(clip)
+    key_payload: dict[str, Any] = {
+        "version": SOURCE_RENDER_POLICY_VERSION,
+        "clip": clip.fingerprint,
+        "source": [source_start, source_end, clip.has_audio],
+        "members": [
+            [member.candidate.candidate_id, member.candidate.start, member.candidate.end]
+            for member in source_members
+        ],
+        "speed": segment.speed,
+        "transitions": [transition_in, transition_out],
+        "stream_start_delays": [video_start_delay, audio_start_delay],
+        "location_overlay": location_overlay,
+        "format": [width, height, fps, encoder, bitrate],
+    }
+    # Keep landscape SDR cache keys byte-for-byte compatible. Only sources
+    # whose actual filtering changed receive the new policy dimensions.
+    if portrait:
+        key_payload["portrait_layout"] = portrait_layout
+    if hdr_to_sdr:
+        key_payload["hdr_to_sdr"] = {
+            "engine": "videotoolbox-pixel-transfer-v1",
+            "pix_fmt": clip.pix_fmt,
+            "color_space": clip.color_space,
+            "color_transfer": clip.color_transfer,
+            "color_primaries": clip.color_primaries,
+            "dolby_vision_profile": clip.dolby_vision_profile,
+            "rotation": clip.rotation,
+        }
+    key = stable_hash(key_payload, length=28)
     output = segments_dir / f"{key}.mp4"
     if not force and cached_piece_is_usable(
         output,
@@ -1674,10 +1850,30 @@ def render_source_piece(
     # Earlier source artifacts can be one frame short and have no transition,
     # stream-offset, SAR, or contiguous-range contract, so v7 does not import them.
 
-    args = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "2",
-        "-ss", f"{source_start:.3f}", "-i", clip.path,
-    ]
+    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "2"]
+    sdr_hardware_decode = not hdr_to_sdr and encoder == "h264_videotoolbox"
+    if hdr_to_sdr:
+        if not ffmpeg_filter_available("scale_vt"):
+            raise VideoSummaryError(
+                "HDR iPhone 영상을 SDR로 변환할 scale_vt 필터가 현재 FFmpeg에 없습니다."
+            )
+        args.extend(
+            [
+                "-noautorotate",
+                "-hwaccel",
+                "videotoolbox",
+                "-hwaccel_output_format",
+                "videotoolbox_vld",
+            ]
+        )
+    elif sdr_hardware_decode:
+        # Draft rendering is decode-bound for 4K/60 HEVC sources. On Macs
+        # that already expose the VideoToolbox encoder, use the matching
+        # hardware decoder while keeping the existing software filter graph.
+        # Some uncommon codecs can still reject hardware decoding, so the
+        # command is retried without this input option below.
+        args.extend(["-hwaccel", "videotoolbox"])
+    args.extend(["-ss", f"{source_start:.3f}", "-i", clip.path])
     overlay_input: int | None = None
     if location_overlay:
         overlay = overlays_dir / f"location-{stable_hash([location_overlay, width, height], 18)}.png"
@@ -1696,16 +1892,59 @@ def render_source_piece(
         if video_start_delay > 0.0
         else ""
     )
-    filters = [
-        f"[0:v:0]setpts=(PTS-STARTPTS)/{segment.speed:.6f},"
-        "scale=w='max(2,trunc(iw*sar/2)*2)':h=ih,setsar=1,"
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x101318,"
+    hardware_filters: list[str] = []
+    if hdr_to_sdr:
+        rotation_filter = videotoolbox_rotation_filter(clip.rotation)
+        if rotation_filter:
+            hardware_filters.append(rotation_filter)
+        hardware_filters.extend(
+            [
+                "scale_vt=w=iw:h=ih:color_matrix=bt709:color_primaries=bt709:color_transfer=bt709",
+                "hwdownload",
+                "format=p010le",
+                "format=yuv420p",
+            ]
+        )
+    source_prefix = "[0:v:0]" + (
+        ",".join(hardware_filters) + "," if hardware_filters else ""
+    )
+    normalized_source = (
+        f"{source_prefix}setpts=(PTS-STARTPTS)/{segment.speed:.6f},"
+        "scale=w='max(2,trunc(iw*sar/2)*2)':h=ih,setsar=1"
+    )
+    final_video_filters = (
         "setsar=1,"
         f"{video_start_pad}"
-        f"fps=fps={fps}:start_time=0:round=near,tpad=stop_mode=clone:stop_duration={video_pad:.6f},"
-        f"trim=end_frame={frame_count},setpts=N/({fps}*TB),format=yuv420p[vbase]"
-    ]
+        f"fps=fps={fps}:start_time=0:round=near,"
+        f"tpad=stop_mode=clone:stop_duration={video_pad:.6f},"
+        f"trim=end_frame={frame_count},setpts=N/({fps}*TB),format=yuv420p"
+    )
+    if portrait and portrait_layout == "blur":
+        blur_sigma = max(12.0, min(width, height) / 30.0)
+        filters = [
+            f"{normalized_source},split=2[vforeground][vbackground]",
+            f"[vbackground]scale={width}:{height}:"
+            "force_original_aspect_ratio=increase:force_divisible_by=2,"
+            f"crop={width}:{height},gblur=sigma={blur_sigma:.3f}[vblurred]",
+            f"[vforeground]scale={width}:{height}:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            "setsar=1[vportrait]",
+            f"[vblurred][vportrait]overlay=(W-w)/2:(H-h)/2:eof_action=pass,"
+            f"{final_video_filters}[vbase]",
+        ]
+    elif portrait and portrait_layout == "crop":
+        filters = [
+            f"{normalized_source},scale={width}:{height}:"
+            "force_original_aspect_ratio=increase:force_divisible_by=2,"
+            f"crop={width}:{height},{final_video_filters}[vbase]"
+        ]
+    else:
+        filters = [
+            f"{normalized_source},scale={width}:{height}:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x101318,"
+            f"{final_video_filters}[vbase]"
+        ]
     if overlay_input is not None:
         filters.append(
             f"[{overlay_input}:v:0]format=rgba[overlay];"
@@ -1765,11 +2004,25 @@ def render_source_piece(
             *video_encode_args(encoder, bitrate),
             "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
             "-ar", "48000", "-ac", "2", "-video_track_timescale", "90000",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+            "-color_range", "tv", "-metadata:s:v:0", "rotate=0",
             "-map_metadata", "-1", "-map_chapters", "-1",
             "-movflags", "+faststart", "-y", str(temporary),
         ]
     )
-    run_command(args)
+    try:
+        run_command(args)
+    except VideoSummaryError:
+        if not sdr_hardware_decode:
+            raise
+        temporary.unlink(missing_ok=True)
+        software_args = list(args)
+        hardware_option = software_args.index("-hwaccel")
+        del software_args[hardware_option : hardware_option + 2]
+        print_status(
+            f"hardware decode fallback: {Path(clip.path).name}"
+        )
+        run_command(software_args)
     if not cached_piece_is_usable(
         temporary,
         width,
@@ -2130,6 +2383,8 @@ def assemble_output(
     width: int,
     height: int,
     draft: bool,
+    *,
+    episode_mode: str | None = None,
 ) -> dict[str, Any]:
     if not pieces:
         raise VideoSummaryError("조립할 영상 조각이 없습니다.")
@@ -2162,6 +2417,8 @@ def assemble_output(
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "1",
                 "-i", concat_path.name,
                 "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
+                "-color_primaries", "bt709", "-color_trc", "bt709",
+                "-colorspace", "bt709", "-color_range", "tv",
                 "-c:a", "aac", "-b:a", str(config["render"].get("audio_bitrate", "192k")),
                 "-ar", "48000", "-ac", "2",
                 "-af", (
@@ -2195,7 +2452,10 @@ def assemble_output(
         timeline_path = metadata_base.with_suffix(".timeline.txt")
         write_timeline(timeline_path, pieces)
         chapters_path = metadata_base.with_suffix(".chapters.txt")
-        if str(config["editing"].get("episode_mode", "daily")) == "trip":
+        effective_mode = episode_mode or str(
+            config["editing"].get("episode_mode", "daily")
+        )
+        if effective_mode == "trip":
             chapters = write_trip_day_chapters(chapters_path, pieces)
         else:
             chapters = write_chapters(chapters_path, pieces)
@@ -2246,6 +2506,8 @@ def mix_music(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(assembled),
             "-stream_loop", "-1", "-i", str(music), "-filter_complex", filter_complex,
             "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac",
+            "-color_primaries", "bt709", "-color_trc", "bt709",
+            "-colorspace", "bt709", "-color_range", "tv",
             "-b:a", str(config["render"].get("audio_bitrate", "192k")),
             "-t", f"{duration:.3f}", "-movflags", "+faststart", "-y", str(temporary),
         ]

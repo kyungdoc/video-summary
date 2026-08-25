@@ -34,7 +34,7 @@ ALLOWED_ROLES = {
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
 MAX_CODEX_CONTACT_SHEETS = 20
 CONTACT_SHEET_CANDIDATES = 12
-STORY_SELECTION_POLICY_VERSION = 4
+STORY_SELECTION_POLICY_VERSION = 6
 MAX_PLAN_SPEED = 4.0
 STORY_RUN_GAP_SECONDS = 2.0
 STORY_COVERAGE_RUN_MAX_SECONDS = 36.0
@@ -42,6 +42,77 @@ STORY_EVENT_GAP_SECONDS = 15.0 * 60.0
 STORY_EVENT_MAX_SPAN_SECONDS = 30.0 * 60.0
 STORY_EVENT_INTERNAL_BRIDGE_SECONDS = 20.0
 STORY_EVENT_CONTEXT_SCORE_FLOOR = 0.42
+PACING_EVENT_GROUP_GAP_SECONDS = 60.0
+PACING_CHOICE_CUES = (
+    "골라",
+    "고르",
+    "선택",
+    "원픽",
+    "pick one",
+    "choose",
+)
+PACING_ANTICIPATION_CUES = (
+    "나와야",
+    "잘 나와",
+    "기대",
+    "hope it",
+)
+PACING_REVEAL_CUES = (
+    "뭐가 나올",
+    "무엇이 나올",
+    "뭐가 나왔",
+    "이게 나왔",
+    "나왔네",
+    "나왔다",
+    "나온다",
+    "나온 거",
+    "결과",
+    "당첨",
+    "성공",
+    "what will come out",
+    "result",
+    "revealed",
+)
+PLAYFUL_REACTION_CUES = (
+    "마음에 들어",
+    "재밌",
+    "신나",
+    "깜짝",
+    "놀랐",
+    "대박",
+    "최고",
+    "웃음",
+    "하하",
+    "ㅎㅎ",
+    "ㅋㅋ",
+    "love it",
+    "so fun",
+    "amazing",
+    "surprised",
+    "laugh",
+)
+PACING_REVEAL_EXIT_RE = re.compile(
+    r"(?:식당|카페|가게|호텔|숙소|공항|역)(?:에서|을|를)?[^.!?\n]{0,12}"
+    r"(?:나왔네|나왔다|나온 거)"
+)
+PACING_SOURCE_ENVELOPES: dict[str, dict[str, float]] = {
+    "gentle": {
+        "interview": 120.0,
+        "meal": 60.0,
+        "play": 70.0,
+        "waypoint": 30.0,
+        "dialogue": 45.0,
+        "scenery": 20.0,
+    },
+    "balanced": {
+        "interview": 90.0,
+        "meal": 45.0,
+        "play": 50.0,
+        "waypoint": 20.0,
+        "dialogue": 30.0,
+        "scenery": 15.0,
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,9 +123,48 @@ class _StoryEventGroup:
     runs: tuple[tuple[Candidate, ...], ...]
 
 
-def _configured_max_plan_speed(config: dict[str, Any]) -> float:
+def _configured_max_plan_speed(
+    config: dict[str, Any],
+    *,
+    pacing_profile: str | None = None,
+) -> float:
     configured = float(config["editing"].get("max_fast_forward_speed", 3.0))
+    if (pacing_profile or _configured_pacing_profile(config)) == "gentle":
+        configured = min(configured, 2.0)
     return min(MAX_PLAN_SPEED, configured)
+
+
+def _configured_pacing_profile(config: dict[str, Any]) -> str:
+    return str(config["editing"].get("pacing_profile", "gentle"))
+
+
+def _configured_tone_profile(config: dict[str, Any]) -> str:
+    return str(config["editing"].get("tone_profile", "playful"))
+
+
+def _clip_source_families(paths: ProjectPaths) -> dict[str, str]:
+    """Classify source folders without exposing paths to a planner."""
+    if not paths.manifest.exists():
+        return {}
+    payload = read_json(paths.manifest)
+    raw_clips = payload.get("clips", [])
+    if not isinstance(raw_clips, list):
+        return {}
+    result: dict[str, str] = {}
+    for raw_clip in raw_clips:
+        if not isinstance(raw_clip, dict):
+            continue
+        clip_id = raw_clip.get("clip_id")
+        relative_path = raw_clip.get("relative_path")
+        if not isinstance(clip_id, str) or not isinstance(relative_path, str):
+            continue
+        parts = Path(relative_path.replace("\\", "/")).parts[:-1]
+        result[clip_id] = (
+            "iphone"
+            if any(part.casefold() == "iphone" for part in parts)
+            else "primary"
+        )
+    return result
 
 
 def _eligible_planner_candidates(candidates: list[Candidate]) -> list[Candidate]:
@@ -81,10 +191,11 @@ def _plan_cache_key(
     plan_file_path: Path | None,
     plan_file_key: str | None,
     strict_planner: bool,
+    source_families: dict[str, str] | None = None,
 ) -> str:
     return stable_hash(
         {
-            "version": 17,
+            "version": 23,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "candidate_policy_versions": _normalized_candidate_policy_versions(
@@ -95,6 +206,9 @@ def _plan_cache_key(
             "planner_images": use_images,
             "target": config["editing"]["target_minutes_per_day"],
             "soft_max": config["editing"].get("soft_max_minutes_per_day", 10.0),
+            "pacing_profile": _configured_pacing_profile(config),
+            "tone_profile": _configured_tone_profile(config),
+            "source_families": source_families or {},
             "selection_strategy": config["editing"].get("selection_strategy", "event_flow"),
             "adaptive_fast_forward": config["editing"].get("adaptive_fast_forward", True),
             "max_fast_forward_speed": config["editing"].get("max_fast_forward_speed", 3.0),
@@ -120,6 +234,7 @@ def plan_project(
 ) -> dict[str, Any]:
     candidates = load_candidates(paths, config)
     candidates_payload = read_json(paths.candidates)
+    source_families = _clip_source_families(paths)
     candidate_set_hash = str(candidates_payload["candidate_set_hash"])
     candidate_policy_versions = _normalized_candidate_policy_versions(
         candidates_payload.get("policy_versions")
@@ -146,6 +261,7 @@ def plan_project(
         plan_file_path=plan_file_path,
         plan_file_key=plan_file_key,
         strict_planner=strict_planner,
+        source_families=source_families,
     )
     state = StateStore(paths.state)
     if not force and paths.plan.exists() and state.is_complete("plan", cache_key):
@@ -155,15 +271,29 @@ def plan_project(
     state.mark_running("plan", cache_key, {"planner": planner_name})
     fallback_error: str | None = None
     try:
-        schema = planner_schema(max_speed=_configured_max_plan_speed(config))
+        schema = planner_schema(
+            max_speed=_configured_max_plan_speed(config),
+            pacing_profile=_configured_pacing_profile(config),
+            tone_profile=_configured_tone_profile(config),
+        )
         write_json(paths.planner / "edit-plan.schema.json", schema)
         request = build_planner_request(paths, config, editing_prompt, candidates, candidate_set_hash)
         atomic_write_text(paths.planner / "request.md", request)
-        planner_candidates = _planner_candidates_payload(candidates, candidate_set_hash)
+        planner_candidates = _planner_candidates_payload(
+            candidates,
+            candidate_set_hash,
+            config,
+        )
         write_json(paths.planner / "candidates.json", planner_candidates)
 
         if planner_name == "local":
-            plan = local_plan(config, editing_prompt, candidates, candidate_set_hash)
+            plan = local_plan(
+                config,
+                editing_prompt,
+                candidates,
+                candidate_set_hash,
+                source_family_by_clip=source_families,
+            )
         elif planner_name == "file":
             payload = parse_json_strict(plan_file_path.read_text(encoding="utf-8"))
             plan = validate_and_normalize_plan(payload, config, editing_prompt, candidates, candidate_set_hash, "file")
@@ -199,7 +329,13 @@ def plan_project(
                 if strict_planner:
                     raise
                 print_status(f"{planner_name} 플래너 실패, 로컬 플래너로 계속합니다: {exc}")
-                plan = local_plan(config, editing_prompt, candidates, candidate_set_hash)
+                plan = local_plan(
+                    config,
+                    editing_prompt,
+                    candidates,
+                    candidate_set_hash,
+                    source_family_by_clip=source_families,
+                )
                 plan.planner = f"local-fallback-from-{planner_name}"
                 fallback_error = str(exc)
 
@@ -221,12 +357,16 @@ def local_plan(
     prompt: str,
     candidates: list[Candidate],
     candidate_set_hash: str,
+    *,
+    source_family_by_clip: dict[str, str] | None = None,
 ) -> EditPlan:
     grouped: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
         grouped[candidate.day_key].append(candidate)
     target = _configured_target_seconds(config)
     soft_max = _configured_soft_max_seconds(config)
+    pacing_profile = _configured_pacing_profile(config)
+    tone_profile = _configured_tone_profile(config)
     episodes: list[Episode] = []
     for day_key, day_candidates in sorted(grouped.items()):
         day_candidates.sort(key=_candidate_sort_key)
@@ -234,12 +374,17 @@ def local_plan(
             day_candidates,
             soft_max,
             _prompt_role_weights(prompt),
+            pacing_profile=pacing_profile,
+            tone_profile=tone_profile,
+            source_family_by_clip=source_family_by_clip,
         )
         speed_by_id = _adaptive_compression_speeds(
             selected,
             soft_max,
             enabled=bool(config["editing"].get("adaptive_fast_forward", True)),
             max_speed=_configured_max_plan_speed(config),
+            pacing_profile=pacing_profile,
+            tone_profile=tone_profile,
         )
         locations = list(dict.fromkeys(item.location for item in selected if item.location))
         segments: list[PlanSegment] = []
@@ -313,6 +458,8 @@ def local_plan(
         planner="local",
         candidate_set_hash=candidate_set_hash,
         episodes=episodes,
+        pacing_profile=pacing_profile,
+        tone_profile=tone_profile,
     )
 
 
@@ -326,7 +473,16 @@ def validate_and_normalize_plan(
 ) -> EditPlan:
     if not isinstance(payload, dict):
         raise VideoSummaryError("플래너 출력은 JSON object여야 합니다.")
-    allowed_top = {"version", "project", "candidate_set_hash", "episodes", "prompt", "planner"}
+    allowed_top = {
+        "version",
+        "project",
+        "candidate_set_hash",
+        "episodes",
+        "prompt",
+        "planner",
+        "pacing_profile",
+        "tone_profile",
+    }
     unknown = set(payload) - allowed_top
     if unknown:
         raise VideoSummaryError(f"플래너 출력에 허용되지 않은 필드가 있습니다: {sorted(unknown)}")
@@ -336,6 +492,31 @@ def validate_and_normalize_plan(
         raise VideoSummaryError("플래너 출력의 project가 현재 프로젝트와 다릅니다.")
     if payload.get("candidate_set_hash") != candidate_set_hash:
         raise VideoSummaryError("플래너 출력의 candidate_set_hash가 현재 후보와 다릅니다.")
+    raw_pacing_profile = payload.get("pacing_profile")
+    if raw_pacing_profile is None:
+        # Plans written before profile metadata existed used the historical
+        # balanced behavior and allowed up to 3x bridges. Preserve that
+        # meaning so an old validated plan remains renderable after the new
+        # gentle default is installed.
+        pacing_profile = "balanced"
+    elif (
+        isinstance(raw_pacing_profile, str)
+        and raw_pacing_profile in PACING_SOURCE_ENVELOPES
+    ):
+        pacing_profile = str(raw_pacing_profile)
+    else:
+        raise VideoSummaryError("플래너 출력의 pacing_profile이 잘못되었습니다.")
+    raw_tone_profile = payload.get("tone_profile")
+    if raw_tone_profile is None:
+        tone_profile = "calm"
+    elif isinstance(raw_tone_profile, str) and raw_tone_profile in {"calm", "playful"}:
+        tone_profile = str(raw_tone_profile)
+    else:
+        raise VideoSummaryError("플래너 출력의 tone_profile이 잘못되었습니다.")
+    configured_max_speed = _configured_max_plan_speed(
+        config,
+        pacing_profile=pacing_profile,
+    )
 
     catalog = {candidate.candidate_id: candidate for candidate in candidates}
     grouped: dict[str, list[Candidate]] = defaultdict(list)
@@ -408,7 +589,6 @@ def validate_and_normalize_plan(
             if isinstance(speed_value, bool) or not isinstance(speed_value, (int, float)):
                 raise VideoSummaryError("speed는 숫자여야 합니다.")
             speed = float(speed_value)
-            configured_max_speed = _configured_max_plan_speed(config)
             if not math.isfinite(speed) or not 0.75 <= speed <= configured_max_speed:
                 raise VideoSummaryError(
                     f"speed는 0.75~{configured_max_speed:g}의 유한한 숫자여야 합니다."
@@ -572,6 +752,8 @@ def validate_and_normalize_plan(
         planner=planner_name,
         candidate_set_hash=candidate_set_hash,
         episodes=episodes,
+        pacing_profile=pacing_profile,
+        tone_profile=tone_profile,
     )
 
 
@@ -586,6 +768,17 @@ def build_planner_request(
     for candidate in _eligible_planner_candidates(candidates):
         days[candidate.day_key].append(candidate)
     configured_max_speed = _configured_max_plan_speed(config)
+    pacing_profile = _configured_pacing_profile(config)
+    pacing_envelopes = PACING_SOURCE_ENVELOPES[pacing_profile]
+    tone_profile = _configured_tone_profile(config)
+    tone_instruction = (
+        "playful 톤은 사건 수나 envelope를 늘리는 뜻이 아닙니다. 같은 사건 안에서 "
+        "행동 → 결과 → 리액션, 선택 → 기대 → 공개, 가족 간 상호작용과 화면 변화가 "
+        "있는 후보를 반복·정지 구간보다 우선하세요."
+        if tone_profile == "playful"
+        else "calm 톤은 같은 사건 안에서 공간과 대화의 자연스러운 맥락을 우선하고, "
+        "재미 요소를 위해 장면을 추가하거나 순서를 바꾸지 마세요."
+    )
     lines = [
         "# 여행 영상 편집 계획 요청",
         "",
@@ -607,6 +800,10 @@ def build_planner_request(
         "식사 option이나 setup/closure 맥락이 필수 인터뷰와 겹치면 인터뷰 계약이, transition과 겹치면 transition 계약이 food 계약보다 우선합니다. 단순히 role=food이지만 required_meal_event_ids와 required_meal_context_ids가 모두 비어 있는 후보는 필수가 아닙니다.",
         "target_duration은 기존 edit-plan schema 호환용 메타데이터이며 채워야 하는 할당량이 아닙니다.",
         "soft maximum은 사건 삭제 기준이 아니라 압축 재검토 기준입니다. 고유한 activity event를 시간 때문에 누락하지 말고, full → compact → speed_up → omit 순서로만 압축하세요.",
+        f"현재 pacing profile은 {pacing_profile}입니다. 사건 자체는 모두 대표하되 사건 내부 반복은 아래 source-time soft envelope 안에서 compact하세요: "
+        + ", ".join(f"{key}={value:g}s" for key, value in pacing_envelopes.items())
+        + ". 필수·phase anchor가 넘으면 완결성을 위해 soft overflow를 허용하세요.",
+        f"현재 tone profile은 {tone_profile}입니다. {tone_instruction}",
         "speed_policy=protected_1x 또는 omit인 후보는 정확히 speed=1.0으로만 사용하세요.",
         f"speed_policy=allow_fast인 후보만 0.75~{configured_max_speed:g}배속을 사용할 수 있고, 1배속 초과는 무대사·저정보 이동/대기/접근 압축에만 사용하세요. exclusion_reason이 있는 후보는 절대 선택하지 마세요.",
         "각 날짜를 출발/도입 → 탐색/이동 → 핵심 경험 → 마무리의 4단계 이야기로 구성하되 실제 촬영 순서를 바꾸지 마세요.",
@@ -614,13 +811,15 @@ def build_planner_request(
         "같은 원본의 중간을 건너뛰고 다시 들어가는 jump cut은 꼭 필요한 경우가 아니면 피하고, 선택한다면 앞뒤 맥락이 완결된 구간을 고르세요.",
         "대사가 적거나 없어도 scenery 역할이거나 visual_quality가 높은 안정적인 화면은 날짜별 시각 앵커로 포함하세요.",
         "여정의 시작·이동·주요 장소·음식·사람들의 반응·마무리가 균형 있게 드러나야 합니다.",
-        "비슷한 장면을 반복하지 말고, 재미있는 대화와 리액션을 우선하되 날짜별 맥락을 보존하세요.",
+        "비슷한 장면을 반복하지 말고 현재 tone profile의 우선순위를 따르되 날짜별 맥락을 보존하세요.",
         "모든 날짜에 최소 하나의 segment를 선택하고 JSON Schema에 맞는 JSON object만 반환하세요.",
         "",
         f"Project: {config['project']['name']}",
         f"Candidate set: {candidate_set_hash}",
         f"Legacy target_duration per day: {config['editing']['target_minutes_per_day']} minutes",
         f"Duration review guard per day: {config['editing'].get('soft_max_minutes_per_day', 10.0)} minutes",
+        f"Pacing profile: {pacing_profile}",
+        f"Tone profile: {tone_profile}",
         f"Maximum fast-forward speed: {configured_max_speed}x",
         "",
         "## 사용자의 편집 프롬프트",
@@ -710,10 +909,13 @@ def build_planner_request(
             "- version은 1",
             f"- project는 {config['project']['name']}",
             f"- candidate_set_hash는 {candidate_set_hash}",
+            f"- pacing_profile 필드는 정확히 {pacing_profile}",
+            f"- tone_profile 필드는 정확히 {tone_profile}",
             "- 모든 날짜를 episodes에 정확히 한 번씩 포함",
             f"- 각 episode의 target_duration 필드는 호환성을 위해 {configured_target:.1f}으로 유지하되 이를 채우지 말 것",
             f"- {soft_max:.1f}초는 삭제 상한이 아니라 압축 재검토 guard; 고유 event 보존 때문에 초과해도 허용",
             "- 모든 story event를 먼저 시간순으로 대표하고 full → compact → speed_up → omit 순서로만 줄일 것",
+            f"- tone profile은 {tone_profile}; event coverage나 필수 단계는 바꾸지 않고 사건 내부 후보 우선순위에만 적용",
             "- speed_policy=protected_1x/omit은 speed=1.0만 허용; allow_fast만 0.75배 레거시 속도 또는 설정된 최대 배속까지 허용",
             "- exclusion_reason이 있는 candidate_id는 선택 금지",
             "- segment에는 candidate_id, role, reason, location, caption, speed를 모두 포함; 표시값이 없으면 location/caption은 null, speed는 1.0",
@@ -730,13 +932,19 @@ def build_planner_request(
     return "\n".join(lines).strip() + "\n"
 
 
-def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash: str) -> dict[str, Any]:
+def _planner_candidates_payload(
+    candidates: list[Candidate],
+    candidate_set_hash: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     eligible_candidates = _eligible_planner_candidates(candidates)
     meal_event_groups = _meal_event_option_groups(eligible_candidates)
     meal_context_groups = _meal_context_option_groups(eligible_candidates)
     story_event_groups = _story_event_groups(_dedupe_candidates(eligible_candidates))
+    pacing_profile = _configured_pacing_profile(config) if config is not None else None
+    tone_profile = _configured_tone_profile(config) if config is not None else None
     return {
-        "version": 3,
+        "version": 4,
         "candidate_set_hash": candidate_set_hash,
         "transcript_policy": "whitespace-normalized excerpt, maximum 240 characters per candidate",
         "story_selection_contract": {
@@ -748,6 +956,14 @@ def _planner_candidates_payload(candidates: list[Candidate], candidate_set_hash:
             "complete_source_runs": True,
             "omit_weak_fragments": True,
             "omit_near_duplicates": True,
+            "pacing_profile": pacing_profile,
+            "tone_profile": tone_profile,
+            "tone_scope": "within_event_ranking_and_eligible_bridge_rhythm_only",
+            "source_time_soft_envelopes_seconds": (
+                PACING_SOURCE_ENVELOPES[pacing_profile]
+                if pacing_profile is not None
+                else None
+            ),
         },
         "story_event_groups": [
             {
@@ -1011,18 +1227,46 @@ def invoke_external_planner(
     raise VideoSummaryError("claude의 구조화 출력을 찾지 못했습니다.")
 
 
-def planner_schema(*, max_speed: float = MAX_PLAN_SPEED) -> dict[str, Any]:
+def planner_schema(
+    *,
+    max_speed: float = MAX_PLAN_SPEED,
+    pacing_profile: str | None = None,
+    tone_profile: str | None = None,
+) -> dict[str, Any]:
     schema_max_speed = min(MAX_PLAN_SPEED, float(max_speed))
     text = {"type": "string", "minLength": 1}
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": False,
-        "required": ["version", "project", "candidate_set_hash", "episodes"],
+        "required": [
+            "version",
+            "project",
+            "candidate_set_hash",
+            "pacing_profile",
+            "tone_profile",
+            "episodes",
+        ],
         "properties": {
             "version": {"type": "integer", "const": 1},
             "project": text,
             "candidate_set_hash": text,
+            "pacing_profile": {
+                "type": "string",
+                **(
+                    {"const": pacing_profile}
+                    if pacing_profile is not None
+                    else {"enum": sorted(PACING_SOURCE_ENVELOPES)}
+                ),
+            },
+            "tone_profile": {
+                "type": "string",
+                **(
+                    {"const": tone_profile}
+                    if tone_profile is not None
+                    else {"enum": ["calm", "playful"]}
+                ),
+            },
             "episodes": {
                 "type": "array",
                 "minItems": 1,
@@ -1092,6 +1336,10 @@ def _select_day_candidates(
     candidates: list[Candidate],
     soft_max_seconds: float,
     prompt_role_weights: dict[str, float] | None = None,
+    *,
+    pacing_profile: str | None = None,
+    tone_profile: str | None = None,
+    source_family_by_clip: dict[str, str] | None = None,
 ) -> list[Candidate]:
     deduped = _dedupe_candidates(
         [item for item in candidates if not item.exclusion_reason]
@@ -1113,7 +1361,568 @@ def _select_day_candidates(
     for event in _story_event_groups(deduped):
         for run in _event_flow_runs(event, weights):
             selected_by_id.update((item.candidate_id, item) for item in run)
-    return sorted(selected_by_id.values(), key=_candidate_sort_key)
+    if pacing_profile in PACING_SOURCE_ENVELOPES:
+        narrative_cues = _pacing_narrative_cue_groups(tone_profile)
+        represented_event_ids = {
+            item.story_event_id
+            for item in selected_by_id.values()
+            if item.story_event_id
+        }
+        for item in deduped:
+            if (
+                item.story_event_id in represented_event_ids
+                and any(_pacing_cue_count(item, cues) for cues in narrative_cues)
+            ):
+                selected_by_id[item.candidate_id] = item
+    selected = sorted(selected_by_id.values(), key=_candidate_sort_key)
+    if pacing_profile is None:
+        # Direct callers from the legacy API retain the old coverage-heavy
+        # behavior. Project planning always supplies an explicit profile.
+        return selected
+    return _compact_day_selection_for_pacing(
+        deduped,
+        selected,
+        pacing_profile,
+        weights,
+        tone_profile=tone_profile,
+        source_family_by_clip=source_family_by_clip,
+    )
+
+
+def _compact_day_selection_for_pacing(
+    day_candidates: list[Candidate],
+    selected: list[Candidate],
+    pacing_profile: str,
+    prompt_role_weights: dict[str, float],
+    *,
+    tone_profile: str | None = None,
+    source_family_by_clip: dict[str, str] | None = None,
+) -> list[Candidate]:
+    """Keep every selected event while compacting repetition inside it.
+
+    ``protected_1x`` controls speed only. It does not make every protected
+    candidate mandatory. Contract footage (interviews, waypoints, meal
+    setup/body/closure), the DAY anchor, and the meaningful closing run remain
+    forced; each other represented event keeps a phase-complete micro-story
+    and then fills only the profile's soft source-time envelope.
+    """
+    envelopes = PACING_SOURCE_ENVELOPES.get(pacing_profile)
+    if envelopes is None:
+        raise VideoSummaryError(
+            f"알 수 없는 pacing_profile입니다: {pacing_profile}"
+        )
+    candidate_catalog = {item.candidate_id: item for item in day_candidates}
+    selected_by_id = {item.candidate_id: item for item in selected}
+    forced_ids = {
+        item.candidate_id
+        for item in _mandatory_day_candidates(day_candidates)
+        if item.candidate_id in selected_by_id
+    }
+    forced_ids.update(
+        item.candidate_id
+        for item in _meaningful_closing_run(day_candidates)
+        if item.candidate_id in selected_by_id
+    )
+
+    kept_ids: set[str] = set()
+    iphone_cutaway_event_ids = {
+        item.story_event_id
+        for item in selected
+        if item.story_event_id
+        and source_family_by_clip
+        and source_family_by_clip.get(item.clip_id) == "iphone"
+    }
+    ordered_groups = _pacing_event_groups(selected)
+    for values in ordered_groups:
+        values.sort(key=_candidate_sort_key)
+        category = _pacing_event_category(values)
+        envelope = envelopes[category]
+        event_kept: list[Candidate] = [
+            item for item in values if item.candidate_id in forced_ids
+        ]
+
+        # Every inferred story represented inside a source-contiguous group
+        # keeps its own filmed activity. A forced setup or exit must never
+        # impersonate the body/action, and merging fragmented event IDs must
+        # not let the tighter profile erase one of those IDs.
+        story_subgroups: dict[str, list[Candidate]] = defaultdict(list)
+        for item in values:
+            story_subgroups[
+                item.story_event_id or f"candidate:{item.candidate_id}"
+            ].append(item)
+        for story_values in story_subgroups.values():
+            story_ids = {item.candidate_id for item in story_values}
+            kept_story = [
+                item for item in event_kept if item.candidate_id in story_ids
+            ]
+            if any(
+                item.story_stage in {"body", "action", "outcome"}
+                for item in kept_story
+            ):
+                continue
+            activity_options = [
+                item
+                for item in story_values
+                if item.story_stage in {"body", "action", "outcome"}
+            ]
+            event_kept.append(
+                max(
+                    activity_options or story_values,
+                    key=lambda item: _pacing_candidate_rank(
+                        item, prompt_role_weights, tone_profile=tone_profile
+                    ),
+                )
+            )
+
+        # Preserve a filmed decision/anticipation beat and its reveal/payoff
+        # even when speech or visual classifiers mislabeled their phase. This
+        # catches compact family highlights such as choosing a capsule toy,
+        # turning the knob, opening it, and reacting to the result.
+        for cues in (
+            PACING_CHOICE_CUES,
+            PACING_ANTICIPATION_CUES,
+            PACING_REVEAL_CUES,
+        ):
+            options = [item for item in values if _pacing_cue_count(item, cues)]
+            if not options:
+                continue
+            chosen = max(
+                options,
+                key=lambda item: (
+                    _pacing_cue_count(item, cues),
+                    _pacing_candidate_rank(
+                        item,
+                        prompt_role_weights,
+                        tone_profile=tone_profile,
+                    ),
+                ),
+            )
+            kept_cue_count = max(
+                (_pacing_cue_count(item, cues) for item in event_kept),
+                default=0,
+            )
+            if (
+                chosen.candidate_id
+                not in {item.candidate_id for item in event_kept}
+                and _pacing_cue_count(chosen, cues) > kept_cue_count
+            ):
+                event_kept.append(chosen)
+
+        # Scenery and generic moments read well as one or two strong beats.
+        # Narrative activities retain one representative per filmed phase.
+        if category != "scenery":
+            for stages in (
+                {"setup"},
+                {"body", "action"},
+                {"outcome", "reaction"},
+                {"closure"},
+            ):
+                if any(item.story_stage in stages for item in event_kept):
+                    continue
+                options = [item for item in values if item.story_stage in stages]
+                if options:
+                    event_kept.append(
+                        max(
+                            options,
+                            key=lambda item: _pacing_candidate_rank(
+                                item,
+                                prompt_role_weights,
+                                tone_profile=tone_profile,
+                            ),
+                        )
+                    )
+
+        event_kept = list(
+            {item.candidate_id: item for item in event_kept}.values()
+        )
+        used = used_duration(event_kept)
+
+        if tone_profile == "playful":
+            represented_group_ids = {
+                item.story_event_id for item in values if item.story_event_id
+            }
+            chain_pool = list(
+                {
+                    item.candidate_id: item
+                    for item in (
+                        *values,
+                        *(
+                            candidate
+                            for candidate in day_candidates
+                            if candidate.story_event_id in represented_group_ids
+                        ),
+                    )
+                }.values()
+            )
+            for beat in _playful_chain_candidates(
+                chain_pool,
+                prompt_role_weights,
+            ):
+                if beat.candidate_id in {
+                    item.candidate_id for item in event_kept
+                }:
+                    continue
+                if used + beat.duration > envelope + 1e-6:
+                    continue
+                event_kept.append(beat)
+                used += beat.duration
+
+        if tone_profile == "playful" and source_family_by_clip:
+            event_ids = {
+                item.story_event_id for item in values if item.story_event_id
+            }
+            for event_id in sorted(event_ids):
+                if event_id in iphone_cutaway_event_ids:
+                    continue
+                event_values = [
+                    item
+                    for item in day_candidates
+                    if item.story_event_id == event_id
+                ]
+                cutaway = _playful_iphone_cutaway(
+                    event_values,
+                    event_kept,
+                    source_family_by_clip,
+                    prompt_role_weights,
+                )
+                if (
+                    cutaway is not None
+                    and cutaway.candidate_id
+                    not in {item.candidate_id for item in event_kept}
+                    and used + cutaway.duration <= envelope + 1e-6
+                ):
+                    event_kept.append(cutaway)
+                    used += cutaway.duration
+                    iphone_cutaway_event_ids.add(event_id)
+
+        remaining = [
+            item
+            for item in values
+            if item.candidate_id
+            not in {current.candidate_id for current in event_kept}
+            and item.duration >= 0.5
+        ]
+        while remaining:
+            fitting = [item for item in remaining if used + item.duration <= envelope + 1e-6]
+            if not fitting:
+                break
+            def fill_rank(item: Candidate) -> tuple[Any, ...]:
+                temporal_distance = min(
+                    abs(
+                        _candidate_sort_key(item)[0]
+                        - _candidate_sort_key(current)[0]
+                    )
+                    for current in event_kept
+                )
+                editorial_rank = _pacing_candidate_rank(
+                    item,
+                    prompt_role_weights,
+                    tone_profile=tone_profile,
+                )
+                if tone_profile == "playful":
+                    return editorial_rank, temporal_distance
+                return temporal_distance, editorial_rank
+
+            chosen = max(fitting, key=fill_rank)
+            event_kept.append(chosen)
+            remaining.remove(chosen)
+            used += chosen.duration
+
+        kept_ids.update(item.candidate_id for item in event_kept)
+
+    return sorted(
+        (candidate_catalog[candidate_id] for candidate_id in kept_ids),
+        key=_candidate_sort_key,
+    )
+
+
+def _pacing_event_groups(candidates: list[Candidate]) -> list[list[Candidate]]:
+    """Split inferred events on real time gaps and join source-contiguous fragments."""
+    groups: list[list[Candidate]] = []
+    for item in sorted(candidates, key=_candidate_sort_key):
+        if not groups:
+            groups.append([item])
+            continue
+        previous = groups[-1][-1]
+        previous_time = _candidate_sort_key(previous)[0]
+        item_time = _candidate_sort_key(item)[0]
+        time_gap = item_time - (previous_time + previous.duration)
+        same_inferred_event = bool(
+            previous.story_event_id
+            and previous.story_event_id == item.story_event_id
+            and -PACING_EVENT_GROUP_GAP_SECONDS <= time_gap <= PACING_EVENT_GROUP_GAP_SECONDS
+        )
+        source_contiguous = (
+            previous.clip_id == item.clip_id
+            and -MAX_SOURCE_OVERLAP_SECONDS <= item.start - previous.end
+            <= STORY_RUN_GAP_SECONDS
+            and not any(
+                _is_required_interview(candidate)
+                or _is_required_transition(candidate)
+                or _has_required_meal(candidate)
+                for candidate in (previous, item)
+            )
+        )
+        if same_inferred_event or source_contiguous:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    return groups
+
+
+def _pacing_cue_count(candidate: Candidate, cues: tuple[str, ...]) -> int:
+    transcript = candidate.transcript.casefold()
+    count = sum(cue in transcript for cue in cues)
+    if cues == PACING_REVEAL_CUES and count:
+        for match in PACING_REVEAL_EXIT_RE.finditer(transcript):
+            count -= sum(cue in match.group(0) for cue in cues)
+    return max(0, count)
+
+
+def _pacing_narrative_cue_groups(
+    tone_profile: str | None,
+) -> tuple[tuple[str, ...], ...]:
+    core = (
+        PACING_CHOICE_CUES,
+        PACING_ANTICIPATION_CUES,
+        PACING_REVEAL_CUES,
+    )
+    if tone_profile == "playful":
+        return (*core, PLAYFUL_REACTION_CUES)
+    return core
+
+
+def _candidate_wallclock_seconds(candidate: Candidate) -> float:
+    return _candidate_sort_key(candidate)[0] + candidate.start
+
+
+def _playful_chain_candidates(
+    candidates: list[Candidate],
+    prompt_role_weights: dict[str, float],
+) -> list[Candidate]:
+    """Prefer a chronological action/payoff chain inside one represented event."""
+    ordered = sorted(candidates, key=_candidate_sort_key)
+    reveal_options = [
+        item
+        for item in ordered
+        if _pacing_cue_count(item, PACING_REVEAL_CUES)
+        or item.story_stage == "outcome"
+    ]
+    if not reveal_options:
+        return []
+    reveal = max(
+        reveal_options,
+        key=lambda item: (
+            _pacing_cue_count(item, PACING_REVEAL_CUES),
+            _pacing_candidate_rank(
+                item,
+                prompt_role_weights,
+                tone_profile="playful",
+            ),
+        ),
+    )
+    reveal_time = _candidate_wallclock_seconds(reveal)
+    before = [
+        item
+        for item in ordered
+        if item.candidate_id != reveal.candidate_id
+        and 0.0 <= reveal_time - _candidate_wallclock_seconds(item) <= 45.0
+    ]
+    after = [
+        item
+        for item in ordered
+        if item.candidate_id != reveal.candidate_id
+        and 0.0 < _candidate_wallclock_seconds(item) - reveal_time <= 30.0
+    ]
+
+    def best(options: list[Candidate]) -> Candidate | None:
+        return max(
+            options,
+            key=lambda item: _pacing_candidate_rank(
+                item,
+                prompt_role_weights,
+                tone_profile="playful",
+            ),
+            default=None,
+        )
+
+    choice = best(
+        [item for item in before if _pacing_cue_count(item, PACING_CHOICE_CUES)]
+    )
+    anticipation = best(
+        [
+            item
+            for item in before
+            if _pacing_cue_count(item, PACING_ANTICIPATION_CUES)
+        ]
+    )
+    action_floor = (
+        _candidate_wallclock_seconds(choice)
+        if choice is not None
+        else reveal_time - 45.0
+    )
+    action_options = [
+        item
+        for item in before
+        if _candidate_wallclock_seconds(item) >= action_floor
+        and item.candidate_id
+        not in {
+            current.candidate_id
+            for current in (choice, anticipation)
+            if current is not None
+        }
+        and (
+            item.story_stage in {"body", "action"}
+            or item.motion_score >= 0.15
+        )
+    ]
+    action = max(
+        action_options,
+        key=lambda item: (
+            item.story_stage == "action",
+            item.motion_score,
+            _pacing_candidate_rank(
+                item,
+                prompt_role_weights,
+                tone_profile="playful",
+            ),
+        ),
+        default=None,
+    )
+    reaction = best(
+        [
+            item
+            for item in after
+            if item.story_stage == "reaction"
+            or _pacing_cue_count(item, PLAYFUL_REACTION_CUES)
+        ]
+    )
+    return sorted(
+        {
+            item.candidate_id: item
+            for item in (choice, action, anticipation, reveal, reaction)
+            if item is not None
+        }.values(),
+        key=_candidate_sort_key,
+    )
+
+
+def _playful_iphone_cutaway(
+    event_candidates: list[Candidate],
+    selected: list[Candidate],
+    source_family_by_clip: dict[str, str],
+    prompt_role_weights: dict[str, float],
+) -> Candidate | None:
+    """Choose at most one nearby iPhone angle as an optional event cutaway."""
+    if not event_candidates or any(
+        _is_required_interview(item) or "interview" in item.roles
+        for item in event_candidates
+    ):
+        return None
+    event_ids = {
+        item.story_event_id for item in event_candidates if item.story_event_id
+    }
+    selected_event = [
+        item
+        for item in selected
+        if item.story_event_id in event_ids
+    ]
+    if not selected_event or any(
+        source_family_by_clip.get(item.clip_id) == "iphone"
+        for item in selected_event
+    ):
+        return None
+    primary = [
+        item
+        for item in selected_event
+        if source_family_by_clip.get(item.clip_id, "primary") != "iphone"
+    ]
+    if not primary:
+        return None
+    selected_ids = {item.candidate_id for item in selected}
+    options = [
+        item
+        for item in event_candidates
+        if source_family_by_clip.get(item.clip_id) == "iphone"
+        and item.candidate_id not in selected_ids
+        and not item.exclusion_reason
+        and not _has_required_meal(item)
+        and 2.0 <= item.duration <= 8.0
+        and min(
+            abs(
+                _candidate_wallclock_seconds(item)
+                - _candidate_wallclock_seconds(current)
+            )
+            for current in primary
+        )
+        <= 45.0
+    ]
+    return max(
+        options,
+        key=lambda item: (
+            _pacing_candidate_rank(
+                item,
+                prompt_role_weights,
+                tone_profile="playful",
+            ),
+            -min(
+                abs(
+                    _candidate_wallclock_seconds(item)
+                    - _candidate_wallclock_seconds(current)
+                )
+                for current in primary
+            ),
+        ),
+        default=None,
+    )
+
+
+def _pacing_event_category(candidates: list[Candidate]) -> str:
+    if any(_is_required_interview(item) or "interview" in item.roles for item in candidates):
+        return "interview"
+    if any(_has_required_meal(item) for item in candidates):
+        return "meal"
+    if any("fun" in item.roles for item in candidates):
+        return "play"
+    if any("food" in item.roles for item in candidates):
+        return "meal"
+    if any(_is_required_transition(item) or "journey" in item.roles for item in candidates):
+        return "waypoint"
+    if any("dialogue" in item.roles or item.speech_ratio > 0.08 for item in candidates):
+        return "dialogue"
+    return "scenery"
+
+
+def _pacing_candidate_rank(
+    candidate: Candidate,
+    prompt_role_weights: dict[str, float],
+    *,
+    tone_profile: str | None = None,
+) -> tuple[float, float, float, float, str]:
+    playful_bonus = 0.0
+    if tone_profile == "playful":
+        if "fun" in candidate.roles:
+            playful_bonus += 0.18
+        if candidate.story_stage in {"outcome", "reaction"}:
+            playful_bonus += 0.16
+        elif candidate.story_stage == "action":
+            playful_bonus += 0.08
+        if _pacing_cue_count(candidate, PLAYFUL_REACTION_CUES):
+            playful_bonus += 0.14
+        if any(
+            _pacing_cue_count(candidate, cues)
+            for cues in (PACING_CHOICE_CUES, PACING_ANTICIPATION_CUES, PACING_REVEAL_CUES)
+        ):
+            playful_bonus += 0.08
+        if candidate.speech_ratio > 0.08 and candidate.motion_score >= 0.12:
+            playful_bonus += 0.05
+    return (
+        _event_run_value((candidate,), prompt_role_weights) + playful_bonus,
+        candidate.visual_quality,
+        candidate.motion_score,
+        candidate.duration,
+        candidate.candidate_id,
+    )
 
 
 def used_duration(candidates: list[Candidate]) -> float:
@@ -1126,12 +1935,15 @@ def _adaptive_compression_speeds(
     *,
     enabled: bool,
     max_speed: float,
+    pacing_profile: str | None = None,
+    tone_profile: str | None = None,
 ) -> dict[str, float]:
     speeds = {item.candidate_id: 1.0 for item in candidates}
     if not enabled or max_speed <= 1.0:
         return speeds
     projected = used_duration(candidates)
-    if projected <= review_guard_seconds + 1e-6:
+    profile_compression = pacing_profile in PACING_SOURCE_ENVELOPES
+    if not profile_compression and projected <= review_guard_seconds + 1e-6:
         return speeds
     eligible = [
         item
@@ -1152,9 +1964,13 @@ def _adaptive_compression_speeds(
         )
     )
     for item in eligible:
-        if projected <= review_guard_seconds + 1e-6:
+        if not profile_compression and projected <= review_guard_seconds + 1e-6:
             break
         suggested = _recommended_fast_forward_speed(item, max_speed)
+        if pacing_profile == "balanced" and 1.0 < suggested < 3.0:
+            suggested = min(max_speed, suggested + 0.5)
+        elif tone_profile == "playful" and 1.0 < suggested < 2.0:
+            suggested = min(max_speed, suggested + 0.5)
         if suggested <= 1.0:
             continue
         speeds[item.candidate_id] = suggested
