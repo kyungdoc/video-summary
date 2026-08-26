@@ -1291,6 +1291,14 @@ def clip_requires_hdr_to_sdr(clip: Clip) -> bool:
     }
 
 
+def videotoolbox_download_pixel_format(clip: Clip) -> str:
+    """Return the software pixel format exposed by VideoToolbox for the clip."""
+    pixel_format = str(clip.pix_fmt or "").casefold()
+    if "p010" in pixel_format or "10" in pixel_format:
+        return "p010le"
+    return "nv12"
+
+
 def videotoolbox_rotation_filter(rotation: int) -> str | None:
     normalized = rotation % 360
     return {
@@ -1820,6 +1828,7 @@ def render_source_piece(
     if portrait:
         key_payload["portrait_layout"] = portrait_layout
     if hdr_to_sdr:
+        download_pixel_format = videotoolbox_download_pixel_format(clip)
         key_payload["hdr_to_sdr"] = {
             "engine": "videotoolbox-pixel-transfer-v1",
             "pix_fmt": clip.pix_fmt,
@@ -1829,6 +1838,8 @@ def render_source_piece(
             "dolby_vision_profile": clip.dolby_vision_profile,
             "rotation": clip.rotation,
         }
+        if download_pixel_format != "p010le":
+            key_payload["hdr_to_sdr"]["download_pix_fmt"] = download_pixel_format
     key = stable_hash(key_payload, length=28)
     output = segments_dir / f"{key}.mp4"
     if not force and cached_piece_is_usable(
@@ -1894,6 +1905,7 @@ def render_source_piece(
     )
     hardware_filters: list[str] = []
     if hdr_to_sdr:
+        download_pixel_format = videotoolbox_download_pixel_format(clip)
         rotation_filter = videotoolbox_rotation_filter(clip.rotation)
         if rotation_filter:
             hardware_filters.append(rotation_filter)
@@ -1901,7 +1913,7 @@ def render_source_piece(
             [
                 "scale_vt=w=iw:h=ih:color_matrix=bt709:color_primaries=bt709:color_transfer=bt709",
                 "hwdownload",
-                "format=p010le",
+                f"format={download_pixel_format}",
                 "format=yuv420p",
             ]
         )

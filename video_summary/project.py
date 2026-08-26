@@ -320,6 +320,11 @@ def _validate_config(config: dict[str, Any]) -> None:
                 ZoneInfo(rule_timezone)
             except ZoneInfoNotFoundError as exc:
                 raise VideoSummaryError(f"알 수 없는 timezone입니다: {rule_timezone}") from exc
+        confidence = rule.get("confidence")
+        if confidence is not None and confidence not in {"high", "medium", "low"}:
+            raise VideoSummaryError(
+                f"{field}.confidence는 high, medium, low 중 하나여야 합니다."
+            )
     for key in ("intro_seconds", "date_card_seconds", "outro_seconds"):
         duration = _finite_number(render.get(key), key)
         if not 0.1 <= duration <= 30:

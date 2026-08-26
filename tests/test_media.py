@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from video_summary.media import VISUAL_SIGNAL_POLICY_VERSION, analyze_visual_signals
+from video_summary.media import VISUAL_SIGNAL_POLICY_VERSION, analyze_visual_signals, extract_frame
 from video_summary.models import Clip
 from video_summary.project import ProjectPaths
 from video_summary.utils import VideoSummaryError
@@ -140,6 +140,90 @@ class VisualSignalDecodeTests(unittest.TestCase):
 
             self.assertTrue(process.terminated)
             self.assertTrue(process.stdout.closed)
+
+    def test_extract_frame_uses_full_range_jpeg_pixel_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "frame.jpg"
+            calls: list[list[str]] = []
+
+            def fake_run_command(args: list[str]) -> str:
+                calls.append(args)
+                Path(args[-1]).write_bytes(b"jpeg")
+                return ""
+
+            with patch("video_summary.media.run_command", side_effect=fake_run_command):
+                extract_frame(self._clip(), 1.5, output)
+
+            self.assertTrue(output.exists())
+            self.assertEqual(len(calls), 1)
+            args = calls[0]
+            self.assertEqual(args[args.index("-pix_fmt") + 1], "yuvj420p")
+            self.assertLess(args.index("-pix_fmt"), args.index("-q:v"))
+
+    def test_extract_frame_clamps_tail_seek_to_a_decodable_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "frame.jpg"
+            calls: list[list[str]] = []
+
+            def fake_run_command(args: list[str]) -> str:
+                calls.append(args)
+                Path(args[-1]).write_bytes(b"jpeg")
+                return ""
+
+            with patch("video_summary.media.run_command", side_effect=fake_run_command):
+                extract_frame(self._clip(), 9.99, output)
+
+            args = calls[0]
+            self.assertEqual(args[args.index("-ss") + 1], "9.900")
+
+    def test_extract_frame_retries_with_accurate_seek_when_fast_seek_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "frame.jpg"
+            calls: list[list[str]] = []
+
+            def fake_run_command(args: list[str]) -> str:
+                calls.append(args)
+                if len(calls) == 2:
+                    Path(args[-1]).write_bytes(b"jpeg")
+                return ""
+
+            with patch("video_summary.media.run_command", side_effect=fake_run_command):
+                extract_frame(self._clip(), 1.5, output)
+
+            self.assertTrue(output.exists())
+            self.assertEqual(len(calls), 2)
+            self.assertLess(calls[0].index("-ss"), calls[0].index("-i"))
+            self.assertGreater(calls[1].index("-ss"), calls[1].index("-i"))
+
+    def test_extract_frame_retries_when_fast_seek_writes_an_empty_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "frame.jpg"
+            calls: list[list[str]] = []
+
+            def fake_run_command(args: list[str]) -> str:
+                calls.append(args)
+                Path(args[-1]).write_bytes(b"" if len(calls) == 1 else b"jpeg")
+                return ""
+
+            with patch("video_summary.media.run_command", side_effect=fake_run_command):
+                extract_frame(self._clip(), 1.5, output)
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(output.read_bytes(), b"jpeg")
+
+    def test_extract_frame_rejects_an_empty_accurate_seek_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "frame.jpg"
+
+            def fake_run_command(args: list[str]) -> str:
+                Path(args[-1]).write_bytes(b"")
+                return ""
+
+            with patch("video_summary.media.run_command", side_effect=fake_run_command):
+                with self.assertRaisesRegex(VideoSummaryError, "대표 프레임을 추출하지 못했습니다"):
+                    extract_frame(self._clip(), 1.5, output)
+
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ from .utils import VideoSummaryError, file_fingerprint, print_status, read_json,
 
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mts", ".m2ts", ".avi", ".mkv"}
-_CAPTURE_TIME_POLICY_VERSION = 4
+_CAPTURE_TIME_POLICY_VERSION = 6
 VISUAL_SIGNAL_POLICY_VERSION = 2
 _FILENAME_PATTERNS = (
     re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])[_-]?([0-2]\d)([0-5]\d)([0-5]\d)(?!\d)"),
@@ -106,6 +106,19 @@ def scan_project(
             day_key = _day_key(captured, day_start_hour)
             video = _video_stream(probe)
             audio = _audio_stream(probe)
+            camera_make = _metadata_tag(probe, "com.apple.quicktime.make", "make")
+            camera_model = _metadata_tag(probe, "com.apple.quicktime.model", "model")
+            source_kind = _source_kind(relative, camera_make, camera_model)
+            source_stream_id = _source_stream_id(
+                relative,
+                source_kind=source_kind,
+                camera_make=camera_make,
+                camera_model=camera_model,
+            )
+            capture_time_confidence = _capture_time_confidence(
+                capture_source,
+                _date_override(relative, config.get("date_overrides", [])),
+            )
             duration = _duration(probe, video)
             if duration <= 0:
                 warnings.append("영상 길이를 확인할 수 없습니다.")
@@ -138,6 +151,11 @@ def scan_project(
                     color_primaries=_optional_probe_text(video.get("color_primaries")),
                     color_range=_optional_probe_text(video.get("color_range")),
                     dolby_vision_profile=_dolby_vision_profile(video),
+                    camera_make=camera_make,
+                    camera_model=camera_model,
+                    source_kind=source_kind,
+                    source_stream_id=source_stream_id,
+                    capture_time_confidence=capture_time_confidence,
                 )
             )
 
@@ -452,6 +470,12 @@ def _decode_visual_signal_frames(
 def extract_frame(clip: Clip, at: float, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
+    temporary.unlink(missing_ok=True)
+    frame_interval = 1.0 / max(1.0, float(clip.fps or 0.0))
+    safe_at = min(
+        max(0.0, at),
+        max(0.0, clip.duration - max(0.1, frame_interval * 2.0)),
+    )
     run_command(
         [
             "ffmpeg",
@@ -459,19 +483,53 @@ def extract_frame(clip: Clip, at: float, output: Path) -> None:
             "-loglevel",
             "error",
             "-ss",
-            f"{max(0.0, at):.3f}",
+            f"{safe_at:.3f}",
             "-i",
             clip.path,
             "-frames:v",
             "1",
             "-vf",
             "scale=640:-2:force_original_aspect_ratio=decrease",
+            "-pix_fmt",
+            "yuvj420p",
             "-q:v",
             "4",
             "-y",
             str(temporary),
         ]
     )
+    if not temporary.exists() or temporary.stat().st_size == 0:
+        # Some iPhone MOV edit lists let a fast input seek return success while
+        # producing no packet. Retry with an accurate output seek before
+        # treating the representative frame as unavailable.
+        temporary.unlink(missing_ok=True)
+        run_command(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                clip.path,
+                "-ss",
+                f"{safe_at:.3f}",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=640:-2:force_original_aspect_ratio=decrease",
+                "-pix_fmt",
+                "yuvj420p",
+                "-q:v",
+                "4",
+                "-y",
+                str(temporary),
+            ]
+        )
+    if not temporary.exists() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        raise VideoSummaryError(
+            f"대표 프레임을 추출하지 못했습니다 ({Path(clip.path).name} @ {safe_at:.3f}s)"
+        )
     os.replace(temporary, output)
 
 
@@ -495,21 +553,93 @@ def _date_override(relative_path: Path, overrides: Any) -> dict[str, Any] | None
     return None
 
 
-def _creation_time(probe: dict[str, Any]) -> str | None:
+def _metadata_tag(probe: dict[str, Any], *keys: str) -> str | None:
     containers: list[dict[str, Any]] = []
     format_data = probe.get("format")
     if isinstance(format_data, dict):
         containers.append(format_data)
     containers.extend(stream for stream in probe.get("streams", []) if isinstance(stream, dict))
+    lowered_containers: list[dict[str, Any]] = []
     for container in containers:
         tags = container.get("tags", {})
         if not isinstance(tags, dict):
             continue
-        lowered = {str(key).casefold(): value for key, value in tags.items()}
-        for key in ("creation_time", "com.apple.quicktime.creationdate", "date"):
+        lowered_containers.append(
+            {str(key).casefold(): value for key, value in tags.items()}
+        )
+    # Honor tag priority across all containers. A generic format creation_time
+    # must never beat an original QuickTime creation date stored on a stream.
+    for key in keys:
+        for lowered in lowered_containers:
             if lowered.get(key):
                 return str(lowered[key])
     return None
+
+
+def _creation_time(probe: dict[str, Any]) -> str | None:
+    # Photos exports can stamp the export time into generic creation_time while
+    # preserving the original capture time in the QuickTime tag.
+    return _metadata_tag(
+        probe,
+        "com.apple.quicktime.creationdate",
+        "creation_time",
+        "date",
+    )
+
+
+def _source_kind(
+    relative_path: Path,
+    camera_make: str | None,
+    camera_model: str | None,
+) -> str:
+    name = relative_path.name.casefold()
+    make = (camera_make or "").casefold()
+    model = (camera_model or "").casefold()
+    if name.startswith("_talkv_"):
+        return "shared"
+    if "iphone" in model or make == "apple":
+        return "phone"
+    if "dji" in make or "dji" in model or name.startswith("dji_"):
+        return "action_camera"
+    return "unknown"
+
+
+def _source_stream_id(
+    relative_path: Path,
+    *,
+    source_kind: str,
+    camera_make: str | None,
+    camera_model: str | None,
+) -> str:
+    if camera_model:
+        identity = {
+            "kind": source_kind,
+            "make": (camera_make or "").strip().casefold(),
+            "model": camera_model.strip().casefold(),
+        }
+    elif source_kind == "shared":
+        identity = {"kind": "shared", "channel": "talkv"}
+    else:
+        parents = [part.casefold() for part in relative_path.parts[:-1]]
+        identity = {
+            "kind": source_kind,
+            "folder": parents[-1] if parents else "root",
+        }
+    return "stream_" + stable_hash(identity, length=12)
+
+
+def _capture_time_confidence(
+    capture_source: str,
+    override: dict[str, Any] | None,
+) -> str:
+    configured = str((override or {}).get("confidence", "")).strip().casefold()
+    if configured in {"high", "medium", "low"}:
+        return configured
+    if capture_source in {"metadata", "date_override:metadata", "override"}:
+        return "high"
+    if capture_source in {"filename", "date_override:filename"}:
+        return "medium"
+    return "low"
 
 
 def _parse_datetime(value: str, timezone: ZoneInfo) -> datetime:
@@ -523,6 +653,11 @@ def _parse_datetime_raw(value: str) -> datetime:
     text = value.strip()
     if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
+    # Apple QuickTime commonly writes local offsets as ``-1000`` instead of
+    # the colonized ISO 8601 form ``-10:00``.  Python 3.11+ accepts both, but
+    # normalize explicitly so capture ordering stays stable on every supported
+    # runtime and in tools that reuse this parser.
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)
     try:
         return datetime.fromisoformat(text)
     except ValueError as exc:

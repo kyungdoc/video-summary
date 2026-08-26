@@ -44,6 +44,7 @@ from video_summary.renderer import (
     source_output_timing,
     source_cache_namespace,
     story_flow_coverage,
+    videotoolbox_download_pixel_format,
     write_chapters,
     write_timeline,
     write_trip_day_chapters,
@@ -1716,6 +1717,65 @@ class RendererTests(unittest.TestCase):
             "videotoolbox",
         )
         self.assertNotIn("-hwaccel", software_args)
+
+    def test_source_piece_uses_matching_videotoolbox_download_format_for_hdr(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        item = candidate("hdr-eight-bit", "2026-08-19T08:00:00+09:00", 0.0)
+        item.end = 5.0
+        segment = PlanSegment(item.candidate_id, "journey", "")
+        clip = Clip(
+            clip_id="clip",
+            path="/hdr-eight-bit.mp4",
+            relative_path="hdr-eight-bit.mp4",
+            fingerprint="hdr-eight-bit-fp",
+            size_bytes=1,
+            duration=10.0,
+            captured_at=item.captured_at,
+            capture_source="metadata",
+            day_key=item.day_key,
+            travel_day=1,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            codec="hevc",
+            rotation=270,
+            has_audio=True,
+            pix_fmt="yuv420p",
+            color_space="bt2020nc",
+            color_transfer="arib-std-b67",
+            color_primaries="bt2020",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("video_summary.renderer.ffmpeg_filter_available", return_value=True),
+            patch("video_summary.renderer.cached_piece_is_usable", side_effect=[False, True]),
+            patch("video_summary.renderer.run_command") as run,
+            patch("video_summary.renderer.os.replace"),
+        ):
+            render_source_piece(
+                segment,
+                item,
+                clip,
+                Path(tmpdir),
+                Path(tmpdir),
+                1280,
+                720,
+                30,
+                "h264_videotoolbox",
+                "4M",
+                config,
+                location_overlay=None,
+                fade_in=False,
+                fade_out=False,
+                force=False,
+            )
+
+        args = run.call_args.args[0]
+        filters = args[args.index("-filter_complex") + 1]
+        self.assertIn("hwdownload,format=nv12,format=yuv420p", filters)
+        self.assertEqual(videotoolbox_download_pixel_format(clip), "nv12")
+        clip.pix_fmt = "yuv420p10le"
+        self.assertEqual(videotoolbox_download_pixel_format(clip), "p010le")
 
     def test_atempo_filter_chain_supports_three_and_four_times_speed(self) -> None:
         self.assertEqual(atempo_filter_chain(1.0), "atempo=1.000000")

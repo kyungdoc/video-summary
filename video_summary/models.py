@@ -34,6 +34,11 @@ class Clip:
     color_primaries: str | None = None
     color_range: str | None = None
     dolby_vision_profile: int | None = None
+    camera_make: str | None = None
+    camera_model: str | None = None
+    source_kind: str = "unknown"
+    source_stream_id: str | None = None
+    capture_time_confidence: str = "medium"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -84,6 +89,9 @@ class Candidate:
     importance: str = "supporting"
     speed_policy: str = "protected_1x"
     exclusion_reason: str | None = None
+    source_stream_id: str | None = None
+    capture_time_confidence: str = "medium"
+    angle_group_id: str | None = None
 
     @property
     def duration(self) -> float:

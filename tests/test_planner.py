@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,13 +11,16 @@ from video_summary.models import Candidate
 from video_summary.planner import (
     PACING_REVEAL_CUES,
     _adaptive_compression_speeds,
+    _candidate_wallclock_seconds,
     _clip_source_families,
     _contact_sheet_day_keys,
     _planner_candidates_payload,
+    _playful_alternate_angle,
     _pacing_cue_count,
     _prompt_role_weights,
     _sample_contact_sheets,
     _select_day_candidates,
+    _suppress_repeated_angle_groups,
     build_contact_sheets,
     build_planner_request,
     local_plan,
@@ -84,6 +88,113 @@ def meal_context_candidate(
 
 
 class PlannerTests(unittest.TestCase):
+    def test_candidate_wallclock_does_not_add_source_start_twice(self) -> None:
+        item = candidate(
+            "offset",
+            "2026-11-01T08:01:00-05:00",
+            start=60.0,
+        )
+        expected = datetime.fromisoformat(item.captured_at).timestamp()
+        self.assertEqual(_candidate_wallclock_seconds(item), expected)
+
+    def test_multicamera_angle_group_keeps_one_best_body_and_preserves_reaction(self) -> None:
+        lower = candidate("lower-angle", "2026-11-01T08:00:00-05:00")
+        better = candidate("better-angle", "2026-11-01T08:00:00-05:00")
+        reaction = candidate("reaction-angle", "2026-11-01T08:00:06-05:00")
+        lower.angle_group_id = "angle-action"
+        better.angle_group_id = "angle-action"
+        reaction.angle_group_id = "angle-reaction"
+        lower.story_stage = better.story_stage = "action"
+        reaction.story_stage = "reaction"
+        lower.score = 0.2
+        lower.visual_quality = 0.2
+        better.score = 0.9
+        better.visual_quality = 0.9
+
+        selected = _suppress_repeated_angle_groups(
+            [lower, better, reaction],
+            set(),
+            {},
+            tone_profile="playful",
+        )
+
+        self.assertEqual(
+            {item.candidate_id for item in selected},
+            {"better-angle", "reaction-angle"},
+        )
+
+    def test_multicamera_meal_one_of_keeps_only_the_forced_representative(self) -> None:
+        first = meal_candidate(
+            "meal-first",
+            "2026-11-01T12:00:00-05:00",
+            ["meal-event"],
+        )
+        second = meal_candidate(
+            "meal-second",
+            "2026-11-01T12:00:00-05:00",
+            ["meal-event"],
+        )
+        first.angle_group_id = second.angle_group_id = "angle-meal"
+        selected = _suppress_repeated_angle_groups(
+            [first, second],
+            {first.candidate_id},
+            {},
+            tone_profile="playful",
+        )
+        self.assertEqual(
+            [item.candidate_id for item in selected],
+            [first.candidate_id],
+        )
+
+    def test_low_confidence_timestamp_is_not_an_automatic_alternate_angle(self) -> None:
+        selected = candidate("native", "2026-11-01T12:00:00-05:00")
+        inferred = candidate("shared", "2026-11-01T12:00:05-05:00")
+        selected.story_event_id = inferred.story_event_id = "pool"
+        selected.source_stream_id = "phone-a"
+        inferred.source_stream_id = "shared-b"
+        inferred.capture_time_confidence = "low"
+
+        cutaway = _playful_alternate_angle(
+            [selected, inferred],
+            [selected],
+            {
+                selected.clip_id: "phone-a",
+                inferred.clip_id: "shared-b",
+            },
+            {},
+        )
+
+        self.assertIsNone(cutaway)
+
+    def test_multicamera_meal_group_keeps_minimum_disjoint_contract_cover(self) -> None:
+        meal_one_a = meal_candidate(
+            "meal-one-a", "2026-11-01T12:00:00-05:00", ["meal-1"]
+        )
+        meal_two = meal_candidate(
+            "meal-two", "2026-11-01T12:00:01-05:00", ["meal-2"]
+        )
+        meal_one_b = meal_candidate(
+            "meal-one-b", "2026-11-01T12:00:02-05:00", ["meal-1"]
+        )
+        for item in (meal_one_a, meal_two, meal_one_b):
+            item.angle_group_id = "angle-meal"
+
+        selected = _suppress_repeated_angle_groups(
+            [meal_one_a, meal_two, meal_one_b],
+            {item.candidate_id for item in (meal_one_a, meal_two, meal_one_b)},
+            {},
+            tone_profile="playful",
+        )
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(
+            {
+                event_id
+                for item in selected
+                for event_id in item.required_meal_event_ids
+            },
+            {"meal-1", "meal-2"},
+        )
     def setUp(self) -> None:
         self.config = copy.deepcopy(DEFAULT_CONFIG)
         self.config["project"]["name"] = "Test Trip"
@@ -744,6 +855,10 @@ class PlannerTests(unittest.TestCase):
             request,
         )
         self.assertIn("각 이벤트의 one_of 후보 중 최소 1개", request)
+        self.assertIn(
+            "capture_time_confidence=low 후보의 시각은 수동 추정 anchor",
+            request,
+        )
         self.assertIn("speed=1.0, role=food", request)
         self.assertIn(
             "required_meal_event_ids와 required_meal_context_ids가 모두 비어 있는 후보는 필수가 아닙니다",
@@ -1861,6 +1976,78 @@ class PlannerTests(unittest.TestCase):
                         "hash",
                         planner_name,
                     )
+
+    def test_external_plan_rejects_redundant_third_view_in_one_angle_group(self) -> None:
+        meal_one_a = meal_candidate(
+            "meal_one_a", "2026-11-01T09:00:00-05:00", ["meal_1"]
+        )
+        meal_two = meal_candidate(
+            "meal_two", "2026-11-01T09:00:01-05:00", ["meal_2"]
+        )
+        meal_one_b = meal_candidate(
+            "meal_one_b", "2026-11-01T09:00:02-05:00", ["meal_1"]
+        )
+        for item in (meal_one_a, meal_two, meal_one_b):
+            item.angle_group_id = "angle-meal"
+        candidates = [self.candidates[0], meal_one_a, meal_two, meal_one_b]
+        payload = self.valid_payload()
+        payload["episodes"][0]["segments"] = [
+            payload["episodes"][0]["segments"][0],
+            *(
+                {
+                    "candidate_id": item.candidate_id,
+                    "role": "food",
+                    "reason": "식사 계약",
+                    "speed": 1.0,
+                }
+                for item in (meal_one_a, meal_two, meal_one_b)
+            ),
+        ]
+
+        with self.assertRaisesRegex(
+            VideoSummaryError,
+            "동시 촬영 앵글 그룹을 불필요하게 반복",
+        ):
+            validate_and_normalize_plan(
+                payload, self.config, "x", candidates, "hash", "file"
+            )
+
+    def test_external_plan_allows_interview_and_unique_meal_in_one_angle_group(self) -> None:
+        interview = candidate("interview", "2026-11-01T09:00:00-05:00")
+        interview.required_event_ids = ["family_interview"]
+        interview.roles = ["interview"]
+        meal = meal_candidate(
+            "meal", "2026-11-01T09:00:01-05:00", ["meal_1"]
+        )
+        interview.angle_group_id = meal.angle_group_id = "angle-contracts"
+        candidates = [self.candidates[0], interview, meal]
+        payload = self.valid_payload()
+        payload["episodes"][0]["segments"] = [
+            payload["episodes"][0]["segments"][0],
+            {
+                "candidate_id": interview.candidate_id,
+                "role": "interview",
+                "reason": "가족 인터뷰",
+                "location": None,
+                "caption": None,
+                "speed": 1.0,
+            },
+            {
+                "candidate_id": meal.candidate_id,
+                "role": "food",
+                "reason": "고유 식사 계약",
+                "speed": 1.0,
+            },
+        ]
+
+        plan = validate_and_normalize_plan(
+            payload, self.config, "x", candidates, "hash", "file"
+        )
+
+        self.assertEqual(
+            [segment.candidate_id for segment in plan.episodes[0].segments],
+            ["c1", "interview", "meal"],
+        )
 
     def test_meal_option_contract_defers_to_interview_and_transition_roles(self) -> None:
         interview = meal_candidate(

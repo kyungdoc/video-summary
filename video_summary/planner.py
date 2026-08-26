@@ -34,7 +34,7 @@ ALLOWED_ROLES = {
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
 MAX_CODEX_CONTACT_SHEETS = 20
 CONTACT_SHEET_CANDIDATES = 12
-STORY_SELECTION_POLICY_VERSION = 6
+STORY_SELECTION_POLICY_VERSION = 8
 MAX_PLAN_SPEED = 4.0
 STORY_RUN_GAP_SECONDS = 2.0
 STORY_COVERAGE_RUN_MAX_SECONDS = 36.0
@@ -167,6 +167,21 @@ def _clip_source_families(paths: ProjectPaths) -> dict[str, str]:
     return result
 
 
+def _candidate_source_streams(
+    candidates: list[Candidate],
+    source_families: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve opaque camera streams while retaining legacy folder behavior."""
+    families = source_families or {}
+    result: dict[str, str] = {}
+    for candidate in candidates:
+        result[candidate.clip_id] = (
+            candidate.source_stream_id
+            or f"legacy:{families.get(candidate.clip_id, 'primary')}"
+        )
+    return result
+
+
 def _eligible_planner_candidates(candidates: list[Candidate]) -> list[Candidate]:
     return [candidate for candidate in candidates if not candidate.exclusion_reason]
 
@@ -192,10 +207,11 @@ def _plan_cache_key(
     plan_file_key: str | None,
     strict_planner: bool,
     source_families: dict[str, str] | None = None,
+    source_streams: dict[str, str] | None = None,
 ) -> str:
     return stable_hash(
         {
-            "version": 23,
+            "version": 24,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "candidate_policy_versions": _normalized_candidate_policy_versions(
@@ -209,6 +225,7 @@ def _plan_cache_key(
             "pacing_profile": _configured_pacing_profile(config),
             "tone_profile": _configured_tone_profile(config),
             "source_families": source_families or {},
+            "source_streams": source_streams or {},
             "selection_strategy": config["editing"].get("selection_strategy", "event_flow"),
             "adaptive_fast_forward": config["editing"].get("adaptive_fast_forward", True),
             "max_fast_forward_speed": config["editing"].get("max_fast_forward_speed", 3.0),
@@ -235,6 +252,7 @@ def plan_project(
     candidates = load_candidates(paths, config)
     candidates_payload = read_json(paths.candidates)
     source_families = _clip_source_families(paths)
+    source_streams = _candidate_source_streams(candidates, source_families)
     candidate_set_hash = str(candidates_payload["candidate_set_hash"])
     candidate_policy_versions = _normalized_candidate_policy_versions(
         candidates_payload.get("policy_versions")
@@ -262,6 +280,7 @@ def plan_project(
         plan_file_key=plan_file_key,
         strict_planner=strict_planner,
         source_families=source_families,
+        source_streams=source_streams,
     )
     state = StateStore(paths.state)
     if not force and paths.plan.exists() and state.is_complete("plan", cache_key):
@@ -293,6 +312,7 @@ def plan_project(
                 candidates,
                 candidate_set_hash,
                 source_family_by_clip=source_families,
+                source_stream_by_clip=source_streams,
             )
         elif planner_name == "file":
             payload = parse_json_strict(plan_file_path.read_text(encoding="utf-8"))
@@ -335,6 +355,7 @@ def plan_project(
                     candidates,
                     candidate_set_hash,
                     source_family_by_clip=source_families,
+                    source_stream_by_clip=source_streams,
                 )
                 plan.planner = f"local-fallback-from-{planner_name}"
                 fallback_error = str(exc)
@@ -359,6 +380,7 @@ def local_plan(
     candidate_set_hash: str,
     *,
     source_family_by_clip: dict[str, str] | None = None,
+    source_stream_by_clip: dict[str, str] | None = None,
 ) -> EditPlan:
     grouped: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
@@ -377,6 +399,7 @@ def local_plan(
             pacing_profile=pacing_profile,
             tone_profile=tone_profile,
             source_family_by_clip=source_family_by_clip,
+            source_stream_by_clip=source_stream_by_clip,
         )
         speed_by_id = _adaptive_compression_speeds(
             selected,
@@ -557,6 +580,8 @@ def validate_and_normalize_plan(
         segments: list[PlanSegment] = []
         chronology: list[tuple[float, float, str]] = []
         selected_ranges: dict[str, list[Candidate]] = defaultdict(list)
+        selected_angle_groups: dict[str, list[Candidate]] = defaultdict(list)
+        selected_episode_candidates: list[Candidate] = []
         runtime_by_candidate: dict[str, float] = {}
         for index, raw_segment in enumerate(raw_segments):
             if not isinstance(raw_segment, dict):
@@ -580,6 +605,9 @@ def validate_and_normalize_plan(
                         f"같은 원본 클립의 선택 구간이 겹칩니다: {previous.candidate_id}, {candidate_id}"
                     )
             selected_ranges[candidate.clip_id].append(candidate)
+            if candidate.angle_group_id:
+                selected_angle_groups[candidate.angle_group_id].append(candidate)
+            selected_episode_candidates.append(candidate)
             role = _safe_text(raw_segment["role"], "role", 24)
             if role not in ALLOWED_ROLES:
                 raise VideoSummaryError(f"허용되지 않은 role입니다: {role}")
@@ -688,6 +716,17 @@ def validate_and_normalize_plan(
         expected_earliest = min(eligible_day_candidates, key=_candidate_sort_key)
         if segments[0].candidate_id != expected_earliest.candidate_id:
             raise VideoSummaryError(f"{day_key}는 가장 이른 후보를 첫 장면으로 포함해야 합니다.")
+        for angle_group_id, angle_candidates in selected_angle_groups.items():
+            removable = _removable_angle_repeat_candidates(
+                angle_candidates,
+                selected_episode_candidates,
+                anchor_candidate_id=expected_earliest.candidate_id,
+            )
+            if removable:
+                raise VideoSummaryError(
+                    "같은 동시 촬영 앵글 그룹을 불필요하게 반복 선택했습니다: "
+                    f"{angle_group_id} ({', '.join(item.candidate_id for item in removable)})"
+                )
         target_value = raw_episode["target_duration"]
         if isinstance(target_value, bool) or not isinstance(target_value, (int, float)):
             raise VideoSummaryError("target_duration은 숫자여야 합니다.")
@@ -812,6 +851,7 @@ def build_planner_request(
         "대사가 적거나 없어도 scenery 역할이거나 visual_quality가 높은 안정적인 화면은 날짜별 시각 앵커로 포함하세요.",
         "여정의 시작·이동·주요 장소·음식·사람들의 반응·마무리가 균형 있게 드러나야 합니다.",
         "비슷한 장면을 반복하지 말고 현재 tone profile의 우선순위를 따르되 날짜별 맥락을 보존하세요.",
+        "capture_time_confidence=low 후보의 시각은 수동 추정 anchor일 수 있습니다. 근접 시각만으로 다른 source stream과 동시 촬영이라고 간주하거나 자동 cutaway로 교차 편집하지 말고, 해당 후보 자체의 장소·행동·전사와 전후 event-flow 근거로만 독립 배치하세요.",
         "모든 날짜에 최소 하나의 segment를 선택하고 JSON Schema에 맞는 JSON object만 반환하세요.",
         "",
         f"Project: {config['project']['name']}",
@@ -956,6 +996,7 @@ def _planner_candidates_payload(
             "complete_source_runs": True,
             "omit_weak_fragments": True,
             "omit_near_duplicates": True,
+            "multicamera_angle_policy": "select_one_per_angle_group_except_required_contracts",
             "pacing_profile": pacing_profile,
             "tone_profile": tone_profile,
             "tone_scope": "within_event_ranking_and_eligible_bridge_rhythm_only",
@@ -1013,6 +1054,9 @@ def _planner_candidates_payload(
                 "travel_day": item.travel_day,
                 "captured_at": item.captured_at,
                 "source_group": item.clip_id,
+                "source_stream_id": item.source_stream_id,
+                "capture_time_confidence": item.capture_time_confidence,
+                "angle_group_id": item.angle_group_id,
                 "source_start": item.start,
                 "source_end": item.end,
                 "duration": item.duration,
@@ -1340,6 +1384,7 @@ def _select_day_candidates(
     pacing_profile: str | None = None,
     tone_profile: str | None = None,
     source_family_by_clip: dict[str, str] | None = None,
+    source_stream_by_clip: dict[str, str] | None = None,
 ) -> list[Candidate]:
     deduped = _dedupe_candidates(
         [item for item in candidates if not item.exclusion_reason]
@@ -1386,6 +1431,7 @@ def _select_day_candidates(
         weights,
         tone_profile=tone_profile,
         source_family_by_clip=source_family_by_clip,
+        source_stream_by_clip=source_stream_by_clip,
     )
 
 
@@ -1397,6 +1443,7 @@ def _compact_day_selection_for_pacing(
     *,
     tone_profile: str | None = None,
     source_family_by_clip: dict[str, str] | None = None,
+    source_stream_by_clip: dict[str, str] | None = None,
 ) -> list[Candidate]:
     """Keep every selected event while compacting repetition inside it.
 
@@ -1425,12 +1472,17 @@ def _compact_day_selection_for_pacing(
     )
 
     kept_ids: set[str] = set()
-    iphone_cutaway_event_ids = {
-        item.story_event_id
-        for item in selected
-        if item.story_event_id
-        and source_family_by_clip
-        and source_family_by_clip.get(item.clip_id) == "iphone"
+    effective_source_streams = source_stream_by_clip or source_family_by_clip or {}
+    selected_streams_by_event: dict[str, set[str]] = defaultdict(set)
+    for item in selected:
+        if item.story_event_id and item.capture_time_confidence != "low":
+            selected_streams_by_event[item.story_event_id].add(
+                effective_source_streams.get(item.clip_id, item.clip_id)
+            )
+    alternate_angle_event_ids = {
+        event_id
+        for event_id, streams in selected_streams_by_event.items()
+        if len(streams) > 1
     }
     ordered_groups = _pacing_event_groups(selected)
     for values in ordered_groups:
@@ -1567,22 +1619,34 @@ def _compact_day_selection_for_pacing(
                 event_kept.append(beat)
                 used += beat.duration
 
-        if tone_profile == "playful" and source_family_by_clip:
+        event_kept = _suppress_repeated_angle_groups(
+            event_kept,
+            forced_ids,
+            prompt_role_weights,
+            tone_profile=tone_profile,
+            anchor_candidate_id=min(
+                day_candidates,
+                key=_candidate_sort_key,
+            ).candidate_id,
+        )
+        used = used_duration(event_kept)
+
+        if tone_profile == "playful" and effective_source_streams:
             event_ids = {
                 item.story_event_id for item in values if item.story_event_id
             }
             for event_id in sorted(event_ids):
-                if event_id in iphone_cutaway_event_ids:
+                if event_id in alternate_angle_event_ids:
                     continue
                 event_values = [
                     item
                     for item in day_candidates
                     if item.story_event_id == event_id
                 ]
-                cutaway = _playful_iphone_cutaway(
+                cutaway = _playful_alternate_angle(
                     event_values,
                     event_kept,
-                    source_family_by_clip,
+                    effective_source_streams,
                     prompt_role_weights,
                 )
                 if (
@@ -1593,7 +1657,7 @@ def _compact_day_selection_for_pacing(
                 ):
                     event_kept.append(cutaway)
                     used += cutaway.duration
-                    iphone_cutaway_event_ids.add(event_id)
+                    alternate_angle_event_ids.add(event_id)
 
         remaining = [
             item
@@ -1602,8 +1666,19 @@ def _compact_day_selection_for_pacing(
             not in {current.candidate_id for current in event_kept}
             and item.duration >= 0.5
         ]
+        represented_angle_groups = {
+            item.angle_group_id for item in event_kept if item.angle_group_id
+        }
         while remaining:
-            fitting = [item for item in remaining if used + item.duration <= envelope + 1e-6]
+            fitting = [
+                item
+                for item in remaining
+                if used + item.duration <= envelope + 1e-6
+                and (
+                    not item.angle_group_id
+                    or item.angle_group_id not in represented_angle_groups
+                )
+            ]
             if not fitting:
                 break
             def fill_rank(item: Candidate) -> tuple[Any, ...]:
@@ -1627,6 +1702,8 @@ def _compact_day_selection_for_pacing(
             event_kept.append(chosen)
             remaining.remove(chosen)
             used += chosen.duration
+            if chosen.angle_group_id:
+                represented_angle_groups.add(chosen.angle_group_id)
 
         kept_ids.update(item.candidate_id for item in event_kept)
 
@@ -1693,7 +1770,8 @@ def _pacing_narrative_cue_groups(
 
 
 def _candidate_wallclock_seconds(candidate: Candidate) -> float:
-    return _candidate_sort_key(candidate)[0] + candidate.start
+    # Candidate.captured_at already includes its source-relative start offset.
+    return _candidate_sort_key(candidate)[0]
 
 
 def _playful_chain_candidates(
@@ -1807,59 +1885,153 @@ def _playful_chain_candidates(
     )
 
 
-def _playful_iphone_cutaway(
+def _suppress_repeated_angle_groups(
+    candidates: list[Candidate],
+    forced_ids: set[str],
+    prompt_role_weights: dict[str, float],
+    *,
+    tone_profile: str | None,
+    anchor_candidate_id: str | None = None,
+) -> list[Candidate]:
+    grouped: dict[str, list[Candidate]] = defaultdict(list)
+    kept: list[Candidate] = []
+    for candidate in candidates:
+        if candidate.angle_group_id:
+            grouped[candidate.angle_group_id].append(candidate)
+        else:
+            kept.append(candidate)
+    for values in grouped.values():
+        protected = [
+            item
+            for item in values
+            if _is_required_interview(item)
+            or _is_required_transition(item)
+            or item.candidate_id == anchor_candidate_id
+        ]
+        selected = {item.candidate_id: item for item in protected}
+        required_meal_keys = {
+            key
+            for item in values
+            if item.candidate_id in forced_ids
+            for key in _required_meal_contract_keys(item)
+        }
+        covered_meal_keys = {
+            key
+            for item in selected.values()
+            for key in _required_meal_contract_keys(item)
+        }
+        missing_meal_keys = required_meal_keys - covered_meal_keys
+        while missing_meal_keys:
+            options = [
+                item
+                for item in values
+                if item.candidate_id not in selected
+                and missing_meal_keys.intersection(
+                    _required_meal_contract_keys(item)
+                )
+            ]
+            if not options:
+                break
+            chosen = max(
+                options,
+                key=lambda item: (
+                    len(
+                        missing_meal_keys.intersection(
+                            _required_meal_contract_keys(item)
+                        )
+                    ),
+                    item.candidate_id in forced_ids,
+                    _pacing_candidate_rank(
+                        item,
+                        prompt_role_weights,
+                        tone_profile=tone_profile,
+                    ),
+                ),
+            )
+            selected[chosen.candidate_id] = chosen
+            missing_meal_keys.difference_update(
+                _required_meal_contract_keys(chosen)
+            )
+        if not selected:
+            best = max(
+                values,
+                key=lambda item: _pacing_candidate_rank(
+                    item,
+                    prompt_role_weights,
+                    tone_profile=tone_profile,
+                ),
+            )
+            selected[best.candidate_id] = best
+        kept.extend(selected.values())
+    return sorted(kept, key=_candidate_sort_key)
+
+
+def _playful_alternate_angle(
     event_candidates: list[Candidate],
     selected: list[Candidate],
-    source_family_by_clip: dict[str, str],
+    source_stream_by_clip: dict[str, str],
     prompt_role_weights: dict[str, float],
 ) -> Candidate | None:
-    """Choose at most one nearby iPhone angle as an optional event cutaway."""
-    if not event_candidates or any(
-        _is_required_interview(item) or "interview" in item.roles
+    """Choose at most one nearby, non-duplicate alternate camera view."""
+    reliable_event_candidates = [
+        item
         for item in event_candidates
+        if item.capture_time_confidence != "low"
+    ]
+    if not reliable_event_candidates or any(
+        _is_required_interview(item) or "interview" in item.roles
+        for item in reliable_event_candidates
     ):
         return None
     event_ids = {
-        item.story_event_id for item in event_candidates if item.story_event_id
+        item.story_event_id
+        for item in reliable_event_candidates
+        if item.story_event_id
     }
     selected_event = [
         item
         for item in selected
         if item.story_event_id in event_ids
+        and item.capture_time_confidence != "low"
     ]
-    if not selected_event or any(
-        source_family_by_clip.get(item.clip_id) == "iphone"
-        for item in selected_event
-    ):
+    if not selected_event:
         return None
-    primary = [
-        item
+    selected_streams = {
+        source_stream_by_clip.get(item.clip_id, item.clip_id)
         for item in selected_event
-        if source_family_by_clip.get(item.clip_id, "primary") != "iphone"
-    ]
-    if not primary:
+    }
+    if len(selected_streams) > 1:
         return None
+    represented_angle_groups = {
+        item.angle_group_id for item in selected_event if item.angle_group_id
+    }
     selected_ids = {item.candidate_id for item in selected}
     options = [
         item
-        for item in event_candidates
-        if source_family_by_clip.get(item.clip_id) == "iphone"
+        for item in reliable_event_candidates
+        if source_stream_by_clip.get(item.clip_id, item.clip_id)
+        not in selected_streams
         and item.candidate_id not in selected_ids
         and not item.exclusion_reason
         and not _has_required_meal(item)
+        and (
+            not item.angle_group_id
+            or item.angle_group_id not in represented_angle_groups
+        )
         and 2.0 <= item.duration <= 8.0
         and min(
             abs(
                 _candidate_wallclock_seconds(item)
                 - _candidate_wallclock_seconds(current)
             )
-            for current in primary
+            for current in selected_event
         )
         <= 45.0
     ]
     return max(
         options,
         key=lambda item: (
+            item.story_stage in {"reaction", "outcome"},
             _pacing_candidate_rank(
                 item,
                 prompt_role_weights,
@@ -1870,7 +2042,7 @@ def _playful_iphone_cutaway(
                     _candidate_wallclock_seconds(item)
                     - _candidate_wallclock_seconds(current)
                 )
-                for current in primary
+                for current in selected_event
             ),
         ),
         default=None,
@@ -2552,6 +2724,46 @@ def _required_meal_context_ids(candidate: Candidate) -> tuple[str, ...]:
 
 def _has_required_meal(candidate: Candidate) -> bool:
     return bool(_required_meal_event_ids(candidate) or _required_meal_context_ids(candidate))
+
+
+def _required_meal_contract_keys(candidate: Candidate) -> frozenset[str]:
+    return frozenset(
+        {
+            *(f"event:{value}" for value in _required_meal_event_ids(candidate)),
+            *(f"context:{value}" for value in _required_meal_context_ids(candidate)),
+        }
+    )
+
+
+def _removable_angle_repeat_candidates(
+    angle_candidates: list[Candidate],
+    selected_candidates: list[Candidate],
+    *,
+    anchor_candidate_id: str,
+) -> list[Candidate]:
+    """Return repeated views that satisfy no unique selection contract."""
+    if len(angle_candidates) < 2:
+        return []
+    removable: list[Candidate] = []
+    for candidate in angle_candidates:
+        if (
+            candidate.candidate_id == anchor_candidate_id
+            or _is_required_interview(candidate)
+            or _is_required_transition(candidate)
+        ):
+            continue
+        candidate_keys = _required_meal_contract_keys(candidate)
+        uniquely_covered = any(
+            not any(
+                other.candidate_id != candidate.candidate_id
+                and key in _required_meal_contract_keys(other)
+                for other in selected_candidates
+            )
+            for key in candidate_keys
+        )
+        if not uniquely_covered:
+            removable.append(candidate)
+    return removable
 
 
 def _meal_event_option_groups(candidates: list[Candidate]) -> dict[str, list[Candidate]]:

@@ -6,9 +6,12 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from .media import VISUAL_SIGNAL_POLICY_VERSION, analyze_visual_signals, extract_frame, load_clips, resolve_location
 from .models import Candidate, Clip, TranscriptCue
@@ -54,6 +57,7 @@ INTERVIEW_EVENT_MAX_SPAN_SECONDS = 180.0
 INTERVIEW_CONTEXT_EVENT_MAX_DISTANCE_SECONDS = 90.0
 FULL_COVERAGE_PARTITION_POLICY_VERSION = 1
 STORY_EVENT_CATALOG_POLICY_VERSION = 3
+MULTICAMERA_ANGLE_POLICY_VERSION = 1
 STORY_EVENT_GAP_SECONDS = 5.0 * 60.0
 STORY_EVENT_MAX_SPAN_SECONDS = 45.0 * 60.0
 
@@ -812,7 +816,7 @@ def build_candidates(
                     length=18,
                 )
                 frame_path = paths.frames / f"{candidate_id}.jpg"
-                if force or not frame_path.exists():
+                if _candidate_frame_needs_extraction(frame_path, force=force):
                     extract_frame(clip, (start + end) / 2.0, frame_path)
                 clip_captured_at = datetime.fromisoformat(clip.captured_at)
                 captured_at = (
@@ -841,11 +845,14 @@ def build_candidates(
                         required_meal_context_ids=required_meal_context_ids,
                         origin=origin,
                         exclusion_reason=exclusion_reason,
+                        source_stream_id=clip.source_stream_id,
+                        capture_time_confidence=clip.capture_time_confidence,
                     )
                 )
 
         candidates.sort(key=lambda item: (_candidate_timestamp(item), item.candidate_id))
         _assign_story_event_metadata(candidates)
+        _assign_multicamera_angle_groups(candidates, paths.root)
         if not candidates:
             raise VideoSummaryError("편집 후보를 만들지 못했습니다.")
         required_events = [
@@ -861,6 +868,7 @@ def build_candidates(
                 "meal_event": MEAL_EVENT_POLICY_VERSION,
                 "full_coverage_partition": FULL_COVERAGE_PARTITION_POLICY_VERSION,
                 "story_event_catalog": STORY_EVENT_CATALOG_POLICY_VERSION,
+                "multicamera_angle": MULTICAMERA_ANGLE_POLICY_VERSION,
             },
             "candidate_set_hash": stable_hash([candidate.to_dict() for candidate in candidates], length=32),
             "count": len(candidates),
@@ -881,6 +889,10 @@ def build_candidates(
     except BaseException as exc:
         state.mark_failed("candidates", cache_key, str(exc))
         raise
+
+
+def _candidate_frame_needs_extraction(frame_path: Path, *, force: bool) -> bool:
+    return force or not frame_path.exists() or frame_path.stat().st_size == 0
 
 
 def load_candidates(paths: ProjectPaths, config: dict[str, Any] | None = None) -> list[Candidate]:
@@ -910,7 +922,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 16,
+            "version": 17,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "journey_transition_detection": {
                 "policy": JOURNEY_TRANSITION_POLICY_VERSION,
@@ -926,6 +938,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             },
             "full_coverage_partition": FULL_COVERAGE_PARTITION_POLICY_VERSION,
             "story_event_catalog": STORY_EVENT_CATALOG_POLICY_VERSION,
+            "multicamera_angle": MULTICAMERA_ANGLE_POLICY_VERSION,
             "project": config["project"]["name"],
             "clips": [
                 (
@@ -935,6 +948,8 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
                     clip.day_key,
                     clip.travel_day,
                     clip.location,
+                    clip.source_stream_id,
+                    clip.capture_time_confidence,
                 )
                 for clip in clips
             ],
@@ -1059,6 +1074,167 @@ def _assign_story_event_metadata(candidates: list[Candidate]) -> None:
                 item.story_stage = _candidate_story_stage(item, index, len(cluster))
                 item.importance = _candidate_importance(item, event_is_core)
                 item.speed_policy = _candidate_speed_policy(item)
+
+
+def _assign_multicamera_angle_groups(
+    candidates: list[Candidate],
+    project_root: Path,
+) -> None:
+    """Mark reliable simultaneous views of the same story beat.
+
+    The group is deliberately conservative: two candidates must come from
+    different source streams, share an inferred event, overlap in real capture
+    time, and contain matching audio text or a near-identical representative
+    frame. Ordinal stage labels may differ only when the content match is very
+    strong. Low-confidence timestamps are never grouped, so a manually
+    estimated messenger export cannot suppress an unrelated native clip.
+    """
+    by_event: dict[tuple[str, str], list[Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        candidate.angle_group_id = None
+        if (
+            candidate.story_event_id
+            and candidate.source_stream_id
+            and candidate.capture_time_confidence != "low"
+        ):
+            by_event[(candidate.day_key, candidate.story_event_id)].append(candidate)
+
+    visual_hashes: dict[str, int | None] = {}
+    for event_candidates in by_event.values():
+        if len({item.source_stream_id for item in event_candidates}) < 2:
+            continue
+        ordered = sorted(event_candidates, key=lambda item: (_candidate_timestamp(item), item.candidate_id))
+        components: list[list[Candidate]] = []
+        for candidate in ordered:
+            matching = next(
+                (
+                    component
+                    for component in components
+                    if all(
+                        _same_multicamera_angle(
+                            existing,
+                            candidate,
+                            project_root,
+                            visual_hashes,
+                        )
+                        for existing in component
+                    )
+                ),
+                None,
+            )
+            if matching is None:
+                components.append([candidate])
+            else:
+                matching.append(candidate)
+        for component in components:
+            if len(component) < 2:
+                continue
+            group_id = "angle_" + stable_hash(
+                {
+                    "policy": MULTICAMERA_ANGLE_POLICY_VERSION,
+                    "candidate_ids": sorted(item.candidate_id for item in component),
+                },
+                length=16,
+            )
+            for candidate in component:
+                candidate.angle_group_id = group_id
+
+
+def _same_multicamera_angle(
+    left: Candidate,
+    right: Candidate,
+    project_root: Path,
+    visual_hashes: dict[str, int | None],
+) -> bool:
+    if (
+        left.clip_id == right.clip_id
+        or left.source_stream_id == right.source_stream_id
+        or left.capture_time_confidence == "low"
+        or right.capture_time_confidence == "low"
+    ):
+        return False
+    broad_roles = {"food", "fun", "scenery", "journey", "dialogue", "interview", "transition"}
+    left_roles = set(left.roles) & broad_roles
+    right_roles = set(right.roles) & broad_roles
+    if left_roles and right_roles and left_roles.isdisjoint(right_roles):
+        return False
+    left_start = _candidate_timestamp(left)
+    right_start = _candidate_timestamp(right)
+    overlap = max(
+        0.0,
+        min(left_start + left.duration, right_start + right.duration)
+        - max(left_start, right_start),
+    )
+    if overlap / max(0.001, min(left.duration, right.duration)) < 0.45:
+        return False
+    stage_matches = (
+        _story_stage_bucket(left.story_stage)
+        == _story_stage_bucket(right.story_stage)
+    )
+    left_hash = _candidate_frame_hash(left, project_root, visual_hashes)
+    right_hash = _candidate_frame_hash(right, project_root, visual_hashes)
+    if left_hash is None or right_hash is None:
+        return False
+    visual_similarity = 1.0 - ((left_hash ^ right_hash).bit_count() / 64.0)
+    transcript_similarity = _multicamera_transcript_similarity(
+        left.transcript,
+        right.transcript,
+    )
+    transcript_matches = transcript_similarity >= (
+        0.62 if stage_matches else 0.82
+    )
+    threshold = (
+        0.86
+        if stage_matches and transcript_matches
+        else 0.92
+        if transcript_matches
+        else 0.90
+        if stage_matches
+        else 0.95
+    )
+    return visual_similarity >= threshold
+
+
+def _story_stage_bucket(stage: str) -> str:
+    if stage in {"body", "action"}:
+        return "activity"
+    if stage in {"reaction", "outcome"}:
+        return "reaction"
+    return stage
+
+
+def _multicamera_transcript_similarity(left: str, right: str) -> float:
+    normalize = lambda value: re.sub(r"[^0-9a-z가-힣]+", " ", value.casefold()).strip()
+    normalized_left = normalize(left)
+    normalized_right = normalize(right)
+    if len(normalized_left) < 4 or len(normalized_right) < 4:
+        return 0.0
+    return SequenceMatcher(None, normalized_left, normalized_right).ratio()
+
+
+def _candidate_frame_hash(
+    candidate: Candidate,
+    project_root: Path,
+    cache: dict[str, int | None],
+) -> int | None:
+    if candidate.candidate_id in cache:
+        return cache[candidate.candidate_id]
+    path = project_root / candidate.frame_path
+    try:
+        with Image.open(path) as image:
+            pixels = list(image.convert("L").resize((9, 8)).tobytes())
+    except (OSError, ValueError):
+        cache[candidate.candidate_id] = None
+        return None
+    value = 0
+    for row in range(8):
+        offset = row * 9
+        for column in range(8):
+            value = (value << 1) | int(
+                pixels[offset + column] > pixels[offset + column + 1]
+            )
+    cache[candidate.candidate_id] = value
+    return value
 
 
 def _candidate_explicit_story_event_ids(candidate: Candidate) -> frozenset[str]:

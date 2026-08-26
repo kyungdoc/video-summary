@@ -12,9 +12,13 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from video_summary.media import (
+    _capture_time_confidence,
     _day_key,
     _filename_datetime,
+    _creation_time,
     _rebase_capture_date,
+    _source_kind,
+    _source_stream_id,
     infer_capture_time,
     resolve_location,
 )
@@ -35,6 +39,57 @@ from video_summary.utils import VideoSummaryError
 
 
 class CoreTests(unittest.TestCase):
+    def test_original_quicktime_tag_wins_when_it_is_on_a_different_container(self) -> None:
+        probe = {
+            "format": {"tags": {"creation_time": "2026-08-25T13:19:48Z"}},
+            "streams": [
+                {
+                    "tags": {
+                        "com.apple.quicktime.creationdate": "2025-06-12T10:06:37-1000"
+                    }
+                }
+            ],
+        }
+        self.assertEqual(
+            _creation_time(probe),
+            "2025-06-12T10:06:37-1000",
+        )
+
+    def test_root_iphone_and_shared_export_get_distinct_opaque_streams(self) -> None:
+        phone_path = Path("IMG_6816.MOV")
+        shared_path = Path("_talkv_example_talkv_high.MP4")
+        self.assertEqual(_source_kind(phone_path, "Apple", "iPhone 16 Pro"), "phone")
+        self.assertEqual(_source_kind(shared_path, None, None), "shared")
+        phone_stream = _source_stream_id(
+            phone_path,
+            source_kind="phone",
+            camera_make="Apple",
+            camera_model="iPhone 16 Pro",
+        )
+        same_model_stream = _source_stream_id(
+            Path("IMG_0002.MOV"),
+            source_kind="phone",
+            camera_make="Apple",
+            camera_model="iPhone 16 Pro",
+        )
+        shared_stream = _source_stream_id(
+            shared_path,
+            source_kind="shared",
+            camera_make=None,
+            camera_model=None,
+        )
+        self.assertEqual(phone_stream, same_model_stream)
+        self.assertNotEqual(phone_stream, shared_stream)
+        self.assertNotIn("iphone", phone_stream.casefold())
+
+    def test_manual_timestamp_confidence_can_disable_automatic_angle_deduplication(self) -> None:
+        self.assertEqual(_capture_time_confidence("metadata", None), "high")
+        self.assertEqual(_capture_time_confidence("mtime", None), "low")
+        self.assertEqual(
+            _capture_time_confidence("override", {"confidence": "low"}),
+            "low",
+        )
+
     def test_family_interview_preservation_config_requires_boolean(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         self.assertTrue(config["editing"]["preserve_family_interviews"])
@@ -151,6 +206,46 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(source, "metadata")
         self.assertEqual(captured.isoformat(), "2026-08-18T10:30:45+09:00")
         self.assertTrue(warnings)
+
+    def test_capture_time_prefers_original_quicktime_date_over_photos_export_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "exported-iphone.mov"
+            path.write_bytes(b"x")
+            probe = {
+                "format": {
+                    "tags": {
+                        "creation_time": "2026-08-25T13:19:48Z",
+                        "com.apple.quicktime.creationdate": "2025-12-29T11:29:01+07:00",
+                    }
+                }
+            }
+            captured, source, warnings = infer_capture_time(
+                path, Path(path.name), probe, ZoneInfo("Asia/Ho_Chi_Minh"), []
+            )
+
+        self.assertEqual(source, "metadata")
+        self.assertEqual(captured.isoformat(), "2025-12-29T11:29:01+07:00")
+        self.assertFalse(warnings)
+
+    def test_capture_time_normalizes_compact_quicktime_utc_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "hawaii-iphone.mov"
+            path.write_bytes(b"x")
+            probe = {
+                "format": {
+                    "tags": {
+                        "creation_time": "2025-06-12T20:06:37Z",
+                        "com.apple.quicktime.creationdate": "2025-06-12T10:06:37-1000",
+                    }
+                }
+            }
+            captured, source, warnings = infer_capture_time(
+                path, Path(path.name), probe, ZoneInfo("Pacific/Honolulu"), []
+            )
+
+        self.assertEqual(source, "metadata")
+        self.assertEqual(captured.isoformat(), "2025-06-12T10:06:37-10:00")
+        self.assertFalse(warnings)
 
     def test_invalid_metadata_falls_back_to_filename_with_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -359,6 +454,7 @@ class CoreTests(unittest.TestCase):
             {"match": "0518/*", "date": "not-a-date"},
             {"match": "0518/*", "captured_at": "2026-05-18T10:00:00-07:00", "date": "2026-05-18"},
             {"match": "0518/*", "date": "2026-05-18", "timezone": "Mars/Olympus"},
+            {"match": "0518/*", "date": "2026-05-18", "confidence": "guess"},
         ):
             invalid = copy.deepcopy(DEFAULT_CONFIG)
             invalid["date_overrides"] = [rule]

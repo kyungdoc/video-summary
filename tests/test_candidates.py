@@ -6,16 +6,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+
 from video_summary.candidates import (
     FULL_COVERAGE_PARTITION_POLICY_VERSION,
     INTERVIEW_DETECTION_POLICY_VERSION,
     JOURNEY_TRANSITION_POLICY_VERSION,
     MEAL_EVENT_POLICY_VERSION,
+    MULTICAMERA_ANGLE_POLICY_VERSION,
     PARTY_TRANSITION_CONTEXT_POLICY_VERSION,
     STORY_EVENT_CATALOG_POLICY_VERSION,
     VISUAL_SIGNAL_POLICY_VERSION,
     _assign_story_event_metadata,
+    _assign_multicamera_angle_groups,
     _candidate_exclusion_reason,
+    _candidate_frame_needs_extraction,
     _detect_family_interview_events,
     _detect_interview_events,
     _detect_journey_transition_windows,
@@ -60,7 +65,184 @@ def _clip(
     )
 
 
+def _write_multicamera_frame(
+    root: Path,
+    candidate_id: str,
+    *,
+    reverse: bool = False,
+) -> None:
+    frame = root / "frames" / f"{candidate_id}.jpg"
+    frame.parent.mkdir(parents=True, exist_ok=True)
+    values = [
+        (column * 28 if not reverse else 255 - column * 28)
+        for _row in range(8)
+        for column in range(9)
+    ]
+    image = Image.new("L", (9, 8))
+    image.putdata(values)
+    image.save(frame)
+
+
 class CandidateCoverageTests(unittest.TestCase):
+    def test_multicamera_angle_group_requires_reliable_time_and_matching_story_beat(self) -> None:
+        def view(candidate_id: str, stream: str, confidence: str) -> Candidate:
+            return Candidate(
+                candidate_id=candidate_id,
+                clip_id=f"clip-{candidate_id}",
+                day_key="2026-08-20",
+                travel_day=1,
+                start=0.0,
+                end=5.0,
+                captured_at="2026-08-20T10:00:00+09:00",
+                transcript="지금 수영장에 들어갑니다",
+                roles=["fun"],
+                score=0.8,
+                speech_ratio=0.5,
+                motion_score=0.5,
+                visual_quality=0.8,
+                location=None,
+                frame_path=f"frames/{candidate_id}.jpg",
+                story_event_id="pool-event",
+                story_stage="action",
+                source_stream_id=stream,
+                capture_time_confidence=confidence,
+            )
+
+        first = view("first", "stream-a", "high")
+        second = view("second", "stream-b", "high")
+        uncertain = view("uncertain", "stream-c", "low")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_multicamera_frame(root, "first")
+            _write_multicamera_frame(root, "second")
+            _assign_multicamera_angle_groups(
+                [first, second, uncertain],
+                root,
+            )
+
+        self.assertIsNotNone(first.angle_group_id)
+        self.assertEqual(first.angle_group_id, second.angle_group_id)
+        self.assertIsNone(uncertain.angle_group_id)
+
+    def test_multicamera_angle_groups_do_not_merge_transitive_nonoverlapping_views(self) -> None:
+        def view(candidate_id: str, captured_at: str, stream: str) -> Candidate:
+            return Candidate(
+                candidate_id=candidate_id,
+                clip_id=f"clip-{candidate_id}",
+                day_key="2026-08-20",
+                travel_day=1,
+                start=0.0,
+                end=10.0,
+                captured_at=captured_at,
+                transcript="같은 행사 안내를 듣고 있습니다",
+                roles=["dialogue"],
+                score=0.8,
+                speech_ratio=0.8,
+                motion_score=0.2,
+                visual_quality=0.8,
+                location=None,
+                frame_path=f"frames/{candidate_id}.jpg",
+                story_event_id="event",
+                story_stage="body",
+                source_stream_id=stream,
+                capture_time_confidence="high",
+            )
+
+        first = view("first", "2026-08-20T10:00:00+09:00", "stream-a")
+        middle = view("middle", "2026-08-20T10:00:05+09:00", "stream-b")
+        last = view("last", "2026-08-20T10:00:10+09:00", "stream-c")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for candidate_id in ("first", "middle", "last"):
+                _write_multicamera_frame(root, candidate_id)
+            _assign_multicamera_angle_groups(
+                [first, middle, last],
+                root,
+            )
+
+        self.assertEqual(first.angle_group_id, middle.angle_group_id)
+        self.assertIsNone(last.angle_group_id)
+
+    def test_matching_simultaneous_dialogue_can_group_despite_ordinal_stage_labels(self) -> None:
+        def view(candidate_id: str, stage: str, stream: str) -> Candidate:
+            return Candidate(
+                candidate_id=candidate_id,
+                clip_id=f"clip-{candidate_id}",
+                day_key="2026-08-20",
+                travel_day=1,
+                start=0.0,
+                end=5.0,
+                captured_at="2026-08-20T10:00:00+09:00",
+                transcript="오늘 하와이 바다가 정말 예쁘다",
+                roles=["dialogue"],
+                score=0.8,
+                speech_ratio=0.8,
+                motion_score=0.2,
+                visual_quality=0.8,
+                location=None,
+                frame_path=f"frames/{candidate_id}.jpg",
+                story_event_id="event",
+                story_stage=stage,
+                source_stream_id=stream,
+                capture_time_confidence="high",
+            )
+
+        setup = view("setup", "setup", "stream-a")
+        closure = view("closure", "closure", "stream-b")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_multicamera_frame(root, "setup")
+            _write_multicamera_frame(root, "closure")
+            _assign_multicamera_angle_groups([setup, closure], root)
+
+        self.assertIsNotNone(setup.angle_group_id)
+        self.assertEqual(setup.angle_group_id, closure.angle_group_id)
+
+    def test_matching_audio_with_distinct_views_remains_a_cutaway_option(self) -> None:
+        def view(candidate_id: str, stream: str) -> Candidate:
+            return Candidate(
+                candidate_id=candidate_id,
+                clip_id=f"clip-{candidate_id}",
+                day_key="2026-08-20",
+                travel_day=1,
+                start=0.0,
+                end=5.0,
+                captured_at="2026-08-20T10:00:00+09:00",
+                transcript="수영장에서 지금 같이 놀고 있습니다",
+                roles=["fun"],
+                score=0.8,
+                speech_ratio=0.5,
+                motion_score=0.5,
+                visual_quality=0.8,
+                location=None,
+                frame_path=f"frames/{candidate_id}.jpg",
+                story_event_id="pool-event",
+                story_stage="action",
+                source_stream_id=stream,
+                capture_time_confidence="high",
+            )
+
+        action = view("action", "stream-a")
+        reaction = view("reaction", "stream-b")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_multicamera_frame(root, "action")
+            _write_multicamera_frame(root, "reaction", reverse=True)
+            _assign_multicamera_angle_groups([action, reaction], root)
+
+        self.assertIsNone(action.angle_group_id)
+        self.assertIsNone(reaction.angle_group_id)
+
+    def test_candidate_frame_cache_rejects_an_empty_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            frame = Path(temporary) / "candidate.jpg"
+            self.assertTrue(_candidate_frame_needs_extraction(frame, force=False))
+            frame.write_bytes(b"")
+            self.assertTrue(_candidate_frame_needs_extraction(frame, force=False))
+            frame.write_bytes(b"jpeg")
+            self.assertFalse(_candidate_frame_needs_extraction(frame, force=False))
+            self.assertTrue(_candidate_frame_needs_extraction(frame, force=True))
+
     def test_candidate_from_old_payload_defaults_required_event_ids(self) -> None:
         candidate = Candidate.from_dict(
             {
@@ -107,6 +289,21 @@ class CandidateCoverageTests(unittest.TestCase):
             with patch(
                 "video_summary.candidates.VISUAL_SIGNAL_POLICY_VERSION",
                 VISUAL_SIGNAL_POLICY_VERSION + 1,
+            ):
+                changed = _candidate_cache_key(paths, [clip], config)
+
+        self.assertNotEqual(current, changed)
+
+    def test_candidate_cache_key_tracks_multicamera_angle_policy(self) -> None:
+        clip = _clip(duration=10.0)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            current = _candidate_cache_key(paths, [clip], config)
+            with patch(
+                "video_summary.candidates.MULTICAMERA_ANGLE_POLICY_VERSION",
+                MULTICAMERA_ANGLE_POLICY_VERSION + 1,
             ):
                 changed = _candidate_cache_key(paths, [clip], config)
 
