@@ -325,6 +325,14 @@ def _validate_config(config: dict[str, Any]) -> None:
             raise VideoSummaryError(
                 f"{field}.confidence는 high, medium, low 중 하나여야 합니다."
             )
+        clock_offset = _finite_number(
+            rule.get("clock_offset_seconds", 0.0),
+            f"{field}.clock_offset_seconds",
+        )
+        if not -12 * 3600 <= clock_offset <= 12 * 3600:
+            raise VideoSummaryError(
+                f"{field}.clock_offset_seconds는 -43200~43200 사이여야 합니다."
+            )
     for key in ("intro_seconds", "date_card_seconds", "outro_seconds"):
         duration = _finite_number(render.get(key), key)
         if not 0.1 <= duration <= 30:

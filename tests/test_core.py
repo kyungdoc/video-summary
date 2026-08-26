@@ -12,7 +12,9 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from video_summary.media import (
+    _capture_time_basis,
     _capture_time_confidence,
+    _dji_mimo_capture_datetime,
     _day_key,
     _filename_datetime,
     _creation_time,
@@ -20,7 +22,9 @@ from video_summary.media import (
     _source_kind,
     _source_stream_id,
     infer_capture_time,
+    infer_sequence_time,
     resolve_location,
+    scan_project,
 )
 from video_summary.cli import build_parser, parse_target_minutes
 from video_summary.models import Clip, TranscriptCue
@@ -88,6 +92,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(
             _capture_time_confidence("override", {"confidence": "low"}),
             "low",
+        )
+        self.assertEqual(
+            _capture_time_confidence("metadata", None, source_kind="shared"),
+            "low",
+        )
+        self.assertEqual(
+            _capture_time_basis(
+                "metadata",
+                None,
+                source_kind="shared",
+                sequence_source="metadata",
+            ),
+            "unplaced",
         )
 
     def test_family_interview_preservation_config_requires_boolean(self) -> None:
@@ -194,6 +211,154 @@ class CoreTests(unittest.TestCase):
         parsed = _filename_datetime("DJI_20260819_013045_001_D.MP4", timezone)
         self.assertEqual(parsed, datetime(2026, 8, 19, 1, 30, 45, tzinfo=timezone))
         self.assertIsNone(_filename_datetime("DJI_20261340_999999_001_D.MP4", timezone))
+
+    def test_dji_mimo_uses_second_filename_timestamp_for_sequence(self) -> None:
+        timezone = ZoneInfo("Asia/Ho_Chi_Minh")
+        name = "dji_mimo_20251227_121700_20251227121649_123_video.mp4"
+        self.assertEqual(
+            _dji_mimo_capture_datetime(name, timezone),
+            datetime(2025, 12, 27, 12, 16, 49, tzinfo=timezone),
+        )
+        sequence_at, source, warnings = infer_sequence_time(
+            Path(name),
+            datetime(2025, 12, 27, 10, 16, 50, tzinfo=timezone),
+            "metadata",
+            timezone,
+            None,
+            source_kind="action_camera",
+        )
+        self.assertEqual(sequence_at.isoformat(), "2025-12-27T12:16:49+07:00")
+        self.assertEqual(source, "dji_mimo_filename")
+        self.assertTrue(warnings)
+
+    def test_dji_mimo_date_only_override_rebases_second_filename_timestamp(self) -> None:
+        timezone = ZoneInfo("Asia/Seoul")
+        override = {
+            "match": "day2/*",
+            "date": "2025-12-27",
+            "timezone": "Asia/Ho_Chi_Minh",
+        }
+        sequence_at, source, warnings = infer_sequence_time(
+            Path("dji_mimo_20000101_121700_20000101121649_123_video.mp4"),
+            datetime(2025, 12, 27, 10, 16, 50, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh")),
+            "date_override:metadata",
+            timezone,
+            override,
+            source_kind="action_camera",
+        )
+        self.assertEqual(sequence_at.isoformat(), "2025-12-27T12:16:49+07:00")
+        self.assertEqual(source, "date_override:dji_mimo_filename")
+        self.assertEqual(
+            _capture_time_basis(
+                "date_override:metadata",
+                override,
+                source_kind="action_camera",
+                sequence_source=source,
+            ),
+            "estimated",
+        )
+        self.assertTrue(warnings)
+
+    def test_manual_clock_offset_changes_sequence_but_not_capture_time(self) -> None:
+        timezone = ZoneInfo("Asia/Seoul")
+        captured = datetime(2026, 5, 17, 12, 27, 9, tzinfo=timezone)
+        override = {
+            "match": "0517-kr/*",
+            "date": "2026-05-17",
+            "clock_offset_seconds": 1800,
+        }
+        sequence_at, source, warnings = infer_sequence_time(
+            Path("DJI_20000101122709_0002_D.MP4"),
+            captured,
+            "date_override:metadata",
+            timezone,
+            override,
+            source_kind="action_camera",
+        )
+        self.assertEqual(captured.isoformat(), "2026-05-17T12:27:09+09:00")
+        self.assertEqual(sequence_at.isoformat(), "2026-05-17T12:57:09+09:00")
+        self.assertEqual(source, "manual_clock_offset")
+        self.assertTrue(warnings)
+
+        reviewed_zero = {**override, "clock_offset_seconds": 0}
+        zero_at, zero_source, _zero_warnings = infer_sequence_time(
+            Path("DJI_20000101122709_0002_D.MP4"),
+            captured,
+            "date_override:metadata",
+            timezone,
+            reviewed_zero,
+            source_kind="action_camera",
+        )
+        self.assertEqual(zero_at, captured)
+        self.assertEqual(zero_source, "manual_clock_offset")
+        self.assertEqual(
+            _capture_time_basis(
+                "date_override:metadata",
+                reviewed_zero,
+                source_kind="action_camera",
+                sequence_source=zero_source,
+            ),
+            "estimated",
+        )
+
+        relative_override = {key: value for key, value in override.items() if key != "clock_offset_seconds"}
+        relative_at, relative_source, _relative_warnings = infer_sequence_time(
+            Path("DJI_20000101122709_0002_D.MP4"),
+            captured,
+            "date_override:metadata",
+            timezone,
+            relative_override,
+            source_kind="action_camera",
+        )
+        self.assertEqual(relative_at, captured)
+        self.assertEqual(relative_source, "relative_clock_unplaced")
+        self.assertEqual(
+            _capture_time_basis(
+                "date_override:metadata",
+                relative_override,
+                source_kind="action_camera",
+                sequence_source=relative_source,
+            ),
+            "unplaced",
+        )
+
+    def test_unplaced_shared_mtime_does_not_create_a_trip_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            source = workspace / "source"
+            source.mkdir()
+            shared = source / "_talkv_missing_capture_time_talkv_high.MP4"
+            shared.write_bytes(b"shared-video")
+            os.utime(shared, (2_208_988_800, 2_208_988_800))  # 2040-01-01 UTC
+            paths = project_paths(workspace, "unplaced-shared")
+            paths.ensure()
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config["project"]["name"] = "unplaced-shared"
+            probe = {
+                "format": {"duration": "1.0", "tags": {}},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 320,
+                        "height": 180,
+                        "avg_frame_rate": "30/1",
+                        "tags": {},
+                    }
+                ],
+            }
+
+            with patch("video_summary.media.probe_media", return_value=probe):
+                manifest = scan_project(paths, source, config)
+
+        self.assertEqual(manifest["days"], [])
+        self.assertEqual(len(manifest["clips"]), 1)
+        clip = manifest["clips"][0]
+        self.assertEqual(clip["capture_source"], "mtime")
+        self.assertEqual(clip["sequence_source"], "shared_unplaced")
+        self.assertEqual(clip["capture_time_basis"], "unplaced")
+        self.assertEqual(clip["day_key"], "unplaced")
+        self.assertEqual(clip["travel_day"], 0)
 
     def test_capture_time_uses_aware_metadata_and_warns_on_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -447,7 +612,12 @@ class CoreTests(unittest.TestCase):
     def test_config_validates_date_override_contract(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         config["date_overrides"] = [
-            {"match": "0518/*", "date": "2026-05-18", "timezone": "America/Los_Angeles"}
+            {
+                "match": "0518/*",
+                "date": "2026-05-18",
+                "timezone": "America/Los_Angeles",
+                "clock_offset_seconds": 1800,
+            }
         ]
         _validate_config(config)
         for rule in (
@@ -455,6 +625,7 @@ class CoreTests(unittest.TestCase):
             {"match": "0518/*", "captured_at": "2026-05-18T10:00:00-07:00", "date": "2026-05-18"},
             {"match": "0518/*", "date": "2026-05-18", "timezone": "Mars/Olympus"},
             {"match": "0518/*", "date": "2026-05-18", "confidence": "guess"},
+            {"match": "0518/*", "date": "2026-05-18", "clock_offset_seconds": 50000},
         ):
             invalid = copy.deepcopy(DEFAULT_CONFIG)
             invalid["date_overrides"] = [rule]

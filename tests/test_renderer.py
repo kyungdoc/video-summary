@@ -157,7 +157,7 @@ class RendererTests(unittest.TestCase):
                     False,
                 )
 
-    def test_episode_cards_precede_all_sources_and_sources_are_chronological(self) -> None:
+    def test_episode_cards_precede_all_sources_and_preserve_validated_plan_order(self) -> None:
         early = candidate("early", "2026-08-19T08:00:00+09:00", 0.0)
         late_hook = candidate("late", "2026-08-19T18:00:00+09:00", 6.0)
         episode = Episode(
@@ -168,8 +168,8 @@ class RendererTests(unittest.TestCase):
             summary="첫날",
             target_duration=10.0,
             segments=[
-                PlanSegment(late_hook.candidate_id, "hook", "재미있는 장면"),
-                PlanSegment(early.candidate_id, "journey", "출발"),
+                PlanSegment(early.candidate_id, "hook", "출발"),
+                PlanSegment(late_hook.candidate_id, "journey", "재미있는 장면"),
             ],
         )
         plan = EditPlan("Trip", "", "local", "hash", [episode])
@@ -202,6 +202,84 @@ class RendererTests(unittest.TestCase):
             "intro-day-1", "date-day-1", "early", "late", "outro-day-1",
         ])
         self.assertEqual(pieces[1].day_chapter, "DAY 1 · 2026-08-19 · 서울")
+
+    def test_episode_preserves_plan_order_for_equal_sequence_times(self) -> None:
+        first = candidate("z-first", "2026-08-19T08:00:00+09:00", 0.0)
+        second = candidate("a-second", "2026-08-19T08:00:00+09:00", 0.0)
+        first.clip_id = "clip-z"
+        second.clip_id = "clip-a"
+        first.sequence_at = second.sequence_at = "2026-08-19T08:00:00+09:00"
+        episode = Episode(
+            day_key="2026-08-19",
+            travel_day=1,
+            title="DAY 1",
+            subtitle="2026-08-19",
+            summary="첫날",
+            target_duration=10.0,
+            segments=[
+                PlanSegment(first.candidate_id, "hook", "첫 번째"),
+                PlanSegment(second.candidate_id, "journey", "두 번째"),
+            ],
+        )
+        plan = EditPlan("Trip", "", "local", "hash", [episode])
+
+        def clip_for(item: Candidate) -> Clip:
+            return Clip(
+                clip_id=item.clip_id,
+                path=f"/tmp/{item.clip_id}.mp4",
+                relative_path=f"{item.clip_id}.mp4",
+                fingerprint=item.clip_id,
+                size_bytes=1,
+                duration=20.0,
+                captured_at=item.captured_at,
+                capture_source="metadata",
+                day_key=episode.day_key,
+                travel_day=1,
+                width=1920,
+                height=1080,
+                fps=30.0,
+                codec="h264",
+                rotation=0,
+                has_audio=True,
+            )
+
+        def fake_card(_directory: Path, card_id: str, *_args, **_kwargs) -> Piece:
+            return Piece(Path(f"/{card_id}.mp4"), 2.0, card_id)
+
+        def fake_source(segment: PlanSegment, item: Candidate, *_args, **_kwargs) -> Piece:
+            return Piece(
+                Path(f"/{item.candidate_id}.mp4"),
+                item.duration,
+                item.candidate_id,
+                item,
+                segment,
+            )
+
+        with (
+            patch("video_summary.renderer.render_card_piece", side_effect=fake_card),
+            patch("video_summary.renderer.render_source_piece", side_effect=fake_source),
+        ):
+            pieces = episode_pieces(
+                episode,
+                plan,
+                {item.candidate_id: item for item in (first, second)},
+                {item.clip_id: clip_for(item) for item in (first, second)},
+                copy.deepcopy(DEFAULT_CONFIG),
+                Path("/segments"),
+                Path("/cards"),
+                Path("/overlays"),
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                True,
+                include_intro=False,
+                include_outro=False,
+                force=False,
+            )
+
+        self.assertEqual([piece.label for piece in pieces[1:]], ["z-first", "a-second"])
 
     def test_scoped_render_plan_preserves_pacing_profile(self) -> None:
         episode = Episode("2026-08-19", 1, "DAY 1", "", "", 10.0, [])
@@ -697,7 +775,7 @@ class RendererTests(unittest.TestCase):
             moment_coverage=coverage,
         )
 
-        self.assertEqual(RENDER_POLICY_VERSION, 23)
+        self.assertEqual(RENDER_POLICY_VERSION, 24)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
         self.assertEqual(RENDER_REPORT_VERSION, 9)
         self.assertNotEqual(previous, current)

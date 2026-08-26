@@ -17,6 +17,7 @@ from video_summary.candidates import (
     PARTY_TRANSITION_CONTEXT_POLICY_VERSION,
     STORY_EVENT_CATALOG_POLICY_VERSION,
     VISUAL_SIGNAL_POLICY_VERSION,
+    _InterviewEvent,
     _assign_story_event_metadata,
     _assign_multicamera_angle_groups,
     _candidate_exclusion_reason,
@@ -28,10 +29,14 @@ from video_summary.candidates import (
     _candidate_cache_key,
     _candidate_location,
     _candidate_windows,
+    _coalesce_multicamera_interview_events,
     _journey_direction_destination,
     _journey_transition_signal,
     _merge_overlapping_windows,
+    _merge_synchronized_story_events,
     _meal_direct_signal,
+    _meal_subtype,
+    _promote_meaningful_phone_visual,
     _partition_full_clip_coverage,
     build_candidates,
 )
@@ -84,6 +89,137 @@ def _write_multicamera_frame(
 
 
 class CandidateCoverageTests(unittest.TestCase):
+    def test_simultaneous_multicamera_interview_keeps_one_complete_recording(self) -> None:
+        action = _clip("action", duration=40.0, captured_at="2026-08-20T10:00:00+09:00")
+        phone = _clip("phone", duration=22.0, captured_at="2026-08-20T10:00:00+09:00")
+        action.source_kind = "action_camera"
+        action.source_stream_id = "action-stream"
+        action.capture_time_basis = "estimated"
+        phone.source_kind = "phone"
+        phone.source_stream_id = "phone-stream"
+        phone.capture_time_basis = "absolute"
+        events = {
+            action.clip_id: [
+                _InterviewEvent("action-event", action.clip_id, 0.0, 32.0, 0.95, ("spoken_answer",))
+            ],
+            phone.clip_id: [
+                _InterviewEvent("phone-event", phone.clip_id, 0.0, 21.0, 0.97, ("spoken_answer",))
+            ],
+        }
+        cues = {
+            action.clip_id: [
+                TranscriptCue(0.0, 4.0, "뭐가 제일 재미있었나요?"),
+                TranscriptCue(4.0, 12.0, "수영이 제일 재미있었어요"),
+                TranscriptCue(12.0, 25.0, "그리고 바다에서 거북이도 봤어요"),
+            ],
+            phone.clip_id: [
+                TranscriptCue(0.0, 4.0, "뭐가 제일 재미있었나요?"),
+                TranscriptCue(4.0, 12.0, "수영이 제일 재미있었어요"),
+            ],
+        }
+
+        reconciled = _coalesce_multicamera_interview_events(
+            [action, phone],
+            events,
+            cues,
+        )
+
+        self.assertEqual(set(reconciled), {action.clip_id})
+        self.assertEqual(reconciled[action.clip_id][0].event_id, "action-event")
+
+    def test_overlapping_different_interviews_are_not_coalesced(self) -> None:
+        first = _clip("first", duration=20.0, captured_at="2026-08-20T10:00:00+09:00")
+        second = _clip("second", duration=20.0, captured_at="2026-08-20T10:00:00+09:00")
+        first.source_stream_id = "first-stream"
+        second.source_stream_id = "second-stream"
+        events = {
+            first.clip_id: [
+                _InterviewEvent("first-event", first.clip_id, 0.0, 15.0, 0.96, ("spoken_answer",))
+            ],
+            second.clip_id: [
+                _InterviewEvent("second-event", second.clip_id, 0.0, 15.0, 0.96, ("spoken_answer",))
+            ],
+        }
+        cues = {
+            first.clip_id: [
+                TranscriptCue(0.0, 4.0, "뭐가 제일 재미있었나요?"),
+                TranscriptCue(4.0, 12.0, "수영이 제일 재미있었어요"),
+            ],
+            second.clip_id: [
+                TranscriptCue(0.0, 4.0, "뭐가 제일 재미있었나요?"),
+                TranscriptCue(4.0, 12.0, "동물원이 제일 재미있었어요"),
+            ],
+        }
+
+        reconciled = _coalesce_multicamera_interview_events(
+            [first, second],
+            events,
+            cues,
+        )
+
+        self.assertEqual(set(reconciled), {first.clip_id, second.clip_id})
+
+    def test_transitive_overlap_does_not_drop_nonoverlapping_interview_tail(self) -> None:
+        clips = [
+            _clip("first", duration=12.0, captured_at="2026-08-20T10:00:00+09:00"),
+            _clip("middle", duration=12.0, captured_at="2026-08-20T10:00:06+09:00"),
+            _clip("last", duration=12.0, captured_at="2026-08-20T10:00:12+09:00"),
+        ]
+        events: dict[str, list[_InterviewEvent]] = {}
+        cues: dict[str, list[TranscriptCue]] = {}
+        for index, clip in enumerate(clips):
+            clip.source_stream_id = f"stream-{index}"
+            events[clip.clip_id] = [
+                _InterviewEvent(
+                    f"event-{index}",
+                    clip.clip_id,
+                    0.0,
+                    12.0,
+                    0.96,
+                    ("spoken_answer",),
+                )
+            ]
+            cues[clip.clip_id] = [
+                TranscriptCue(0.0, 4.0, "뭐가 제일 재미있었나요?"),
+                TranscriptCue(4.0, 10.0, "수영이 제일 재미있었어요"),
+            ]
+
+        reconciled = _coalesce_multicamera_interview_events(clips, events, cues)
+
+        self.assertEqual(set(reconciled), {clip.clip_id for clip in clips})
+
+    def test_same_qa_with_relative_clock_keeps_both_people(self) -> None:
+        action = _clip("relative-action", duration=30.0, captured_at="2026-08-20T08:00:00+09:00")
+        phone = _clip("absolute-phone", duration=20.0, captured_at="2026-08-20T15:00:00+09:00")
+        action.source_stream_id = "action-stream"
+        action.capture_time_basis = "relative"
+        action.capture_time_confidence = "medium"
+        phone.source_stream_id = "phone-stream"
+        phone.capture_time_basis = "absolute"
+        events = {
+            action.clip_id: [
+                _InterviewEvent("action-event", action.clip_id, 0.0, 24.0, 0.95, ("spoken_answer",))
+            ],
+            phone.clip_id: [
+                _InterviewEvent("phone-event", phone.clip_id, 0.0, 18.0, 0.96, ("spoken_answer",))
+            ],
+        }
+        shared_cues = [
+            TranscriptCue(0.0, 4.0, "이번 여행에서 뭐가 제일 재미있었나요?"),
+            TranscriptCue(4.0, 14.0, "가족과 수영한 게 제일 재미있었어요"),
+        ]
+
+        reconciled = _coalesce_multicamera_interview_events(
+            [action, phone],
+            events,
+            {
+                action.clip_id: shared_cues,
+                phone.clip_id: shared_cues,
+            },
+        )
+
+        self.assertEqual(set(reconciled), {action.clip_id, phone.clip_id})
+
     def test_multicamera_angle_group_requires_reliable_time_and_matching_story_beat(self) -> None:
         def view(candidate_id: str, stream: str, confidence: str) -> Candidate:
             return Candidate(
@@ -162,6 +298,140 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertEqual(first.angle_group_id, middle.angle_group_id)
         self.assertIsNone(last.angle_group_id)
+
+    def test_overlapping_interview_views_merge_cross_camera_story_ids(self) -> None:
+        def view(candidate_id: str, stream: str, event_id: str, required: bool) -> Candidate:
+            return Candidate(
+                candidate_id=candidate_id,
+                clip_id=f"clip-{candidate_id}",
+                day_key="2026-08-20",
+                travel_day=1,
+                start=0.0,
+                end=10.0,
+                captured_at="2026-08-20T10:00:00+09:00",
+                transcript="뭐가 제일 재미있었나요? 수영이 제일 재미있었어요",
+                roles=["interview", "dialogue"] if required else ["dialogue"],
+                score=0.8,
+                speech_ratio=0.8,
+                motion_score=0.2,
+                visual_quality=0.8,
+                location=None,
+                frame_path=f"frames/{candidate_id}.jpg",
+                required_event_ids=["interview"] if required else [],
+                story_event_id=event_id,
+                story_stage="outcome",
+                source_stream_id=stream,
+                capture_time_confidence="high",
+                capture_time_basis="absolute",
+            )
+
+        action = view("action", "action-stream", "action-story", True)
+        phone = view("phone", "phone-stream", "phone-story", False)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_multicamera_frame(root, "action")
+            _write_multicamera_frame(root, "phone", reverse=True)
+            _assign_multicamera_angle_groups([action, phone], root)
+            _merge_synchronized_story_events([action, phone])
+
+        self.assertIsNotNone(action.angle_group_id)
+        self.assertEqual(action.angle_group_id, phone.angle_group_id)
+        self.assertEqual(action.story_event_id, phone.story_event_id)
+
+    def test_overlapping_different_interview_answers_do_not_form_an_angle_group(self) -> None:
+        def view(candidate_id: str, stream: str, transcript: str) -> Candidate:
+            return Candidate(
+                candidate_id=candidate_id,
+                clip_id=f"clip-{candidate_id}",
+                day_key="2026-08-20",
+                travel_day=1,
+                start=0.0,
+                end=12.0,
+                captured_at="2026-08-20T10:00:00+09:00",
+                transcript=transcript,
+                roles=["interview", "dialogue"],
+                score=0.8,
+                speech_ratio=0.8,
+                motion_score=0.2,
+                visual_quality=0.8,
+                location=None,
+                frame_path=f"frames/{candidate_id}.jpg",
+                required_event_ids=[f"interview-{candidate_id}"],
+                story_event_id=f"story-{candidate_id}",
+                story_stage="outcome",
+                source_stream_id=stream,
+                capture_time_confidence="high",
+                capture_time_basis="absolute",
+            )
+
+        swimming = view(
+            "swimming",
+            "stream-a",
+            "뭐가 제일 재미있었나요? 수영이 제일 재미있었어요",
+        )
+        zoo = view(
+            "zoo",
+            "stream-b",
+            "뭐가 제일 재미있었나요? 동물원이 제일 재미있었어요",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_multicamera_frame(root, "swimming")
+            _write_multicamera_frame(root, "zoo")
+            _assign_multicamera_angle_groups([swimming, zoo], root)
+
+        self.assertIsNone(swimming.angle_group_id)
+        self.assertIsNone(zoo.angle_group_id)
+
+    def test_matching_relative_clock_interview_answers_do_not_form_an_angle_group(self) -> None:
+        transcript = "이번 여행에서 뭐가 제일 재미있었나요? 가족과 수영한 게 제일 재미있었어요"
+        action = Candidate(
+            candidate_id="relative-action",
+            clip_id="clip-relative-action",
+            day_key="2026-08-20",
+            travel_day=1,
+            start=0.0,
+            end=12.0,
+            captured_at="2026-08-20T08:00:00+09:00",
+            transcript=transcript,
+            roles=["interview", "dialogue"],
+            score=0.8,
+            speech_ratio=0.8,
+            motion_score=0.2,
+            visual_quality=0.8,
+            location=None,
+            frame_path="frames/relative-action.jpg",
+            required_event_ids=["interview-action"],
+            story_event_id="story-action",
+            story_stage="outcome",
+            source_stream_id="action-stream",
+            capture_time_confidence="medium",
+            capture_time_basis="relative",
+        )
+        phone = Candidate.from_dict(
+            {
+                **action.to_dict(),
+                "candidate_id": "absolute-phone",
+                "clip_id": "clip-absolute-phone",
+                "captured_at": "2026-08-20T15:00:00+09:00",
+                "frame_path": "frames/absolute-phone.jpg",
+                "required_event_ids": ["interview-phone"],
+                "story_event_id": "story-phone",
+                "source_stream_id": "phone-stream",
+                "capture_time_confidence": "high",
+                "capture_time_basis": "absolute",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_multicamera_frame(root, "relative-action")
+            _write_multicamera_frame(root, "absolute-phone", reverse=True)
+            _assign_multicamera_angle_groups([action, phone], root)
+            _merge_synchronized_story_events([action, phone])
+
+        self.assertIsNone(action.angle_group_id)
+        self.assertIsNone(phone.angle_group_id)
+        self.assertNotEqual(action.story_event_id, phone.story_event_id)
 
     def test_matching_simultaneous_dialogue_can_group_despite_ordinal_stage_labels(self) -> None:
         def view(candidate_id: str, stage: str, stream: str) -> Candidate:
@@ -419,9 +689,12 @@ class CandidateCoverageTests(unittest.TestCase):
             "라멘이 나왔습니다",
             "지금 초밥을 먹고 있어요",
             "이 아이스크림 엄청 맛있네요",
+            "오늘 저녁은 테이크아웃 스시예요. 스시랑 텐푸라가 있습니다",
+            "초밥도 있고요 튀김도 있고요",
             "This pizza tastes delicious",
         ]
         negatives = [
+            "기회가 있습니다",
             "내일 라멘 먹으러 갑니다",
             "어제 먹었던 음식이 맛있었어요",
             "밥 먹고 나왔는데 이제 숙소로 갑니다",
@@ -437,6 +710,43 @@ class CandidateCoverageTests(unittest.TestCase):
         for text in negatives:
             with self.subTest(text=text):
                 self.assertIsNone(_meal_direct_signal(text, text))
+
+        self.assertEqual(_meal_subtype("초밥과 음료수가 있습니다"), "meal")
+
+    def test_strong_silent_phone_boundary_is_a_protected_visual_anchor(self) -> None:
+        clip = _clip("phone-dolphin", duration=6.0)
+        clip.source_kind = "phone"
+        roles = _promote_meaningful_phone_visual(
+            ["journey", "opener"],
+            clip,
+            origin="opener",
+            speech_ratio=0.0,
+            motion=0.071,
+            quality=0.679,
+        )
+        self.assertEqual(roles[0], "scenery")
+
+        short_context = _clip("phone-whale-shark", duration=4.2)
+        short_context.source_kind = "phone"
+        short_roles = _promote_meaningful_phone_visual(
+            ["journey", "opener"],
+            short_context,
+            origin="opener",
+            speech_ratio=0.0,
+            motion=0.0,
+            quality=0.34,
+        )
+        self.assertEqual(short_roles[0], "scenery")
+
+        generic = _promote_meaningful_phone_visual(
+            ["journey", "opener"],
+            clip,
+            origin="opener",
+            speech_ratio=0.0,
+            motion=0.01,
+            quality=0.30,
+        )
+        self.assertNotIn("scenery", generic)
 
     def test_direct_meal_localization_keeps_group_level_retrospective_guard(self) -> None:
         clip = _clip("retrospective", duration=12.0)
@@ -687,6 +997,28 @@ class CandidateCoverageTests(unittest.TestCase):
         self.assertEqual([option.clip_id for option in events[0].options], [clip.clip_id])
         self.assertEqual(events[0].setup_options, ())
         self.assertEqual(events[0].closure_options, ())
+
+    def test_presented_food_builds_a_direct_meal_option(self) -> None:
+        clip = _clip(
+            "okinawa-dinner",
+            duration=14.0,
+            captured_at="2026-05-08T19:38:50+09:00",
+        )
+        cues = {
+            clip.clip_id: [
+                TranscriptCue(
+                    0.0,
+                    6.0,
+                    "오늘 저녁은 테이크아웃 스시예요. 스시랑 텐푸라가 있습니다.",
+                )
+            ]
+        }
+
+        events = _detect_meal_events([clip], cues)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].options[0].signals, ("presented_food",))
+        self.assertEqual(events[0].subtype, "meal")
 
     def test_served_food_body_keeps_a_nearby_tasting_reaction(self) -> None:
         clip = _clip("ice-cream", duration=8.8)

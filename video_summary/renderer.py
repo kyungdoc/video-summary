@@ -44,7 +44,7 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 23
+RENDER_POLICY_VERSION = 24
 SOURCE_RENDER_POLICY_VERSION = 8
 RENDER_REPORT_VERSION = 9
 CARD_RENDER_POLICY_VERSION = 4
@@ -1084,10 +1084,10 @@ def episode_pieces(
 ) -> list[Piece]:
     pieces: list[Piece] = []
     render_config = config["render"]
-    segments = sorted(
-        episode.segments,
-        key=lambda segment: source_segment_sort_key(segment, candidate_by_id),
-    )
+    # The planner validator is the sole chronology boundary. Preserve its
+    # exact segment order here, including stable editorial order for equal
+    # sequence timestamps, instead of silently rewriting a validated plan.
+    segments = list(episode.segments)
     if include_intro:
         pieces.append(
             render_card_piece(
@@ -1153,7 +1153,9 @@ def source_segment_sort_key(
 ) -> tuple[float, float, str]:
     candidate = candidate_by_id[segment.candidate_id]
     try:
-        captured_at = datetime.fromisoformat(candidate.captured_at.replace("Z", "+00:00"))
+        captured_at = datetime.fromisoformat(
+            (candidate.sequence_at or candidate.captured_at).replace("Z", "+00:00")
+        )
     except ValueError:
         return (float("inf"), candidate.start, candidate.candidate_id)
     if captured_at.tzinfo is None:
@@ -1222,8 +1224,12 @@ def source_groups_share_contiguous_story(
     if not event_id or event_id != right.story_event_id:
         return False
     try:
-        left_start = datetime.fromisoformat(left.captured_at.replace("Z", "+00:00"))
-        right_start = datetime.fromisoformat(right.captured_at.replace("Z", "+00:00"))
+        left_start = datetime.fromisoformat(
+            (left.sequence_at or left.captured_at).replace("Z", "+00:00")
+        )
+        right_start = datetime.fromisoformat(
+            (right.sequence_at or right.captured_at).replace("Z", "+00:00")
+        )
     except ValueError:
         return False
     if left_start.tzinfo is None:
@@ -1622,7 +1628,9 @@ def evenly_spaced_indices(count: int, take: int) -> list[int]:
 
 def candidate_capture_timestamp(candidate: Candidate) -> float:
     try:
-        captured_at = datetime.fromisoformat(candidate.captured_at.replace("Z", "+00:00"))
+        captured_at = datetime.fromisoformat(
+            (candidate.sequence_at or candidate.captured_at).replace("Z", "+00:00")
+        )
     except ValueError:
         return float("inf")
     if captured_at.tzinfo is None:

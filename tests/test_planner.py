@@ -90,6 +90,97 @@ def meal_context_candidate(
 
 
 class PlannerTests(unittest.TestCase):
+    def test_local_plan_does_not_auto_place_untrusted_shared_candidate(self) -> None:
+        anchor = candidate("anchor", "2026-11-01T08:00:00-05:00")
+        anchor.story_event_id = "anchor-event"
+        shared = candidate("shared", "2026-11-01T09:00:00-05:00")
+        shared.story_event_id = "shared-event"
+        shared.source_kind = "shared"
+        shared.capture_time_confidence = "low"
+        shared.capture_time_basis = "unplaced"
+        plan = local_plan(copy.deepcopy(DEFAULT_CONFIG), "여행", [anchor, shared], "hash")
+        selected = [segment.candidate_id for segment in plan.episodes[0].segments]
+        self.assertEqual(selected, ["anchor"])
+
+    def test_unplaced_required_meal_without_override_is_not_timeline_eligible(self) -> None:
+        anchor = candidate("anchor", "2026-11-01T08:00:00-05:00")
+        anchor.story_event_id = "anchor-event"
+        shared_meal = meal_candidate(
+            "shared-meal",
+            "2026-11-01T09:00:00-05:00",
+            ["meal-unplaced"],
+        )
+        shared_meal.story_event_id = "unplaced-meal-event"
+        shared_meal.source_kind = "shared"
+        shared_meal.capture_time_confidence = "low"
+        shared_meal.capture_time_basis = "unplaced"
+
+        plan = local_plan(
+            copy.deepcopy(DEFAULT_CONFIG),
+            "식사 흐름",
+            [anchor, shared_meal],
+            "hash",
+        )
+
+        self.assertEqual(
+            [segment.candidate_id for segment in plan.episodes[0].segments],
+            ["anchor"],
+        )
+
+    def test_validator_rejects_selected_unplaced_required_meal(self) -> None:
+        anchor = candidate("anchor", "2026-11-01T08:00:00-05:00")
+        shared_meal = meal_candidate(
+            "shared-meal",
+            "2026-11-01T09:00:00-05:00",
+            ["meal-unplaced"],
+        )
+        shared_meal.source_kind = "shared"
+        shared_meal.capture_time_confidence = "low"
+        shared_meal.capture_time_basis = "unplaced"
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        payload = {
+            "version": 1,
+            "project": config["project"]["name"],
+            "candidate_set_hash": "hash",
+            "episodes": [
+                {
+                    "day_key": anchor.day_key,
+                    "travel_day": anchor.travel_day,
+                    "title": "DAY 1",
+                    "subtitle": anchor.day_key,
+                    "summary": "첫날",
+                    "target_duration": config["editing"]["target_minutes_per_day"] * 60,
+                    "segments": [
+                        {"candidate_id": "anchor", "role": "hook", "reason": "시작"},
+                        {"candidate_id": "shared-meal", "role": "food", "reason": "식사"},
+                    ],
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(VideoSummaryError, "배치할 근거가 없는"):
+            validate_and_normalize_plan(
+                payload,
+                config,
+                "식사 흐름",
+                [anchor, shared_meal],
+                "hash",
+                "file",
+            )
+
+    def test_sequence_time_orders_trusted_phone_anchor_before_reset_camera(self) -> None:
+        airport = candidate("airport", "2026-11-01T08:00:00-05:00")
+        airport.sequence_at = "2026-11-01T09:30:00-05:00"
+        taxi = candidate("taxi", "2026-11-01T09:00:00-05:00")
+        taxi.sequence_at = "2026-11-01T09:00:00-05:00"
+        for index, item in enumerate((airport, taxi)):
+            item.story_event_id = f"event-{index}"
+        plan = local_plan(copy.deepcopy(DEFAULT_CONFIG), "여행", [airport, taxi], "hash")
+        self.assertEqual(
+            [segment.candidate_id for segment in plan.episodes[0].segments],
+            ["taxi", "airport"],
+        )
+
     def test_candidate_wallclock_does_not_add_source_start_twice(self) -> None:
         item = candidate(
             "offset",
@@ -585,6 +676,44 @@ class PlannerTests(unittest.TestCase):
             payload, self.config, "x", self.candidates, "hash", "file"
         )
         self.assertEqual([item.candidate_id for item in plan.episodes[0].segments], ["c1", "c2"])
+
+    def test_validator_preserves_editorial_order_for_equal_sequence_times(self) -> None:
+        first = candidate("z-first", "2026-11-01T08:00:00-05:00")
+        second = candidate("a-second", "2026-11-01T08:00:00-05:00")
+        first.sequence_at = second.sequence_at = "2026-11-01T08:00:00-05:00"
+        payload = {
+            "version": 1,
+            "project": self.config["project"]["name"],
+            "candidate_set_hash": "hash",
+            "episodes": [
+                {
+                    "day_key": first.day_key,
+                    "travel_day": 1,
+                    "title": "DAY 1",
+                    "subtitle": first.day_key,
+                    "summary": "동시 촬영 앵글",
+                    "target_duration": 10.0,
+                    "segments": [
+                        {"candidate_id": first.candidate_id, "role": "hook", "reason": "행동"},
+                        {"candidate_id": second.candidate_id, "role": "journey", "reason": "반응"},
+                    ],
+                }
+            ],
+        }
+
+        plan = validate_and_normalize_plan(
+            payload,
+            self.config,
+            "동시 촬영 편집 순서",
+            [first, second],
+            "hash",
+            "file",
+        )
+
+        self.assertEqual(
+            [segment.candidate_id for segment in plan.episodes[0].segments],
+            ["z-first", "a-second"],
+        )
 
     def test_local_plan_never_moves_a_later_fun_candidate_forward(self) -> None:
         self.config["editing"]["cold_open"] = True

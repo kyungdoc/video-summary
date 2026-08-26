@@ -39,6 +39,9 @@ class Clip:
     source_kind: str = "unknown"
     source_stream_id: str | None = None
     capture_time_confidence: str = "medium"
+    sequence_at: str | None = None
+    sequence_source: str = "capture_time"
+    capture_time_basis: str = "absolute"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -93,6 +96,9 @@ class Candidate:
     source_stream_id: str | None = None
     capture_time_confidence: str = "medium"
     angle_group_id: str | None = None
+    sequence_at: str | None = None
+    sequence_source: str = "capture_time"
+    capture_time_basis: str = "absolute"
 
     @property
     def duration(self) -> float:

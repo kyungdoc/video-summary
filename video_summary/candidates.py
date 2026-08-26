@@ -32,6 +32,7 @@ FUN_WORDS = {
 }
 FOOD_WORDS = {
     "맛", "먹", "식당", "조식", "점심", "저녁", "카페", "커피", "디저트", "간식", "음식", "메뉴",
+    "초밥", "스시", "튀김", "텐푸라", "사시미", "라멘", "라면", "소바", "버거", "파스타", "도시락",
     "breakfast", "lunch", "dinner", "cafe", "coffee", "food", "delicious",
 }
 SCENERY_WORDS = {
@@ -44,20 +45,20 @@ JOURNEY_TRANSITION_DEDUPE_SECONDS = 60.0
 PARTY_TRANSITION_CONTEXT_POLICY_VERSION = 1
 PARTY_TRANSITION_CONTEXT_MAX_SECONDS = 12.0
 PARTY_TRANSITION_CONTEXT_MAX_CUES = 3
-MEAL_EVENT_POLICY_VERSION = 6
+MEAL_EVENT_POLICY_VERSION = 7
 MEAL_OPTION_MAX_DURATION_SECONDS = 12.0
 MEAL_SETUP_HORIZON_SECONDS = 3.0 * 60.0 * 60.0
 MEAL_DIRECT_CLUSTER_SECONDS = 30.0 * 60.0
 MEAL_INFER_AFTER_SETUP_SECONDS = 15.0 * 60.0
 MEAL_INFER_BEFORE_CLOSURE_SECONDS = 15.0 * 60.0
-INTERVIEW_DETECTION_POLICY_VERSION = 3
+INTERVIEW_DETECTION_POLICY_VERSION = 6
 INTERVIEW_ANSWER_WAIT_SECONDS = 15.0
 INTERVIEW_CONTINUATION_GAP_SECONDS = 12.0
 INTERVIEW_EVENT_MAX_SPAN_SECONDS = 180.0
 INTERVIEW_CONTEXT_EVENT_MAX_DISTANCE_SECONDS = 90.0
 FULL_COVERAGE_PARTITION_POLICY_VERSION = 1
-STORY_EVENT_CATALOG_POLICY_VERSION = 3
-MULTICAMERA_ANGLE_POLICY_VERSION = 1
+STORY_EVENT_CATALOG_POLICY_VERSION = 5
+MULTICAMERA_ANGLE_POLICY_VERSION = 4
 STORY_EVENT_GAP_SECONDS = 5.0 * 60.0
 STORY_EVENT_MAX_SPAN_SECONDS = 45.0 * 60.0
 
@@ -394,12 +395,27 @@ _MEAL_TASTING_PATTERN = re.compile(
     r"|\b(?:tastes?|is)\s+(?:really\s+|so\s+|very\s+)?(?:delicious|tasty|good)\b"
 )
 _MEAL_FOOD_REVEAL_PATTERN = re.compile(
-    r"(?:이거|이건|이게).{0,18}?(?:피자|라멘|라면|초밥|스시|고기|빵|아이스크림|디저트|케이크)(?:야|예요|이에요|입니다)"
+    r"(?:이거|이건|이게).{0,18}?(?:피자|라멘|라면|초밥|스시|튀김|텐푸라|사시미|"
+    r"소바|버거|파스타|도시락|고기|빵|아이스크림|디저트|케이크)(?:야|예요|이에요|입니다)"
 )
 _MEAL_FOOD_NOUN_PATTERN = re.compile(
-    r"(?:밥|식사|아침|점심|저녁|음식|요리|메뉴|피자|라멘|라면|초밥|스시|고기|빵|"
-    r"아이스크림|디저트|케이크|커피|주스)"
-    r"|\b(?:breakfast|lunch|dinner|food|meal|dish|pizza|ramen|sushi|ice\s*cream|dessert|cake|coffee|juice)\b"
+    r"(?:밥|식사|아침|점심|저녁|음식|요리|메뉴|피자|라멘|라면|초밥|스시|튀김|"
+    r"텐푸라|사시미|소바|버거|파스타|도시락|고기|빵|아이스크림|디저트|케이크|커피|주스)"
+    r"|\b(?:breakfast|lunch|dinner|food|meal|dish|pizza|ramen|sushi|tempura|sashimi|"
+    r"soba|burger|pasta|lunchbox|ice\s*cream|dessert|cake|coffee|juice)\b"
+)
+_MEAL_SOLID_FOOD_PATTERN = re.compile(
+    r"(?:밥|식사|아침|점심|저녁|음식|요리|메뉴|피자|라멘|라면|초밥|스시|튀김|"
+    r"텐푸라|사시미|소바|버거|파스타|도시락|고기|빵)"
+    r"|\b(?:breakfast|lunch|dinner|food|meal|dish|pizza|ramen|sushi|tempura|sashimi|"
+    r"soba|burger|pasta|lunchbox)\b"
+)
+_MEAL_PRESENTED_FOOD_PATTERN = re.compile(
+    r"(?:(?:오늘\s*)?(?:아침|점심|저녁|식사)(?:은|는|으로)?\s*.{0,24}?)?"
+    r"(?:피자|라멘|라면|초밥|스시|튀김|텐푸라|사시미|소바|버거|파스타|도시락|고기|빵)"
+    r"(?:이|가|은|는|도|랑|하고)?\s*(?:있(?:습니다|어요|고|네요)|예요|이에요|입니다)"
+    r"|\b(?:today(?:'s)?\s+)?(?:breakfast|lunch|dinner|meal)\b.{0,28}"
+    r"\b(?:is|has|includes)\b.{0,28}\b(?:food|dish|pizza|ramen|sushi|tempura|sashimi|soba|burger|pasta)\b"
 )
 _MEAL_PRESENT_CONTEXT_PATTERN = re.compile(
     r"(?:이거|이건|이게|지금|여기|와|우와)"
@@ -719,6 +735,12 @@ def build_candidates(
             if preserve_family_interviews
             else {}
         )
+        if preserve_family_interviews:
+            interview_events_by_clip = _coalesce_multicamera_interview_events(
+                clips,
+                interview_events_by_clip,
+                cues_by_clip,
+            )
         meal_events = (
             _detect_meal_events(clips, cues_by_clip)
             if preserve_meal_events
@@ -798,6 +820,14 @@ def build_candidates(
                     if cue.end > start and cue.start < end
                 )
                 speech_ratio = min(1.0, speech_duration / max(0.1, end - start))
+                roles = _promote_meaningful_phone_visual(
+                    roles,
+                    clip,
+                    origin=origin,
+                    speech_ratio=speech_ratio,
+                    motion=motion,
+                    quality=quality,
+                )
                 location = _candidate_location(clip, text, config.get("locations", []))
                 exclusion_reason = _candidate_exclusion_reason(
                     clip,
@@ -823,6 +853,13 @@ def build_candidates(
                     clip_captured_at.astimezone(timezone.utc)
                     + timedelta(seconds=start)
                 ).astimezone(clip_captured_at.tzinfo).isoformat()
+                clip_sequence_at = datetime.fromisoformat(
+                    clip.sequence_at or clip.captured_at
+                )
+                sequence_at = (
+                    clip_sequence_at.astimezone(timezone.utc)
+                    + timedelta(seconds=start)
+                ).astimezone(clip_sequence_at.tzinfo).isoformat()
                 candidates.append(
                     Candidate(
                         candidate_id=candidate_id,
@@ -848,12 +885,16 @@ def build_candidates(
                         source_kind=clip.source_kind,
                         source_stream_id=clip.source_stream_id,
                         capture_time_confidence=clip.capture_time_confidence,
+                        sequence_at=sequence_at,
+                        sequence_source=clip.sequence_source,
+                        capture_time_basis=clip.capture_time_basis,
                     )
                 )
 
         candidates.sort(key=lambda item: (_candidate_timestamp(item), item.candidate_id))
         _assign_story_event_metadata(candidates)
         _assign_multicamera_angle_groups(candidates, paths.root)
+        _merge_synchronized_story_events(candidates)
         if not candidates:
             raise VideoSummaryError("편집 후보를 만들지 못했습니다.")
         required_events = [
@@ -923,7 +964,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 18,
+            "version": 22,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "journey_transition_detection": {
                 "policy": JOURNEY_TRANSITION_POLICY_VERSION,
@@ -946,12 +987,15 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
                     clip.clip_id,
                     clip.fingerprint,
                     clip.captured_at,
+                    clip.sequence_at,
                     clip.day_key,
                     clip.travel_day,
                     clip.location,
                     clip.source_kind,
                     clip.source_stream_id,
                     clip.capture_time_confidence,
+                    clip.capture_time_basis,
+                    clip.sequence_source,
                 )
                 for clip in clips
             ],
@@ -1038,12 +1082,21 @@ def _assign_story_event_metadata(candidates: list[Candidate]) -> None:
                 and candidate_activity_kinds
                 and cluster_activity_kinds.isdisjoint(candidate_activity_kinds)
             )
+            unplaced_cross_clip_boundary = bool(
+                candidate.clip_id != previous.clip_id
+                and "unplaced"
+                in {
+                    candidate.capture_time_basis,
+                    previous.capture_time_basis,
+                }
+            )
             ordinary_boundary = (
                 current_start - previous_end > STORY_EVENT_GAP_SECONDS
                 or current_start - cluster_start > STORY_EVENT_MAX_SPAN_SECONDS
                 or location_changed
                 or transition_boundary
                 or activity_boundary
+                or unplaced_cross_clip_boundary
             )
             if explicit_event_boundary or (ordinary_boundary and not same_explicit_event):
                 clusters.append([candidate])
@@ -1092,17 +1145,29 @@ def _assign_multicamera_angle_groups(
     estimated messenger export cannot suppress an unrelated native clip.
     """
     by_event: dict[tuple[str, str], list[Candidate]] = defaultdict(list)
+    interview_by_day: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
         candidate.angle_group_id = None
+        if not candidate.source_stream_id:
+            continue
         if (
             candidate.story_event_id
-            and candidate.source_stream_id
-            and candidate.capture_time_confidence != "low"
+            and candidate.capture_time_basis in {"absolute", "estimated"}
         ):
             by_event[(candidate.day_key, candidate.story_event_id)].append(candidate)
+        if (
+            candidate.capture_time_basis != "unplaced"
+            and (
+                candidate.required_event_ids
+                or "interview" in candidate.roles
+                or _looks_like_question(candidate.transcript)
+            )
+        ):
+            interview_by_day[candidate.day_key].append(candidate)
 
     visual_hashes: dict[str, int | None] = {}
-    for event_candidates in by_event.values():
+    pools = [*interview_by_day.values(), *by_event.values()]
+    for event_candidates in pools:
         if len({item.source_stream_id for item in event_candidates}) < 2:
             continue
         ordered = sorted(event_candidates, key=lambda item: (_candidate_timestamp(item), item.candidate_id))
@@ -1131,12 +1196,20 @@ def _assign_multicamera_angle_groups(
         for component in components:
             if len(component) < 2:
                 continue
-            group_id = "angle_" + stable_hash(
-                {
-                    "policy": MULTICAMERA_ANGLE_POLICY_VERSION,
-                    "candidate_ids": sorted(item.candidate_id for item in component),
-                },
-                length=16,
+            existing_group_ids = {
+                item.angle_group_id for item in component if item.angle_group_id
+            }
+            group_id = (
+                sorted(existing_group_ids)[0]
+                if existing_group_ids
+                else "angle_"
+                + stable_hash(
+                    {
+                        "policy": MULTICAMERA_ANGLE_POLICY_VERSION,
+                        "candidate_ids": sorted(item.candidate_id for item in component),
+                    },
+                    length=16,
+                )
             )
             for candidate in component:
                 candidate.angle_group_id = group_id
@@ -1151,14 +1224,53 @@ def _same_multicamera_angle(
     if (
         left.clip_id == right.clip_id
         or left.source_stream_id == right.source_stream_id
-        or left.capture_time_confidence == "low"
-        or right.capture_time_confidence == "low"
     ):
         return False
     broad_roles = {"food", "fun", "scenery", "journey", "dialogue", "interview", "transition"}
     left_roles = set(left.roles) & broad_roles
     right_roles = set(right.roles) & broad_roles
     if left_roles and right_roles and left_roles.isdisjoint(right_roles):
+        return False
+    left_interview_like = bool(
+        left.required_event_ids
+        or "interview" in left.roles
+        or _looks_like_question(left.transcript)
+    )
+    right_interview_like = bool(
+        right.required_event_ids
+        or "interview" in right.roles
+        or _looks_like_question(right.transcript)
+    )
+    if left_interview_like and right_interview_like:
+        reliable_pair = bool(
+            left.capture_time_confidence != "low"
+            and right.capture_time_confidence != "low"
+            and left.capture_time_basis in {"absolute", "estimated"}
+            and right.capture_time_basis in {"absolute", "estimated"}
+        )
+        if not reliable_pair:
+            return False
+        if not _matching_interview_qa_transcripts(
+            left.transcript,
+            right.transcript,
+            strict=False,
+        ):
+            return False
+        left_start = _candidate_timestamp(left)
+        right_start = _candidate_timestamp(right)
+        overlap = max(
+            0.0,
+            min(left_start + left.duration, right_start + right.duration)
+            - max(left_start, right_start),
+        )
+        return overlap / max(0.001, min(left.duration, right.duration)) >= 0.45
+
+    if (
+        left.capture_time_confidence == "low"
+        or right.capture_time_confidence == "low"
+        or left.capture_time_basis not in {"absolute", "estimated"}
+        or right.capture_time_basis not in {"absolute", "estimated"}
+    ):
         return False
     left_start = _candidate_timestamp(left)
     right_start = _candidate_timestamp(right)
@@ -1167,7 +1279,8 @@ def _same_multicamera_angle(
         min(left_start + left.duration, right_start + right.duration)
         - max(left_start, right_start),
     )
-    if overlap / max(0.001, min(left.duration, right.duration)) < 0.45:
+    overlap_ratio = overlap / max(0.001, min(left.duration, right.duration))
+    if overlap_ratio < 0.45:
         return False
     stage_matches = (
         _story_stage_bucket(left.story_stage)
@@ -1197,6 +1310,41 @@ def _same_multicamera_angle(
     return visual_similarity >= threshold
 
 
+def _merge_synchronized_story_events(candidates: list[Candidate]) -> None:
+    """Union story events connected by a synchronized camera-angle beat."""
+    event_edges: list[set[str]] = []
+    by_angle: dict[str, set[str]] = defaultdict(set)
+    for candidate in candidates:
+        if candidate.angle_group_id and candidate.story_event_id:
+            by_angle[candidate.angle_group_id].add(candidate.story_event_id)
+    for event_ids in by_angle.values():
+        if len(event_ids) < 2:
+            continue
+        matching = [component for component in event_edges if component & event_ids]
+        if not matching:
+            event_edges.append(set(event_ids))
+            continue
+        merged = set(event_ids)
+        for component in matching:
+            merged.update(component)
+            event_edges.remove(component)
+        event_edges.append(merged)
+
+    replacement: dict[str, str] = {}
+    for component in event_edges:
+        canonical = "story_" + stable_hash(
+            {
+                "policy": STORY_EVENT_CATALOG_POLICY_VERSION,
+                "synchronized_events": sorted(component),
+            },
+            length=18,
+        )
+        replacement.update({event_id: canonical for event_id in component})
+    for candidate in candidates:
+        if candidate.story_event_id in replacement:
+            candidate.story_event_id = replacement[candidate.story_event_id]
+
+
 def _story_stage_bucket(stage: str) -> str:
     if stage in {"body", "action"}:
         return "activity"
@@ -1212,6 +1360,92 @@ def _multicamera_transcript_similarity(left: str, right: str) -> float:
     if len(normalized_left) < 4 or len(normalized_right) < 4:
         return 0.0
     return SequenceMatcher(None, normalized_left, normalized_right).ratio()
+
+
+def _matching_interview_qa_transcripts(
+    left: str,
+    right: str,
+    *,
+    strict: bool,
+) -> bool:
+    """Require matching Q&A meaning before treating recordings as one angle.
+
+    Wall-clock overlap is useful corroboration, but it cannot establish that
+    two family members were answering the same question.  The answer carries
+    more weight than boilerplate such as "what was your favorite?", so a
+    shared question with materially different answer subjects is rejected.
+    ``strict`` is used when one camera has only a relative clock.
+    """
+    normalized_left = _normalized_multicamera_text(left)
+    normalized_right = _normalized_multicamera_text(right)
+    if len(normalized_left) < 4 or len(normalized_right) < 4:
+        return False
+    if normalized_left == normalized_right:
+        return True
+
+    full_similarity = SequenceMatcher(
+        None,
+        normalized_left,
+        normalized_right,
+    ).ratio()
+    if full_similarity < (0.88 if strict else 0.64):
+        return False
+
+    left_answer = _interview_answer_fragment(left)
+    right_answer = _interview_answer_fragment(right)
+    normalized_left_answer = _normalized_multicamera_text(left_answer)
+    normalized_right_answer = _normalized_multicamera_text(right_answer)
+    if not normalized_left_answer or not normalized_right_answer:
+        return full_similarity >= (0.92 if strict else 0.78)
+    if normalized_left_answer == normalized_right_answer:
+        return True
+
+    answer_similarity = SequenceMatcher(
+        None,
+        normalized_left_answer,
+        normalized_right_answer,
+    ).ratio()
+    if answer_similarity < (0.72 if strict else 0.55):
+        return False
+
+    left_subject = _distinctive_interview_answer(normalized_left_answer)
+    right_subject = _distinctive_interview_answer(normalized_right_answer)
+    if left_subject and right_subject:
+        match = SequenceMatcher(None, left_subject, right_subject).find_longest_match()
+        minimum_length = min(len(left_subject), len(right_subject))
+        if match.size < 2 or match.size / max(1, minimum_length) < 0.4:
+            return False
+    elif strict:
+        return answer_similarity >= 0.9
+    return True
+
+
+def _normalized_multicamera_text(value: str) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", " ", value.casefold()).strip()
+
+
+def _interview_answer_fragment(value: str) -> str:
+    normalized = " ".join(value.split())
+    questions = _interview_questions(normalized)
+    if not questions:
+        return normalized
+    fragment = normalized[questions[-1][2] :]
+    question_end = re.search(r"[?？]", fragment)
+    if question_end is not None and question_end.start() <= 40:
+        fragment = fragment[question_end.end() :]
+    return fragment.strip()
+
+
+def _distinctive_interview_answer(value: str) -> str:
+    without_boilerplate = re.sub(
+        r"(?:제일|가장|여행|어떠[가-힣]*|어땠[가-힣]*|좋[가-힣]*|"
+        r"재미있[가-힣]*|재밌[가-힣]*|기억나[가-힣]*|마음에\s*들[가-힣]*|"
+        r"favorite|best|trip|travel|fun|good|great|remember|memory)",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", "", without_boilerplate)
 
 
 def _candidate_frame_hash(
@@ -1722,6 +1956,7 @@ def _meal_evidence(clip: Clip, cues: list[TranscriptCue]) -> _MealEvidence:
                     end=round(end, 3),
                     confidence={
                         "served_food": 0.97,
+                        "presented_food": 0.95,
                         "actual_eating": 0.96,
                         "food_reveal": 0.94,
                         "tasting_food": 0.92,
@@ -1849,6 +2084,8 @@ def _meal_direct_signal(text: str, clip_context: str = "") -> str | None:
         return "served_food"
     if _MEAL_FOOD_REVEAL_PATTERN.search(normalized):
         return "food_reveal"
+    if _MEAL_PRESENTED_FOOD_PATTERN.search(normalized):
+        return "presented_food"
     if _MEAL_ACTUAL_EATING_PATTERN.search(normalized):
         return "actual_eating"
     if (
@@ -1867,6 +2104,8 @@ def _meal_direct_signal(text: str, clip_context: str = "") -> str | None:
 
 
 def _meal_subtype(text: str) -> str:
+    if _MEAL_SOLID_FOOD_PATTERN.search(text):
+        return "meal"
     if _MEAL_DESSERT_PATTERN.search(text):
         return "dessert"
     if _MEAL_DRINK_PATTERN.search(text):
@@ -2313,6 +2552,196 @@ def _detect_family_interview_events(
         if continuation is not None:
             events_by_clip[clip.clip_id] = [continuation]
     return events_by_clip
+
+
+def _coalesce_multicamera_interview_events(
+    clips: list[Clip],
+    events_by_clip: dict[str, list[_InterviewEvent]],
+    cues_by_clip: dict[str, list[TranscriptCue]] | None = None,
+) -> dict[str, list[_InterviewEvent]]:
+    """Keep one complete camera recording for each simultaneous interview.
+
+    A sequential renderer cannot append duplicate recordings of the same Q&A
+    without replaying time.  Clock overlap alone is never enough: the spoken
+    question and answer must match, and one recording is suppressed only when
+    a directly compared representative covers its complete interval and text.
+    This directional containment check avoids transitive A↔B↔C grouping from
+    deleting a non-overlapping continuation.
+    """
+    cues_by_clip = cues_by_clip or {}
+    clip_by_id = {clip.clip_id: clip for clip in clips}
+    records = [
+        (
+            clip_by_id[clip_id],
+            event,
+            _window_transcript(
+                cues_by_clip.get(clip_id, []),
+                event.start,
+                event.end,
+            ),
+        )
+        for clip_id, events in events_by_clip.items()
+        if clip_id in clip_by_id
+        for event in events
+    ]
+    ranked = sorted(
+        records,
+        key=lambda item: (
+            item[1].end - item[1].start,
+            len(_normalized_multicamera_text(item[2])),
+            item[1].confidence,
+            item[0].source_kind == "action_camera",
+            item[0].clip_id,
+            item[1].start,
+        ),
+        reverse=True,
+    )
+
+    representatives: list[tuple[Clip, _InterviewEvent, str]] = []
+    for clip, event, transcript in ranked:
+        if any(
+            _interview_recording_subsumes(
+                representative_clip,
+                representative_event,
+                representative_transcript,
+                clip,
+                event,
+                transcript,
+            )
+            for representative_clip, representative_event, representative_transcript
+            in representatives
+        ):
+            continue
+        representatives.append((clip, event, transcript))
+
+    retained: dict[str, list[_InterviewEvent]] = defaultdict(list)
+    for clip, event, _ in representatives:
+        retained[clip.clip_id].append(event)
+    return {
+        clip_id: sorted(events, key=lambda item: (item.start, item.end, item.event_id))
+        for clip_id, events in retained.items()
+    }
+
+
+def _interview_recording_subsumes(
+    representative_clip: Clip,
+    representative: _InterviewEvent,
+    representative_transcript: str,
+    candidate_clip: Clip,
+    candidate: _InterviewEvent,
+    candidate_transcript: str,
+) -> bool:
+    if not _simultaneous_interview_events(
+        representative_clip,
+        representative,
+        candidate_clip,
+        candidate,
+        left_transcript=representative_transcript,
+        right_transcript=candidate_transcript,
+    ):
+        return False
+    if not _interview_transcript_subsumes(
+        representative_transcript,
+        candidate_transcript,
+    ):
+        return False
+
+    reliable_pair = bool(
+        representative_clip.capture_time_basis in {"absolute", "estimated"}
+        and candidate_clip.capture_time_basis in {"absolute", "estimated"}
+    )
+    representative_duration = max(0.001, representative.end - representative.start)
+    candidate_duration = max(0.001, candidate.end - candidate.start)
+    if not reliable_pair:
+        return representative_duration >= candidate_duration * 0.9
+
+    representative_start = _clip_start_timestamp(representative_clip) + representative.start
+    candidate_start = _clip_start_timestamp(candidate_clip) + candidate.start
+    overlap = max(
+        0.0,
+        min(
+            representative_start + representative_duration,
+            candidate_start + candidate_duration,
+        )
+        - max(representative_start, candidate_start),
+    )
+    return overlap / candidate_duration >= 0.9
+
+
+def _simultaneous_interview_events(
+    left_clip: Clip,
+    left: _InterviewEvent,
+    right_clip: Clip,
+    right: _InterviewEvent,
+    *,
+    left_transcript: str = "",
+    right_transcript: str = "",
+) -> bool:
+    if (
+        left_clip.clip_id == right_clip.clip_id
+        or left_clip.day_key != right_clip.day_key
+        or (left_clip.source_stream_id or left_clip.clip_id)
+        == (right_clip.source_stream_id or right_clip.clip_id)
+        or "unplaced"
+        in {left_clip.capture_time_basis, right_clip.capture_time_basis}
+    ):
+        return False
+    reliable_pair = bool(
+        left_clip.capture_time_basis in {"absolute", "estimated"}
+        and right_clip.capture_time_basis in {"absolute", "estimated"}
+    )
+    if not reliable_pair:
+        return False
+    if not _matching_interview_qa_transcripts(
+        left_transcript,
+        right_transcript,
+        strict=False,
+    ):
+        return False
+
+    left_start = _clip_start_timestamp(left_clip) + left.start
+    right_start = _clip_start_timestamp(right_clip) + right.start
+    left_duration = max(0.001, left.end - left.start)
+    right_duration = max(0.001, right.end - right.start)
+    overlap = max(
+        0.0,
+        min(left_start + left_duration, right_start + right_duration)
+        - max(left_start, right_start),
+    )
+    return overlap / min(left_duration, right_duration) >= 0.45
+
+
+def _interview_transcript_subsumes(
+    representative: str,
+    candidate: str,
+) -> bool:
+    normalized_representative = re.sub(
+        r"\s+",
+        "",
+        _normalized_multicamera_text(representative),
+    )
+    normalized_candidate = re.sub(
+        r"\s+",
+        "",
+        _normalized_multicamera_text(candidate),
+    )
+    if not normalized_representative or not normalized_candidate:
+        return False
+    if normalized_candidate in normalized_representative:
+        return True
+
+    def grams(value: str) -> set[str]:
+        size = 3 if len(value) >= 8 else 2
+        return {
+            value[index : index + size]
+            for index in range(max(1, len(value) - size + 1))
+        }
+
+    representative_grams = grams(normalized_representative)
+    candidate_grams = grams(normalized_candidate)
+    if not candidate_grams:
+        return False
+    return len(representative_grams & candidate_grams) / len(candidate_grams) >= 0.78
 
 
 def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_InterviewEvent]:
@@ -3426,6 +3855,30 @@ def _roles(text: str, clip: Clip, start: float, end: float, origin: str) -> list
     return unique_preserving_order(roles or ["moment"])
 
 
+def _promote_meaningful_phone_visual(
+    roles: list[str],
+    clip: Clip,
+    *,
+    origin: str,
+    speech_ratio: float,
+    motion: float,
+    quality: float,
+) -> list[str]:
+    """Treat a strong silent phone shot as content, even without a person."""
+    if (
+        clip.source_kind == "phone"
+        and origin in {"visual", "opener", "closer", "coverage"}
+        and speech_ratio <= 0.08
+        and (
+            quality >= 0.55
+            or (motion >= 0.05 and quality >= 0.35)
+            or (2.0 <= clip.duration <= 8.0 and quality >= 0.32)
+        )
+    ):
+        return unique_preserving_order(["scenery", *roles])
+    return roles
+
+
 def _score_candidate(
     roles: list[str],
     speech_ratio: float,
@@ -3480,8 +3933,12 @@ def _day_summary(candidates: list[Candidate]) -> list[dict[str, Any]]:
 
 
 def _candidate_timestamp(candidate: Candidate) -> float:
-    return datetime.fromisoformat(candidate.captured_at).astimezone(timezone.utc).timestamp()
+    return datetime.fromisoformat(
+        candidate.sequence_at or candidate.captured_at
+    ).astimezone(timezone.utc).timestamp()
 
 
 def _clip_start_timestamp(clip: Clip) -> float:
-    return datetime.fromisoformat(clip.captured_at).astimezone(timezone.utc).timestamp()
+    return datetime.fromisoformat(
+        clip.sequence_at or clip.captured_at
+    ).astimezone(timezone.utc).timestamp()
