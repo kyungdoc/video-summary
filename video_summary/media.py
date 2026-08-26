@@ -19,7 +19,7 @@ from .utils import VideoSummaryError, file_fingerprint, print_status, read_json,
 
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mts", ".m2ts", ".avi", ".mkv"}
-_CAPTURE_TIME_POLICY_VERSION = 8
+_CAPTURE_TIME_POLICY_VERSION = 9
 VISUAL_SIGNAL_POLICY_VERSION = 2
 _UNPLACED_DAY_KEY = "unplaced"
 _GLOBALLY_PLACED_BASES = frozenset({"absolute", "estimated"})
@@ -367,10 +367,10 @@ def infer_sequence_time(
 
     Native phone timestamps remain fixed anchors.  A project may calibrate a
     reset camera clock with ``clock_offset_seconds``.  DJI Mimo exports have a
-    second filename timestamp that represents the actual recording time; when
-    it materially disagrees with generic container metadata, that filename
-    value is used only for sequencing and the original ``captured_at`` remains
-    available for audit.
+    second filename timestamp that represents the actual recording time.  Use
+    that value consistently for sequencing, even when generic container
+    metadata differs by only a second or two, while keeping the original
+    ``captured_at`` available for audit.
     """
     warnings: list[str] = []
     override = override or None
@@ -404,14 +404,13 @@ def infer_sequence_time(
                     sequence_timezone,
                 )
                 sequence_base_source = "date_override:dji_mimo_filename"
-            elif abs((captured_at - filename_time).total_seconds()) > 60.0:
-                sequence_base_source = "dji_mimo_filename"
             else:
-                filename_time = None
-            if filename_time is not None:
-                sequence_base = filename_time
+                sequence_base_source = "dji_mimo_filename"
+            sequence_base = filename_time
+            if abs((captured_at - filename_time).total_seconds()) > 60.0:
                 warnings.append(
-                    "DJI Mimo 파일명의 두 번째 촬영 시각을 영상 순서에 사용했습니다."
+                    "DJI Mimo 파일명의 두 번째 촬영 시각과 컨테이너 시각이 달라 "
+                    "파일명 시각을 영상 순서에 사용했습니다."
                 )
 
     # The presence of the key is itself an auditable manual review decision.

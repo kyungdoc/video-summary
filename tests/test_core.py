@@ -259,6 +259,21 @@ class CoreTests(unittest.TestCase):
         )
         self.assertTrue(warnings)
 
+    def test_dji_mimo_prefers_second_timestamp_when_metadata_is_close(self) -> None:
+        timezone = ZoneInfo("Asia/Ho_Chi_Minh")
+        sequence_at, source, warnings = infer_sequence_time(
+            Path("dji_mimo_20251227_121700_20251227121649_123_video.mp4"),
+            datetime(2025, 12, 27, 12, 16, 50, tzinfo=timezone),
+            "metadata",
+            timezone,
+            None,
+            source_kind="action_camera",
+        )
+
+        self.assertEqual(sequence_at.isoformat(), "2025-12-27T12:16:49+07:00")
+        self.assertEqual(source, "dji_mimo_filename")
+        self.assertEqual(warnings, [])
+
     def test_manual_clock_offset_changes_sequence_but_not_capture_time(self) -> None:
         timezone = ZoneInfo("Asia/Seoul")
         captured = datetime(2026, 5, 17, 12, 27, 9, tzinfo=timezone)

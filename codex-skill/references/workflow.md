@@ -32,6 +32,8 @@ The first intro uses a destination display title, not the internal project ID. L
 
 ## Ordering and output contract
 
+For DJI Mimo media, always use the second consecutive filename timestamp as the recording-order anchor, even when it differs from container metadata by only one or two seconds. Record `sequence_source=dji_mimo_filename` and retain raw `captured_at` for audit.
+
 Within each DAY, all selected source segments remain in verified `sequence_at` order. Preserve raw metadata `captured_at` for audit and apply camera-clock calibration only to the sequence field. With `cold_open` enabled, only the earliest selected source may be labeled `hook`; it remains after the DAY's visual date card and is not moved ahead of it.
 
 The local planner preserves the earliest candidate as the DAY's journey anchor and reserves room for a visually strong low- or no-speech scenery candidate when one is available. Visual quality and stable outdoor context remain valid selection signals even without transcript text.

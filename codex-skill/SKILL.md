@@ -65,6 +65,8 @@ bash /absolute/path/to/this-skill/scripts/run-video-summary.sh run \
 
 ## Output contract
 
+- For DJI Mimo media, always use the second consecutive filename timestamp as the recording-order anchor, even when it differs from container metadata by only one or two seconds. Record `sequence_source=dji_mimo_filename` and preserve raw `captured_at` for audit.
+
 - Keep every selected source segment in verified `sequence_at` order within its DAY. Preserve raw metadata `captured_at` for audit; camera-clock calibration must change only sequence order. `cold_open` may label only the earliest selected source as `hook`; it stays after that DAY's visual date card and is never moved ahead of it.
 - Preserve the earliest usable candidate as each DAY's narrative anchor. Consider visually strong scenery and stable outdoor shots even with little or no speech; do not rank candidates by transcript density alone.
 - A trip MP4 follows: global mosaic intro (classic title card fallback) → DAY date card → all chronological source segments for that DAY, including the optional earliest hook → repeat for later DAYs → global outro.

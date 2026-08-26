@@ -15,6 +15,8 @@
 
 ## Stable invariants
 
+- DJI Mimo 파일은 두 번째 연속 날짜·시각 토큰을 실제 녹화 순서 기준으로 항상 사용합니다. 컨테이너 시각과 1~2초만 달라도 `sequence_source=dji_mimo_filename`을 유지하고 raw `captured_at`은 감사용으로 보존합니다.
+
 - 각 여행일의 모든 source 구간은 첫 장면부터 마지막 장면까지 검증된 `sequence_at` 순서입니다. 원본 메타데이터의 `captured_at`은 감사용으로 그대로 남기고, 카메라 시계 보정은 편집 순서에만 적용합니다. `cold_open`도 이 순서를 깨지 않으며, 선택된 후보 중 가장 이른 하나만 첫 source인 `hook`이 될 수 있습니다.
 - plan은 coverage-first event-flow입니다. 선택 예산을 보기 전에 각 DAY의 전체 원본을 훑어 실제 활동을 시간순 `story_event_id`로 묶고, 모든 후보를 사건/단계/중요도/속도 정책에 할당합니다. 후보로 덮이지 않는 원본 길이는 `unassigned_source_seconds`로 드러내며, candidate hole이 사건 부재를 의미하지 않으므로 contact sheet/원본 시간축을 재검수합니다. 전체 사건 스파인을 구성한 뒤에야 편집 방법을 결정합니다.
 - 사건의 서사 단위는 `setup → body/action → reaction/outcome → closure`입니다. 사건 성격과 실제 촬영 범위에 따라 단계가 생략될 수는 있지만 setup/closure로 body/action을 대체하지 않습니다. 원본/contact sheet 감사에서 body/action이 촬영되지 않았다고 판단하면 검수 메모에 `not_filmed`로 남기고, setup과 closure만으로 완결된 활동처럼 연출하지 않습니다. `not_filmed`는 현재 파이프라인이 자동 생성하는 필드가 아닙니다. 필요하면 “식사 후”·“잠시 쉬어 간 뒤”처럼 편집 공백을 명시하는 정직한 카드·캡션·나레이션 브리지만 사용합니다.
