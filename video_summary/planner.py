@@ -34,7 +34,10 @@ ALLOWED_ROLES = {
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
 MAX_CODEX_CONTACT_SHEETS = 20
 CONTACT_SHEET_CANDIDATES = 12
-STORY_SELECTION_POLICY_VERSION = 8
+STORY_SELECTION_POLICY_VERSION = 9
+CAMERA_SOURCE_PRIORITY_POLICY_VERSION = 1
+PHONE_MAIN_EDITORIAL_MARGIN = 0.10
+PHONE_MAIN_VISUAL_MARGIN = 0.20
 MAX_PLAN_SPEED = 4.0
 STORY_RUN_GAP_SECONDS = 2.0
 STORY_COVERAGE_RUN_MAX_SECONDS = 36.0
@@ -211,7 +214,7 @@ def _plan_cache_key(
 ) -> str:
     return stable_hash(
         {
-            "version": 24,
+            "version": 25,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "candidate_policy_versions": _normalized_candidate_policy_versions(
@@ -230,6 +233,7 @@ def _plan_cache_key(
             "adaptive_fast_forward": config["editing"].get("adaptive_fast_forward", True),
             "max_fast_forward_speed": config["editing"].get("max_fast_forward_speed", 3.0),
             "story_selection_policy": STORY_SELECTION_POLICY_VERSION,
+            "camera_source_priority_policy": CAMERA_SOURCE_PRIORITY_POLICY_VERSION,
             "cold_open": config["editing"].get("cold_open", True),
             "plan_file": str(plan_file_path) if plan_file_path else None,
             "plan_file_key": plan_file_key,
@@ -843,6 +847,9 @@ def build_planner_request(
         + ", ".join(f"{key}={value:g}s" for key, value in pacing_envelopes.items())
         + ". 필수·phase anchor가 넘으면 완결성을 위해 soft overflow를 허용하세요.",
         f"현재 tone profile은 {tone_profile}입니다. {tone_instruction}",
+        "source_kind=action_camera와 phone이 같은 story_event_id의 같은 서사 beat를 동등하게 담았다면 사용 가능한 action_camera를 대표 화면으로 우선하세요. 다만 이 우선순위로 사건이나 서사 단계를 삭제해서는 안 됩니다.",
+        "phone이 action_camera에 없는 핵심 body/action/reaction/outcome, 선택·공개·대화, 실제 식사 body, 만남·이동 거점을 담았거나 화면·내용이 명확히 더 좋다면 2~8초 보조 cutaway가 아니라 길이 제한 없는 정상 main segment로 선택하세요. 해당 사건에 action_camera coverage가 없으면 phone을 동등한 primary로 취급하세요.",
+        "필수 인터뷰·transition·meal 계약과 DAY anchor는 카메라 선호보다 우선합니다. 세로 화면이라는 이유로 phone 후보의 순위를 낮추지 마세요.",
         "speed_policy=protected_1x 또는 omit인 후보는 정확히 speed=1.0으로만 사용하세요.",
         f"speed_policy=allow_fast인 후보만 0.75~{configured_max_speed:g}배속을 사용할 수 있고, 1배속 초과는 무대사·저정보 이동/대기/접근 압축에만 사용하세요. exclusion_reason이 있는 후보는 절대 선택하지 마세요.",
         "각 날짜를 출발/도입 → 탐색/이동 → 핵심 경험 → 마무리의 4단계 이야기로 구성하되 실제 촬영 순서를 바꾸지 마세요.",
@@ -938,6 +945,8 @@ def build_planner_request(
                 f"required_meal_event_ids={','.join(_required_meal_event_ids(candidate)) or '-'} | "
                 f"required_meal_context_ids={','.join(_required_meal_context_ids(candidate)) or '-'} | "
                 f"event={candidate.story_event_id or '-'}:{candidate.story_stage} | "
+                f"source_kind={candidate.source_kind} | source_stream={candidate.source_stream_id or '-'} | "
+                f"capture_time_confidence={candidate.capture_time_confidence} | "
                 f"importance={candidate.importance} | speed_policy={candidate.speed_policy} | "
                 f"excluded={candidate.exclusion_reason or '-'} | "
                 f"location={candidate.location or '-'} | transcript={transcript or '[silent]'}"
@@ -956,6 +965,7 @@ def build_planner_request(
             f"- {soft_max:.1f}초는 삭제 상한이 아니라 압축 재검토 guard; 고유 event 보존 때문에 초과해도 허용",
             "- 모든 story event를 먼저 시간순으로 대표하고 full → compact → speed_up → omit 순서로만 줄일 것",
             f"- tone profile은 {tone_profile}; event coverage나 필수 단계는 바꾸지 않고 사건 내부 후보 우선순위에만 적용",
+            "- 같은 사건·같은 beat의 동등한 action_camera/phone 후보는 action_camera를 soft default로 삼되, phone이 유일하거나 명확히 우수한 핵심 단계이면 정상 main segment로 선택; phone-only 사건은 phone을 primary로 취급",
             "- speed_policy=protected_1x/omit은 speed=1.0만 허용; allow_fast만 0.75배 레거시 속도 또는 설정된 최대 배속까지 허용",
             "- exclusion_reason이 있는 candidate_id는 선택 금지",
             "- segment에는 candidate_id, role, reason, location, caption, speed를 모두 포함; 표시값이 없으면 location/caption은 null, speed는 1.0",
@@ -984,7 +994,7 @@ def _planner_candidates_payload(
     pacing_profile = _configured_pacing_profile(config) if config is not None else None
     tone_profile = _configured_tone_profile(config) if config is not None else None
     return {
-        "version": 4,
+        "version": 5,
         "candidate_set_hash": candidate_set_hash,
         "transcript_policy": "whitespace-normalized excerpt, maximum 240 characters per candidate",
         "story_selection_contract": {
@@ -997,6 +1007,14 @@ def _planner_candidates_payload(
             "omit_weak_fragments": True,
             "omit_near_duplicates": True,
             "multicamera_angle_policy": "select_one_per_angle_group_except_required_contracts",
+            "camera_source_priority_policy": {
+                "version": CAMERA_SOURCE_PRIORITY_POLICY_VERSION,
+                "equivalent_beat_default": "action_camera",
+                "phone_main_when": "unique_or_materially_better_key_stage",
+                "phone_only_event": "equal_primary",
+                "vertical_penalty": False,
+                "low_confidence": "independent_event_evidence_only",
+            },
             "pacing_profile": pacing_profile,
             "tone_profile": tone_profile,
             "tone_scope": "within_event_ranking_and_eligible_bridge_rhythm_only",
@@ -1054,6 +1072,7 @@ def _planner_candidates_payload(
                 "travel_day": item.travel_day,
                 "captured_at": item.captured_at,
                 "source_group": item.clip_id,
+                "source_kind": item.source_kind,
                 "source_stream_id": item.source_stream_id,
                 "capture_time_confidence": item.capture_time_confidence,
                 "angle_group_id": item.angle_group_id,
@@ -1473,17 +1492,7 @@ def _compact_day_selection_for_pacing(
 
     kept_ids: set[str] = set()
     effective_source_streams = source_stream_by_clip or source_family_by_clip or {}
-    selected_streams_by_event: dict[str, set[str]] = defaultdict(set)
-    for item in selected:
-        if item.story_event_id and item.capture_time_confidence != "low":
-            selected_streams_by_event[item.story_event_id].add(
-                effective_source_streams.get(item.clip_id, item.clip_id)
-            )
-    alternate_angle_event_ids = {
-        event_id
-        for event_id, streams in selected_streams_by_event.items()
-        if len(streams) > 1
-    }
+    alternate_angle_event_ids: set[str] = set()
     ordered_groups = _pacing_event_groups(selected)
     for values in ordered_groups:
         values.sort(key=_candidate_sort_key)
@@ -1497,8 +1506,23 @@ def _compact_day_selection_for_pacing(
         # keeps its own filmed activity. A forced setup or exit must never
         # impersonate the body/action, and merging fragmented event IDs must
         # not let the tighter profile erase one of those IDs.
+        represented_story_ids = {
+            item.story_event_id for item in values if item.story_event_id
+        }
+        phone_main_candidates = [
+            item
+            for item in day_candidates
+            if item.story_event_id in represented_story_ids
+            and _phone_main_stage_candidate(item)
+        ]
+        phase_values = list(
+            {
+                item.candidate_id: item
+                for item in (*values, *phone_main_candidates)
+            }.values()
+        )
         story_subgroups: dict[str, list[Candidate]] = defaultdict(list)
-        for item in values:
+        for item in phase_values:
             story_subgroups[
                 item.story_event_id or f"candidate:{item.candidate_id}"
             ].append(item)
@@ -1518,11 +1542,10 @@ def _compact_day_selection_for_pacing(
                 if item.story_stage in {"body", "action", "outcome"}
             ]
             event_kept.append(
-                max(
+                _preferred_camera_candidate(
                     activity_options or story_values,
-                    key=lambda item: _pacing_candidate_rank(
-                        item, prompt_role_weights, tone_profile=tone_profile
-                    ),
+                    prompt_role_weights,
+                    tone_profile=tone_profile,
                 )
             )
 
@@ -1535,19 +1558,22 @@ def _compact_day_selection_for_pacing(
             PACING_ANTICIPATION_CUES,
             PACING_REVEAL_CUES,
         ):
-            options = [item for item in values if _pacing_cue_count(item, cues)]
+            options = [
+                item for item in phase_values if _pacing_cue_count(item, cues)
+            ]
             if not options:
                 continue
-            chosen = max(
-                options,
-                key=lambda item: (
-                    _pacing_cue_count(item, cues),
-                    _pacing_candidate_rank(
-                        item,
-                        prompt_role_weights,
-                        tone_profile=tone_profile,
-                    ),
-                ),
+            maximum_cue_count = max(
+                _pacing_cue_count(item, cues) for item in options
+            )
+            chosen = _preferred_camera_candidate(
+                [
+                    item
+                    for item in options
+                    if _pacing_cue_count(item, cues) == maximum_cue_count
+                ],
+                prompt_role_weights,
+                tone_profile=tone_profile,
             )
             kept_cue_count = max(
                 (_pacing_cue_count(item, cues) for item in event_kept),
@@ -1571,16 +1597,15 @@ def _compact_day_selection_for_pacing(
             ):
                 if any(item.story_stage in stages for item in event_kept):
                     continue
-                options = [item for item in values if item.story_stage in stages]
+                options = [
+                    item for item in phase_values if item.story_stage in stages
+                ]
                 if options:
                     event_kept.append(
-                        max(
+                        _preferred_camera_candidate(
                             options,
-                            key=lambda item: _pacing_candidate_rank(
-                                item,
-                                prompt_role_weights,
-                                tone_profile=tone_profile,
-                            ),
+                            prompt_role_weights,
+                            tone_profile=tone_profile,
                         )
                     )
 
@@ -1636,6 +1661,14 @@ def _compact_day_selection_for_pacing(
                 item.story_event_id for item in values if item.story_event_id
             }
             for event_id in sorted(event_ids):
+                selected_event_streams = {
+                    effective_source_streams.get(item.clip_id, item.clip_id)
+                    for item in event_kept
+                    if item.story_event_id == event_id
+                    and item.capture_time_confidence != "low"
+                }
+                if len(selected_event_streams) > 1:
+                    alternate_angle_event_ids.add(event_id)
                 if event_id in alternate_angle_event_ids:
                     continue
                 event_values = [
@@ -1788,16 +1821,19 @@ def _playful_chain_candidates(
     ]
     if not reveal_options:
         return []
-    reveal = max(
-        reveal_options,
-        key=lambda item: (
-            _pacing_cue_count(item, PACING_REVEAL_CUES),
-            _pacing_candidate_rank(
-                item,
-                prompt_role_weights,
-                tone_profile="playful",
-            ),
-        ),
+    maximum_reveal_cues = max(
+        _pacing_cue_count(item, PACING_REVEAL_CUES)
+        for item in reveal_options
+    )
+    reveal = _preferred_camera_candidate(
+        [
+            item
+            for item in reveal_options
+            if _pacing_cue_count(item, PACING_REVEAL_CUES)
+            == maximum_reveal_cues
+        ],
+        prompt_role_weights,
+        tone_profile="playful",
     )
     reveal_time = _candidate_wallclock_seconds(reveal)
     before = [
@@ -1814,14 +1850,12 @@ def _playful_chain_candidates(
     ]
 
     def best(options: list[Candidate]) -> Candidate | None:
-        return max(
+        if not options:
+            return None
+        return _preferred_camera_candidate(
             options,
-            key=lambda item: _pacing_candidate_rank(
-                item,
-                prompt_role_weights,
-                tone_profile="playful",
-            ),
-            default=None,
+            prompt_role_weights,
+            tone_profile="playful",
         )
 
     choice = best(
@@ -1854,18 +1888,23 @@ def _playful_chain_candidates(
             or item.motion_score >= 0.15
         )
     ]
-    action = max(
-        action_options,
-        key=lambda item: (
-            item.story_stage == "action",
-            item.motion_score,
-            _pacing_candidate_rank(
-                item,
-                prompt_role_weights,
-                tone_profile="playful",
+    action = (
+        _preferred_camera_candidate(
+            action_options,
+            prompt_role_weights,
+            tone_profile="playful",
+            ranker=lambda item: (
+                item.story_stage == "action",
+                item.motion_score,
+                _pacing_candidate_rank(
+                    item,
+                    prompt_role_weights,
+                    tone_profile="playful",
+                ),
             ),
-        ),
-        default=None,
+        )
+        if action_options
+        else None
     )
     reaction = best(
         [
@@ -1932,34 +1971,48 @@ def _suppress_repeated_angle_groups(
             ]
             if not options:
                 break
-            chosen = max(
-                options,
-                key=lambda item: (
-                    len(
+            maximum_coverage = max(
+                len(
+                    missing_meal_keys.intersection(
+                        _required_meal_contract_keys(item)
+                    )
+                )
+                for item in options
+            )
+            maximum_forced = max(
+                int(item.candidate_id in forced_ids)
+                for item in options
+                if len(
+                    missing_meal_keys.intersection(
+                        _required_meal_contract_keys(item)
+                    )
+                )
+                == maximum_coverage
+            )
+            chosen = _preferred_camera_candidate(
+                [
+                    item
+                    for item in options
+                    if len(
                         missing_meal_keys.intersection(
                             _required_meal_contract_keys(item)
                         )
-                    ),
-                    item.candidate_id in forced_ids,
-                    _pacing_candidate_rank(
-                        item,
-                        prompt_role_weights,
-                        tone_profile=tone_profile,
-                    ),
-                ),
+                    )
+                    == maximum_coverage
+                    and int(item.candidate_id in forced_ids) == maximum_forced
+                ],
+                prompt_role_weights,
+                tone_profile=tone_profile,
             )
             selected[chosen.candidate_id] = chosen
             missing_meal_keys.difference_update(
                 _required_meal_contract_keys(chosen)
             )
         if not selected:
-            best = max(
+            best = _preferred_camera_candidate(
                 values,
-                key=lambda item: _pacing_candidate_rank(
-                    item,
-                    prompt_role_weights,
-                    tone_profile=tone_profile,
-                ),
+                prompt_role_weights,
+                tone_profile=tone_profile,
             )
             selected[best.candidate_id] = best
         kept.extend(selected.values())
@@ -2071,6 +2124,25 @@ def _pacing_candidate_rank(
     *,
     tone_profile: str | None = None,
 ) -> tuple[float, float, float, float, str]:
+    return (
+        _pacing_candidate_value(
+            candidate,
+            prompt_role_weights,
+            tone_profile=tone_profile,
+        ),
+        candidate.visual_quality,
+        candidate.motion_score,
+        candidate.duration,
+        candidate.candidate_id,
+    )
+
+
+def _pacing_candidate_value(
+    candidate: Candidate,
+    prompt_role_weights: dict[str, float],
+    *,
+    tone_profile: str | None = None,
+) -> float:
     playful_bonus = 0.0
     if tone_profile == "playful":
         if "fun" in candidate.roles:
@@ -2088,13 +2160,238 @@ def _pacing_candidate_rank(
             playful_bonus += 0.08
         if candidate.speech_ratio > 0.08 and candidate.motion_score >= 0.12:
             playful_bonus += 0.05
-    return (
-        _event_run_value((candidate,), prompt_role_weights) + playful_bonus,
-        candidate.visual_quality,
-        candidate.motion_score,
-        candidate.duration,
-        candidate.candidate_id,
+    return _event_run_value((candidate,), prompt_role_weights) + playful_bonus
+
+
+def _planning_story_stage_bucket(stage: str) -> str:
+    if stage in {"body", "action"}:
+        return "activity"
+    if stage in {"reaction", "outcome"}:
+        return "reaction"
+    return stage
+
+
+def _key_moment_cue_count(candidate: Candidate) -> int:
+    return sum(
+        _pacing_cue_count(candidate, cues)
+        for cues in (
+            PACING_CHOICE_CUES,
+            PACING_ANTICIPATION_CUES,
+            PACING_REVEAL_CUES,
+            PLAYFUL_REACTION_CUES,
+        )
     )
+
+
+def _candidate_source_contract_keys(candidate: Candidate) -> frozenset[str]:
+    keys = {
+        *(f"interview:{value}" for value in _required_event_ids(candidate)),
+        *_required_meal_contract_keys(candidate),
+    }
+    if _is_required_transition(candidate):
+        keys.add("transition")
+    return frozenset(keys)
+
+
+def _phone_main_stage_candidate(candidate: Candidate) -> bool:
+    if (
+        candidate.source_kind != "phone"
+        or candidate.capture_time_confidence == "low"
+        or candidate.exclusion_reason
+    ):
+        return False
+    return bool(
+        _planning_story_stage_bucket(candidate.story_stage)
+        in {"activity", "reaction"}
+        or _key_moment_cue_count(candidate)
+        or _candidate_source_contract_keys(candidate)
+    )
+
+
+def _candidate_capture_overlap_ratio(left: Candidate, right: Candidate) -> float:
+    left_start = _candidate_wallclock_seconds(left)
+    right_start = _candidate_wallclock_seconds(right)
+    overlap = max(
+        0.0,
+        min(left_start + left.duration, right_start + right.duration)
+        - max(left_start, right_start),
+    )
+    return overlap / max(0.001, min(left.duration, right.duration))
+
+
+def _equivalent_camera_beat(left: Candidate, right: Candidate) -> bool:
+    if (
+        not left.story_event_id
+        or left.story_event_id != right.story_event_id
+        or left.day_key != right.day_key
+        or left.capture_time_confidence == "low"
+        or right.capture_time_confidence == "low"
+        or _planning_story_stage_bucket(left.story_stage)
+        != _planning_story_stage_bucket(right.story_stage)
+    ):
+        return False
+    if (
+        left.angle_group_id
+        and left.angle_group_id == right.angle_group_id
+    ):
+        return True
+    return _candidate_capture_overlap_ratio(left, right) >= 0.45
+
+
+def _candidate_importance_rank(candidate: Candidate) -> int:
+    return {"bridge": 0, "supporting": 1, "core": 2}.get(
+        candidate.importance,
+        1,
+    )
+
+
+def _phone_materially_better_than_action_camera(
+    phone: Candidate,
+    action_camera: Candidate,
+    prompt_role_weights: dict[str, float],
+    *,
+    tone_profile: str | None,
+) -> bool:
+    if not _phone_main_stage_candidate(phone):
+        return False
+    if not _equivalent_camera_beat(phone, action_camera):
+        return False
+    if (
+        _candidate_source_contract_keys(phone)
+        - _candidate_source_contract_keys(action_camera)
+    ):
+        return True
+    if _candidate_importance_rank(phone) > _candidate_importance_rank(
+        action_camera
+    ):
+        return True
+    if _key_moment_cue_count(phone) > _key_moment_cue_count(action_camera):
+        return True
+    if _pacing_candidate_value(
+        phone,
+        prompt_role_weights,
+        tone_profile=tone_profile,
+    ) >= _pacing_candidate_value(
+        action_camera,
+        prompt_role_weights,
+        tone_profile=tone_profile,
+    ) + PHONE_MAIN_EDITORIAL_MARGIN:
+        return True
+    return bool(
+        phone.visual_quality
+        >= action_camera.visual_quality + PHONE_MAIN_VISUAL_MARGIN
+        and phone.score >= action_camera.score - 0.05
+    )
+
+
+def _preferred_camera_candidate(
+    options: list[Candidate],
+    prompt_role_weights: dict[str, float],
+    *,
+    tone_profile: str | None = None,
+    ranker: Any | None = None,
+) -> Candidate:
+    """Choose a main view without treating every phone clip as a cutaway.
+
+    Action-camera preference applies only to reliable candidates that cover
+    the same event beat. A phone-only beat stays primary, while a phone view
+    can replace an equivalent action-camera view when its narrative or visual
+    evidence is materially stronger.
+    """
+    if not options:
+        raise VideoSummaryError("대표 카메라 후보가 비어 있습니다.")
+    effective_ranker = ranker or (
+        lambda item: _pacing_candidate_rank(
+            item,
+            prompt_role_weights,
+            tone_profile=tone_profile,
+        )
+    )
+    reliable_options = [
+        item for item in options if item.capture_time_confidence != "low"
+    ]
+    # A manually inferred timestamp cannot win an automatic camera
+    # comparison merely through score or visual quality.  Low-confidence
+    # footage remains eligible when it is the only independently represented
+    # evidence for the beat/event.
+    comparison_options = reliable_options or options
+    base_best = max(comparison_options, key=effective_ranker)
+
+    reliable_action_cameras = [
+        item
+        for item in comparison_options
+        if item.source_kind == "action_camera"
+        and item.capture_time_confidence != "low"
+    ]
+    if not reliable_action_cameras:
+        return base_best
+
+    if base_best.source_kind == "action_camera":
+        promotable_phones = [
+            item
+            for item in comparison_options
+            if item.source_kind == "phone"
+            and _phone_materially_better_than_action_camera(
+                item,
+                base_best,
+                prompt_role_weights,
+                tone_profile=tone_profile,
+            )
+        ]
+        return (
+            max(promotable_phones, key=effective_ranker)
+            if promotable_phones
+            else base_best
+        )
+
+    equivalent_action_cameras = [
+        item
+        for item in reliable_action_cameras
+        if _equivalent_camera_beat(base_best, item)
+    ]
+    if not equivalent_action_cameras:
+        return base_best
+    action_best = max(equivalent_action_cameras, key=effective_ranker)
+    if base_best.source_kind == "phone" and _phone_materially_better_than_action_camera(
+        base_best,
+        action_best,
+        prompt_role_weights,
+        tone_profile=tone_profile,
+    ):
+        return base_best
+    return action_best
+
+
+def _preferred_camera_run(
+    options: list[tuple[Candidate, ...]],
+    prompt_role_weights: dict[str, float],
+) -> tuple[Candidate, ...] | None:
+    if not options:
+        return None
+    representative_to_run: dict[str, tuple[Candidate, ...]] = {}
+    representatives: list[Candidate] = []
+    for run in options:
+        representative = max(
+            run,
+            key=lambda item: _pacing_candidate_rank(
+                item,
+                prompt_role_weights,
+            ),
+        )
+        representative_to_run[representative.candidate_id] = run
+        representatives.append(representative)
+    chosen = _preferred_camera_candidate(
+        representatives,
+        prompt_role_weights,
+        ranker=lambda item: (
+            _event_run_value(
+                representative_to_run[item.candidate_id],
+                prompt_role_weights,
+            ),
+            _pacing_candidate_rank(item, prompt_role_weights),
+        ),
+    )
+    return representative_to_run[chosen.candidate_id]
 
 
 def used_duration(candidates: list[Candidate]) -> float:
@@ -2397,10 +2694,9 @@ def _event_flow_runs(
         if _event_run_is_meaningful(event, run, prompt_role_weights)
     ]
     if not meaningful:
-        fallback = max(
-            event.runs,
-            key=lambda run: _event_run_value(run, prompt_role_weights),
-            default=None,
+        fallback = _preferred_camera_run(
+            list(event.runs),
+            prompt_role_weights,
         )
         if (
             fallback is not None
@@ -2434,9 +2730,9 @@ def _event_flow_runs(
         ]
         if options:
             selected.append(
-                max(
+                _preferred_camera_run(
                     options,
-                    key=lambda run: _event_run_value(run, prompt_role_weights),
+                    prompt_role_weights,
                 )
             )
     clip_arcs = _clip_arc_runs(event.runs, prompt_role_weights)
@@ -2834,11 +3130,23 @@ def _mandatory_day_candidates(candidates: list[Candidate]) -> list[Candidate]:
     for options in _meal_event_option_groups(ordered).values():
         option_ids = {item.candidate_id for item in options}
         if mandatory_ids.isdisjoint(option_ids):
-            mandatory_ids.add(max(options, key=_meal_option_rank).candidate_id)
+            mandatory_ids.add(
+                _preferred_camera_candidate(
+                    options,
+                    {},
+                    ranker=_meal_option_rank,
+                ).candidate_id
+            )
     for options in _meal_context_option_groups(ordered).values():
         option_ids = {item.candidate_id for item in options}
         if mandatory_ids.isdisjoint(option_ids):
-            mandatory_ids.add(max(options, key=_meal_option_rank).candidate_id)
+            mandatory_ids.add(
+                _preferred_camera_candidate(
+                    options,
+                    {},
+                    ranker=_meal_option_rank,
+                ).candidate_id
+            )
     return [item for item in ordered if item.candidate_id in mandatory_ids]
 
 

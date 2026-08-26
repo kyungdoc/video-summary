@@ -17,6 +17,8 @@ from video_summary.planner import (
     _planner_candidates_payload,
     _playful_alternate_angle,
     _pacing_cue_count,
+    _phone_main_stage_candidate,
+    _preferred_camera_candidate,
     _prompt_role_weights,
     _sample_contact_sheets,
     _select_day_candidates,
@@ -122,6 +124,216 @@ class PlannerTests(unittest.TestCase):
             {item.candidate_id for item in selected},
             {"better-angle", "reaction-angle"},
         )
+
+    def test_action_camera_wins_an_equivalent_phone_beat_when_comparable(self) -> None:
+        action_camera = candidate("osmo", "2026-11-01T08:00:00-05:00")
+        phone = candidate("phone", "2026-11-01T08:00:00-05:00")
+        for item, kind, stream in (
+            (action_camera, "action_camera", "osmo-stream"),
+            (phone, "phone", "phone-stream"),
+        ):
+            item.roles = ["fun"]
+            item.transcript = ""
+            item.story_event_id = "pool"
+            item.story_stage = "action"
+            item.source_kind = kind
+            item.source_stream_id = stream
+            item.capture_time_confidence = "high"
+            item.angle_group_id = "same-beat"
+        action_camera.score = 0.78
+        action_camera.visual_quality = 0.76
+        phone.score = 0.82
+        phone.visual_quality = 0.82
+
+        selected = _preferred_camera_candidate(
+            [action_camera, phone],
+            {},
+            tone_profile="playful",
+        )
+
+        self.assertEqual(selected.candidate_id, "osmo")
+
+    def test_phone_can_be_the_main_view_when_materially_better(self) -> None:
+        action_camera = candidate("osmo", "2026-11-01T08:00:00-05:00")
+        phone = candidate("phone", "2026-11-01T08:00:00-05:00")
+        for item, kind, stream in (
+            (action_camera, "action_camera", "osmo-stream"),
+            (phone, "phone", "phone-stream"),
+        ):
+            item.roles = ["fun"]
+            item.transcript = ""
+            item.story_event_id = "pool"
+            item.story_stage = "reaction"
+            item.source_kind = kind
+            item.source_stream_id = stream
+            item.capture_time_confidence = "high"
+            item.angle_group_id = "same-beat"
+        action_camera.score = 0.62
+        action_camera.visual_quality = 0.58
+        phone.score = 0.90
+        phone.visual_quality = 0.90
+
+        selected = _preferred_camera_candidate(
+            [action_camera, phone],
+            {},
+            tone_profile="playful",
+        )
+
+        self.assertEqual(selected.candidate_id, "phone")
+
+    def test_long_phone_only_key_stage_is_promoted_as_a_main_segment(self) -> None:
+        setup = candidate("setup", "2026-11-01T08:00:00-05:00")
+        body = candidate("body", "2026-11-01T08:00:10-05:00")
+        phone_reaction = candidate(
+            "phone-reaction",
+            "2026-11-01T08:00:20-05:00",
+        )
+        closing = candidate("closing", "2026-11-01T08:00:35-05:00")
+        for item, stage in (
+            (setup, "setup"),
+            (body, "action"),
+            (phone_reaction, "reaction"),
+            (closing, "closure"),
+        ):
+            item.roles = ["fun"]
+            item.transcript = ""
+            item.story_event_id = "pool"
+            item.story_stage = stage
+            item.capture_time_confidence = "high"
+        for item in (setup, body, closing):
+            item.source_kind = "action_camera"
+            item.source_stream_id = "osmo-stream"
+        phone_reaction.source_kind = "phone"
+        phone_reaction.source_stream_id = "phone-stream"
+        phone_reaction.end = phone_reaction.start + 12.0
+        closing.roles.append("closer")
+
+        plan = local_plan(
+            self.config,
+            "수영 놀이와 가족 반응",
+            [setup, body, phone_reaction, closing],
+            "hash",
+        )
+        selected = {
+            segment.candidate_id: segment
+            for segment in plan.episodes[0].segments
+        }
+
+        self.assertIn("body", selected)
+        self.assertIn("phone-reaction", selected)
+        self.assertEqual(selected["phone-reaction"].speed, 1.0)
+        self.assertGreater(phone_reaction.duration, 8.0)
+
+    def test_low_confidence_phone_is_not_auto_promoted_as_a_main_stage(self) -> None:
+        phone = candidate("phone", "2026-11-01T08:00:00-05:00")
+        phone.roles = ["fun"]
+        phone.story_event_id = "pool"
+        phone.story_stage = "reaction"
+        phone.source_kind = "phone"
+        phone.capture_time_confidence = "low"
+
+        self.assertFalse(_phone_main_stage_candidate(phone))
+
+    def test_low_confidence_phone_cannot_outscore_a_reliable_osmo_view(self) -> None:
+        action_camera = candidate("osmo", "2026-11-01T08:00:00-05:00")
+        phone = candidate("phone", "2026-11-01T08:00:00-05:00")
+        for item, kind, confidence in (
+            (action_camera, "action_camera", "high"),
+            (phone, "phone", "low"),
+        ):
+            item.roles = ["fun"]
+            item.transcript = ""
+            item.story_event_id = "pool"
+            item.story_stage = "reaction"
+            item.source_kind = kind
+            item.capture_time_confidence = confidence
+        action_camera.score = action_camera.visual_quality = 0.70
+        phone.score = phone.visual_quality = 0.99
+
+        selected = _preferred_camera_candidate(
+            [action_camera, phone],
+            {},
+            tone_profile="playful",
+        )
+
+        self.assertEqual(selected.candidate_id, "osmo")
+
+    def test_phone_meal_body_remains_required_with_an_osmo_setup(self) -> None:
+        anchor = candidate("anchor", "2026-11-01T08:00:00-05:00")
+        osmo_setup = meal_context_candidate(
+            "osmo-setup",
+            "2026-11-01T12:00:00-05:00",
+            ["meal-1:setup"],
+        )
+        phone_body = meal_candidate(
+            "phone-body",
+            "2026-11-01T12:00:10-05:00",
+            ["meal-1"],
+        )
+        closing = candidate("closing", "2026-11-01T12:00:30-05:00")
+        for item in (anchor, osmo_setup, phone_body, closing):
+            item.story_event_id = "meal-story"
+            item.capture_time_confidence = "high"
+        anchor.story_stage = "setup"
+        anchor.source_kind = "action_camera"
+        osmo_setup.story_stage = "setup"
+        osmo_setup.source_kind = "action_camera"
+        phone_body.story_stage = "body"
+        phone_body.source_kind = "phone"
+        phone_body.end = phone_body.start + 12.0
+        closing.story_stage = "closure"
+        closing.source_kind = "action_camera"
+        closing.roles.append("closer")
+
+        plan = local_plan(
+            self.config,
+            "식사 흐름",
+            [anchor, osmo_setup, phone_body, closing],
+            "hash",
+        )
+        selected = {
+            segment.candidate_id: segment
+            for segment in plan.episodes[0].segments
+        }
+
+        self.assertIn("osmo-setup", selected)
+        self.assertIn("phone-body", selected)
+        self.assertEqual(selected["phone-body"].role, "food")
+        self.assertEqual(selected["phone-body"].speed, 1.0)
+
+    def test_phone_only_event_is_not_demoted_by_action_camera_in_another_event(self) -> None:
+        osmo = candidate("osmo-event", "2026-11-01T08:00:00-05:00")
+        phone = candidate("phone-event", "2026-11-01T09:00:00-05:00")
+        closing = candidate("closing", "2026-11-01T09:00:10-05:00")
+        for item in (osmo, phone, closing):
+            item.roles = ["fun"]
+            item.transcript = ""
+            item.capture_time_confidence = "high"
+        osmo.story_event_id = "osmo-only-event"
+        osmo.story_stage = "action"
+        osmo.source_kind = "action_camera"
+        osmo.source_stream_id = "osmo-stream"
+        phone.story_event_id = "phone-only-event"
+        phone.story_stage = "action"
+        phone.source_kind = "phone"
+        phone.source_stream_id = "phone-stream"
+        closing.story_event_id = "phone-only-event"
+        closing.story_stage = "closure"
+        closing.source_kind = "phone"
+        closing.source_stream_id = "phone-stream"
+        closing.roles.append("closer")
+
+        plan = local_plan(
+            self.config,
+            "모든 이벤트 흐름",
+            [osmo, phone, closing],
+            "hash",
+        )
+        selected_ids = {
+            segment.candidate_id for segment in plan.episodes[0].segments
+        }
+
+        self.assertIn("phone-event", selected_ids)
 
     def test_multicamera_meal_one_of_keeps_only_the_forced_representative(self) -> None:
         first = meal_candidate(
@@ -614,9 +826,10 @@ class PlannerTests(unittest.TestCase):
     def test_external_candidate_payload_only_contains_bounded_excerpt(self) -> None:
         item = candidate("private", "2026-11-01T10:00:00-05:00")
         item.transcript = "민감한 대화 " * 80
+        item.source_kind = "phone"
         payload = _planner_candidates_payload([item], "hash")
         exported = payload["candidates"][0]
-        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["version"], 5)
         self.assertEqual(
             payload["story_selection_contract"]["strategy"],
             "coverage_first_event_flow",
@@ -629,6 +842,11 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(
             payload["story_selection_contract"]["compression_ladder"],
             ["full", "compact", "speed_up", "omit"],
+        )
+        self.assertEqual(
+            payload["story_selection_contract"]["camera_source_priority_policy"]
+            ["equivalent_beat_default"],
+            "action_camera",
         )
         profiled = _planner_candidates_payload([item], "hash", self.config)
         self.assertEqual(
@@ -646,6 +864,18 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(exported["speed_policy"], "protected_1x")
         self.assertIn("story_stage", exported)
         self.assertIn("exclusion_reason", exported)
+        self.assertEqual(exported["source_kind"], "phone")
+        request = build_planner_request(
+            ProjectPaths(Path("/tmp"), "project"),
+            self.config,
+            "가족 여행",
+            [item],
+            "hash",
+        )
+        self.assertIn("보조 cutaway가 아니라 길이 제한 없는 정상 main segment", request)
+        self.assertIn("source_kind=phone", request)
+        self.assertNotIn("camera_make", request)
+        self.assertNotIn("camera_model", request)
 
     def test_external_planner_materials_fully_omit_excluded_candidates(self) -> None:
         public_story = candidate("public_story", "2026-11-01T08:00:00-05:00")

@@ -273,6 +273,7 @@ class CandidateCoverageTests(unittest.TestCase):
         self.assertEqual(candidate.importance, "supporting")
         self.assertEqual(candidate.speed_policy, "protected_1x")
         self.assertIsNone(candidate.exclusion_reason)
+        self.assertEqual(candidate.source_kind, "unknown")
 
     def test_candidate_cache_key_tracks_visual_signal_policy(self) -> None:
         clip = Clip(
@@ -306,6 +307,18 @@ class CandidateCoverageTests(unittest.TestCase):
                 MULTICAMERA_ANGLE_POLICY_VERSION + 1,
             ):
                 changed = _candidate_cache_key(paths, [clip], config)
+
+        self.assertNotEqual(current, changed)
+
+    def test_candidate_cache_key_tracks_source_kind(self) -> None:
+        clip = _clip(duration=10.0)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary), "project")
+            paths.ensure()
+            current = _candidate_cache_key(paths, [clip], config)
+            clip.source_kind = "phone"
+            changed = _candidate_cache_key(paths, [clip], config)
 
         self.assertNotEqual(current, changed)
 
@@ -1043,6 +1056,7 @@ class CandidateCoverageTests(unittest.TestCase):
             _clip("meal-body", duration=10.0, captured_at="2026-08-20T12:01:00+09:00"),
             _clip("meal-closure", duration=10.0, captured_at="2026-08-20T12:02:00+09:00"),
         ]
+        clips[1].source_kind = "phone"
         cues_by_clip = {
             "meal-setup": [TranscriptCue(1.0, 3.0, "자 밥 먹으러 갑시다")],
             "meal-body": [TranscriptCue(1.0, 3.0, "안녕")],
@@ -1068,7 +1082,7 @@ class CandidateCoverageTests(unittest.TestCase):
         meal_events = [
             event for event in payload["required_events"] if event["kind"] == "meal"
         ]
-        self.assertEqual(payload["version"], 5)
+        self.assertEqual(payload["version"], 6)
         self.assertEqual(payload["policy_versions"]["meal_event"], MEAL_EVENT_POLICY_VERSION)
         self.assertEqual(
             payload["policy_versions"]["full_coverage_partition"],
@@ -1092,6 +1106,7 @@ class CandidateCoverageTests(unittest.TestCase):
         ]
         self.assertTrue(tagged)
         self.assertEqual({candidate["clip_id"] for candidate in tagged}, {"meal-body"})
+        self.assertEqual({candidate["source_kind"] for candidate in tagged}, {"phone"})
         self.assertEqual(event["candidate_ids"], [candidate["candidate_id"] for candidate in tagged])
         self.assertEqual(
             event["option_ranges"][0]["candidate_ids"],
@@ -1750,7 +1765,7 @@ class CandidateCoverageTests(unittest.TestCase):
             ):
                 payload = build_candidates(paths, [clip], config)
 
-        self.assertEqual(payload["version"], 5)
+        self.assertEqual(payload["version"], 6)
         self.assertEqual(len(payload["required_events"]), 1)
         event = payload["required_events"][0]
         tagged = [

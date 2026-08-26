@@ -845,6 +845,7 @@ def build_candidates(
                         required_meal_context_ids=required_meal_context_ids,
                         origin=origin,
                         exclusion_reason=exclusion_reason,
+                        source_kind=clip.source_kind,
                         source_stream_id=clip.source_stream_id,
                         capture_time_confidence=clip.capture_time_confidence,
                     )
@@ -860,7 +861,7 @@ def build_candidates(
             *_required_meal_events_payload(meal_events, candidates),
         ]
         payload = {
-            "version": 5,
+            "version": 6,
             "project": config["project"]["name"],
             "cache_key": cache_key,
             "policy_versions": {
@@ -922,7 +923,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 17,
+            "version": 18,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "journey_transition_detection": {
                 "policy": JOURNEY_TRANSITION_POLICY_VERSION,
@@ -948,6 +949,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
                     clip.day_key,
                     clip.travel_day,
                     clip.location,
+                    clip.source_kind,
                     clip.source_stream_id,
                     clip.capture_time_confidence,
                 )

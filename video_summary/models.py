@@ -89,6 +89,7 @@ class Candidate:
     importance: str = "supporting"
     speed_policy: str = "protected_1x"
     exclusion_reason: str | None = None
+    source_kind: str = "unknown"
     source_stream_id: str | None = None
     capture_time_confidence: str = "medium"
     angle_group_id: str | None = None
