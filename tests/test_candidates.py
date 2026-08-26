@@ -159,6 +159,36 @@ class CandidateCoverageTests(unittest.TestCase):
 
         self.assertEqual(set(reconciled), {first.clip_id, second.clip_id})
 
+    def test_shared_qa_does_not_drop_different_interview_tails(self) -> None:
+        first = _clip("sea-tail", duration=24.0, captured_at="2026-08-20T10:00:00+09:00")
+        second = _clip("dolphin-tail", duration=24.0, captured_at="2026-08-20T10:00:00+09:00")
+        first.source_stream_id = "first-stream"
+        second.source_stream_id = "second-stream"
+        events = {
+            first.clip_id: [
+                _InterviewEvent("sea-event", first.clip_id, 0.0, 20.0, 0.96, ("spoken_answer",))
+            ],
+            second.clip_id: [
+                _InterviewEvent("dolphin-event", second.clip_id, 0.0, 20.0, 0.96, ("spoken_answer",))
+            ],
+        }
+        common = [
+            TranscriptCue(0.0, 4.0, "뭐가 제일 재미있었나요?"),
+            TranscriptCue(4.0, 12.0, "수영이 제일 재미있었어요"),
+        ]
+        cues = {
+            first.clip_id: [*common, TranscriptCue(12.0, 18.0, "바다도 정말 예뻤어요")],
+            second.clip_id: [*common, TranscriptCue(12.0, 18.0, "마지막에 돌고래도 봤어요")],
+        }
+
+        reconciled = _coalesce_multicamera_interview_events(
+            [first, second],
+            events,
+            cues,
+        )
+
+        self.assertEqual(set(reconciled), {first.clip_id, second.clip_id})
+
     def test_transitive_overlap_does_not_drop_nonoverlapping_interview_tail(self) -> None:
         clips = [
             _clip("first", duration=12.0, captured_at="2026-08-20T10:00:00+09:00"),

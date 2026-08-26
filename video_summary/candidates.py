@@ -51,7 +51,7 @@ MEAL_SETUP_HORIZON_SECONDS = 3.0 * 60.0 * 60.0
 MEAL_DIRECT_CLUSTER_SECONDS = 30.0 * 60.0
 MEAL_INFER_AFTER_SETUP_SECONDS = 15.0 * 60.0
 MEAL_INFER_BEFORE_CLOSURE_SECONDS = 15.0 * 60.0
-INTERVIEW_DETECTION_POLICY_VERSION = 6
+INTERVIEW_DETECTION_POLICY_VERSION = 7
 INTERVIEW_ANSWER_WAIT_SECONDS = 15.0
 INTERVIEW_CONTINUATION_GAP_SECONDS = 12.0
 INTERVIEW_EVENT_MAX_SPAN_SECONDS = 180.0
@@ -964,7 +964,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 22,
+            "version": 23,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "journey_transition_detection": {
                 "policy": JOURNEY_TRANSITION_POLICY_VERSION,
@@ -2727,21 +2727,11 @@ def _interview_transcript_subsumes(
     )
     if not normalized_representative or not normalized_candidate:
         return False
-    if normalized_candidate in normalized_representative:
-        return True
-
-    def grams(value: str) -> set[str]:
-        size = 3 if len(value) >= 8 else 2
-        return {
-            value[index : index + size]
-            for index in range(max(1, len(value) - size + 1))
-        }
-
-    representative_grams = grams(normalized_representative)
-    candidate_grams = grams(normalized_candidate)
-    if not candidate_grams:
-        return False
-    return len(representative_grams & candidate_grams) / len(candidate_grams) >= 0.78
+    # Approximate n-gram containment can erase a different family member's
+    # short unique closing answer when most of the preceding Q&A is shared.
+    # Prefer a duplicate over losing interview content: suppress only an exact
+    # normalized transcript that is wholly present in the representative.
+    return normalized_candidate in normalized_representative
 
 
 def _detect_interview_events(clip: Clip, cues: list[TranscriptCue]) -> list[_InterviewEvent]:
