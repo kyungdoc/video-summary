@@ -34,7 +34,7 @@ ALLOWED_ROLES = {
 MAX_SOURCE_OVERLAP_SECONDS = 0.001
 MAX_CODEX_CONTACT_SHEETS = 20
 CONTACT_SHEET_CANDIDATES = 12
-STORY_SELECTION_POLICY_VERSION = 11
+STORY_SELECTION_POLICY_VERSION = 12
 CAMERA_SOURCE_PRIORITY_POLICY_VERSION = 1
 PHONE_MAIN_EDITORIAL_MARGIN = 0.10
 PHONE_MAIN_VISUAL_MARGIN = 0.20
@@ -226,7 +226,7 @@ def _plan_cache_key(
 ) -> str:
     return stable_hash(
         {
-            "version": 28,
+            "version": 29,
             "project": config["project"]["name"],
             "candidate_set_hash": candidate_set_hash,
             "candidate_policy_versions": _normalized_candidate_policy_versions(
@@ -683,6 +683,10 @@ def validate_and_normalize_plan(
                     raise VideoSummaryError(
                         f"필수 이동 거점 후보는 role=transition이어야 합니다: {candidate_id}"
                     )
+            if _is_reviewed_inclusion(candidate) and speed != 1.0:
+                raise VideoSummaryError(
+                    f"검수 후 포함한 후보는 speed=1.0이어야 합니다: {candidate_id}"
+                )
             if (
                 _has_required_meal(candidate)
                 and not _is_required_interview(candidate)
@@ -796,6 +800,16 @@ def validate_and_normalize_plan(
     if missing_transitions:
         raise VideoSummaryError(
             "플래너가 필수 이동 거점 후보를 누락했습니다: " + ", ".join(missing_transitions)
+        )
+    reviewed_inclusions = {
+        candidate.candidate_id
+        for candidate in eligible_candidates
+        if _is_reviewed_inclusion(candidate)
+    }
+    missing_reviewed = sorted(reviewed_inclusions - used_candidates)
+    if missing_reviewed:
+        raise VideoSummaryError(
+            "플래너가 검수 후 포함할 후보를 누락했습니다: " + ", ".join(missing_reviewed)
         )
     for event_id, options in _meal_event_option_groups(eligible_candidates).items():
         option_ids = {candidate.candidate_id for candidate in options}
@@ -919,6 +933,7 @@ def build_planner_request(
         ]
         required_values = [item for item in ordered_values if _is_required_interview(item)]
         transition_values = [item for item in ordered_values if _is_required_transition(item)]
+        reviewed_values = [item for item in ordered_values if _is_reviewed_inclusion(item)]
         meal_event_groups = _meal_event_option_groups(ordered_values)
         meal_context_groups = _meal_context_option_groups(ordered_values)
         lines.extend(
@@ -940,6 +955,14 @@ def build_planner_request(
             lines.append(
                 "- mandatory transition waypoint candidates: "
                 + ", ".join(item.candidate_id for item in transition_values)
+            )
+        if reviewed_values:
+            lines.append(
+                "- mandatory human-reviewed visual candidates: "
+                + ", ".join(
+                    f"{item.candidate_id} ({item.reviewed_inclusion_reason})"
+                    for item in reviewed_values
+                )
             )
         for event_id, options in meal_event_groups.items():
             lines.append(
@@ -967,6 +990,7 @@ def build_planner_request(
                 f"required_event_ids={','.join(_required_event_ids(candidate)) or '-'} | "
                 f"required_meal_event_ids={','.join(_required_meal_event_ids(candidate)) or '-'} | "
                 f"required_meal_context_ids={','.join(_required_meal_context_ids(candidate)) or '-'} | "
+                f"reviewed_inclusion={candidate.reviewed_inclusion_reason or '-'} | "
                 f"event={candidate.story_event_id or '-'}:{candidate.story_stage} | "
                 f"source_kind={candidate.source_kind} | source_stream={candidate.source_stream_id or '-'} | "
                 f"capture_time_confidence={candidate.capture_time_confidence} | "
@@ -995,6 +1019,7 @@ def build_planner_request(
             "- segment에는 candidate_id, role, reason, location, caption, speed를 모두 포함; 표시값이 없으면 location/caption은 null, speed는 1.0",
             "- required_event_ids가 비어 있지 않은 candidate_id는 전부 포함; speed=1.0, location=null, caption=null, role=interview (날짜의 첫 segment만 hook 허용)",
             "- roles에 transition이 있는 candidate_id는 날짜별로 전부 포함; speed=1.0, role=transition (날짜의 첫 segment는 hook, 마지막 segment는 closing 허용)",
+            "- reviewed_inclusion이 있는 candidate_id는 사람이 의미를 확인한 장면이므로 전부 포함하고 speed=1.0 유지",
             "- 필수 인터뷰와 transition이 같은 candidate_id에 함께 있으면 인터뷰 role/location/caption 계약이 우선",
             "- role=journey만 있는 후보는 위 필수 이동 거점 계약의 대상이 아님",
             "- 각 required_meal_event_ids 이벤트의 one_of candidate_id 그룹에서 최소 1개를 포함하고, 반복 방지를 위해 가장 적절한 1개만 우선",
@@ -1018,7 +1043,7 @@ def _planner_candidates_payload(
     pacing_profile = _configured_pacing_profile(config) if config is not None else None
     tone_profile = _configured_tone_profile(config) if config is not None else None
     return {
-        "version": 5,
+        "version": 6,
         "candidate_set_hash": candidate_set_hash,
         "transcript_policy": "whitespace-normalized excerpt, maximum 240 characters per candidate",
         "story_selection_contract": {
@@ -1111,6 +1136,7 @@ def _planner_candidates_payload(
                 "required_event_ids": list(_required_event_ids(item)),
                 "required_meal_event_ids": list(_required_meal_event_ids(item)),
                 "required_meal_context_ids": list(_required_meal_context_ids(item)),
+                "reviewed_inclusion_reason": item.reviewed_inclusion_reason,
                 "score": item.score,
                 "speech_ratio": item.speech_ratio,
                 "motion_score": item.motion_score,
@@ -1976,6 +2002,7 @@ def _suppress_repeated_angle_groups(
             for item in values
             if _is_required_interview(item)
             or _is_required_transition(item)
+            or _is_reviewed_inclusion(item)
             or item.candidate_id == anchor_candidate_id
         ]
         selected = {item.candidate_id: item for item in protected}
@@ -2221,6 +2248,8 @@ def _candidate_source_contract_keys(candidate: Candidate) -> frozenset[str]:
     }
     if _is_required_transition(candidate):
         keys.add("transition")
+    if _is_reviewed_inclusion(candidate):
+        keys.add(f"reviewed:{candidate.candidate_id}")
     return frozenset(keys)
 
 
@@ -2925,9 +2954,12 @@ def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
     ranked = sorted(
         candidates,
         key=lambda item: (
-            _is_required_interview(item) or _is_required_transition(item),
+            _is_required_interview(item)
+            or _is_required_transition(item)
+            or _is_reviewed_inclusion(item),
             _is_required_interview(item),
             _is_required_transition(item),
+            _is_reviewed_inclusion(item),
             _has_required_meal(item),
             len(_required_meal_event_ids(item)) + len(_required_meal_context_ids(item)),
             item.score,
@@ -3083,6 +3115,7 @@ def _removable_angle_repeat_candidates(
             candidate.candidate_id == anchor_candidate_id
             or _is_required_interview(candidate)
             or _is_required_transition(candidate)
+            or _is_reviewed_inclusion(candidate)
         ):
             continue
         candidate_keys = _required_meal_contract_keys(candidate)
@@ -3154,6 +3187,10 @@ def _is_required_transition(candidate: Candidate) -> bool:
     return "transition" in candidate.roles
 
 
+def _is_reviewed_inclusion(candidate: Candidate) -> bool:
+    return bool((candidate.reviewed_inclusion_reason or "").strip())
+
+
 def _mandatory_day_candidates(candidates: list[Candidate]) -> list[Candidate]:
     if not candidates:
         return []
@@ -3162,7 +3199,11 @@ def _mandatory_day_candidates(candidates: list[Candidate]) -> list[Candidate]:
     mandatory_ids.update(
         item.candidate_id
         for item in ordered
-        if _is_required_interview(item) or _is_required_transition(item)
+        if (
+            _is_required_interview(item)
+            or _is_required_transition(item)
+            or _is_reviewed_inclusion(item)
+        )
     )
     for options in _meal_event_option_groups(ordered).values():
         option_ids = {item.candidate_id for item in options}
@@ -3200,7 +3241,11 @@ def _runtime_ceiling_exempt_candidate_ids(
         item.candidate_id
         for item in ordered
         if item.candidate_id in selected_ids
-        and (_is_required_interview(item) or _is_required_transition(item))
+        and (
+            _is_required_interview(item)
+            or _is_required_transition(item)
+            or _is_reviewed_inclusion(item)
+        )
     )
     for groups in (
         _meal_event_option_groups(ordered),

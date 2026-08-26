@@ -44,9 +44,9 @@ from .utils import (
 )
 
 
-RENDER_POLICY_VERSION = 24
+RENDER_POLICY_VERSION = 25
 SOURCE_RENDER_POLICY_VERSION = 8
-RENDER_REPORT_VERSION = 9
+RENDER_REPORT_VERSION = 10
 CARD_RENDER_POLICY_VERSION = 4
 MOSAIC_CARD_POLICY_VERSION = 5
 YOUTUBE_MIN_CHAPTERS = 3
@@ -549,6 +549,17 @@ def story_flow_coverage(
         for episode in plan.episodes
         for segment in episode.segments
     }
+    reviewed_inclusion_candidate_ids = {
+        candidate.candidate_id
+        for candidate in candidates
+        if candidate.reviewed_inclusion_reason and not candidate.exclusion_reason
+    }
+    selected_reviewed_inclusion_candidate_ids = (
+        reviewed_inclusion_candidate_ids & set(selected_segments)
+    )
+    missing_reviewed_inclusion_candidate_ids = (
+        reviewed_inclusion_candidate_ids - selected_reviewed_inclusion_candidate_ids
+    )
     candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
     event_ids = {
         candidate.story_event_id
@@ -712,6 +723,7 @@ def story_flow_coverage(
             if not omitted_core_event_ids
             and not incomplete_represented_event_ids
             and not protected_speed_violations
+            and not missing_reviewed_inclusion_candidate_ids
             else "unsatisfied"
         ),
         "raw_source_seconds": round(raw_seconds, 3),
@@ -729,6 +741,13 @@ def story_flow_coverage(
         "compression_saved_seconds": round(selected_source_seconds - selected_output_seconds, 3),
         "fast_forward_candidate_count": len(fast_forwarded),
         "protected_speed_violation_candidate_ids": protected_speed_violations,
+        "reviewed_inclusion_candidate_ids": sorted(reviewed_inclusion_candidate_ids),
+        "selected_reviewed_inclusion_candidate_ids": sorted(
+            selected_reviewed_inclusion_candidate_ids
+        ),
+        "missing_reviewed_inclusion_candidate_ids": sorted(
+            missing_reviewed_inclusion_candidate_ids
+        ),
         "explicitly_excluded_candidate_count": sum(
             candidate.exclusion_reason is not None for candidate in candidates
         ),

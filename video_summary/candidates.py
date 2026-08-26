@@ -59,6 +59,7 @@ INTERVIEW_CONTEXT_EVENT_MAX_DISTANCE_SECONDS = 90.0
 FULL_COVERAGE_PARTITION_POLICY_VERSION = 1
 STORY_EVENT_CATALOG_POLICY_VERSION = 5
 MULTICAMERA_ANGLE_POLICY_VERSION = 4
+REVIEWED_INCLUSION_POLICY_VERSION = 1
 STORY_EVENT_GAP_SECONDS = 5.0 * 60.0
 STORY_EVENT_MAX_SPAN_SECONDS = 45.0 * 60.0
 
@@ -721,6 +722,14 @@ def build_candidates(
 
     state.mark_running("candidates", cache_key)
     try:
+        reviewed_include_rules = config["editing"].get(
+            "reviewed_include_ranges", []
+        )
+        _validate_reviewed_inclusion_rules(
+            clips,
+            reviewed_include_rules,
+            config["editing"].get("exclude_ranges", []),
+        )
         candidates: list[Candidate] = []
         required_interview_events: list[tuple[Clip, _InterviewEvent]] = []
         preserve_family_interviews = _preserve_family_interviews(config)
@@ -788,6 +797,10 @@ def build_candidates(
                     (option.start, option.end, f"meal_{stage}")
                     for _, stage, option in clip_meal_context
                 ],
+                reviewed_windows=_reviewed_inclusion_windows(
+                    clip,
+                    reviewed_include_rules,
+                ),
             )
             for start, end, origin in windows:
                 text = _window_transcript(cues, start, end)
@@ -835,6 +848,16 @@ def build_candidates(
                     end,
                     config["editing"].get("exclude_ranges", []),
                 )
+                reviewed_inclusion_reason = (
+                    None
+                    if exclusion_reason
+                    else _candidate_reviewed_inclusion_reason(
+                        clip,
+                        start,
+                        end,
+                        config["editing"].get("reviewed_include_ranges", []),
+                    )
+                )
                 score = _score_candidate(roles, speech_ratio, motion, quality, start, end, clip.duration)
                 candidate_id = "cand_" + stable_hash(
                     {
@@ -880,6 +903,7 @@ def build_candidates(
                         required_event_ids=required_event_ids,
                         required_meal_event_ids=required_meal_event_ids,
                         required_meal_context_ids=required_meal_context_ids,
+                        reviewed_inclusion_reason=reviewed_inclusion_reason,
                         origin=origin,
                         exclusion_reason=exclusion_reason,
                         source_kind=clip.source_kind,
@@ -902,7 +926,7 @@ def build_candidates(
             *_required_meal_events_payload(meal_events, candidates),
         ]
         payload = {
-            "version": 6,
+            "version": 7,
             "project": config["project"]["name"],
             "cache_key": cache_key,
             "policy_versions": {
@@ -911,6 +935,7 @@ def build_candidates(
                 "full_coverage_partition": FULL_COVERAGE_PARTITION_POLICY_VERSION,
                 "story_event_catalog": STORY_EVENT_CATALOG_POLICY_VERSION,
                 "multicamera_angle": MULTICAMERA_ANGLE_POLICY_VERSION,
+                "reviewed_inclusion": REVIEWED_INCLUSION_POLICY_VERSION,
             },
             "candidate_set_hash": stable_hash([candidate.to_dict() for candidate in candidates], length=32),
             "count": len(candidates),
@@ -964,7 +989,7 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             transcript_keys.append(None)
     return stable_hash(
         {
-            "version": 23,
+            "version": 24,
             "visual_signal_policy": VISUAL_SIGNAL_POLICY_VERSION,
             "journey_transition_detection": {
                 "policy": JOURNEY_TRANSITION_POLICY_VERSION,
@@ -981,6 +1006,10 @@ def _candidate_cache_key(paths: ProjectPaths, clips: list[Clip], config: dict[st
             "full_coverage_partition": FULL_COVERAGE_PARTITION_POLICY_VERSION,
             "story_event_catalog": STORY_EVENT_CATALOG_POLICY_VERSION,
             "multicamera_angle": MULTICAMERA_ANGLE_POLICY_VERSION,
+            "reviewed_inclusion": {
+                "policy": REVIEWED_INCLUSION_POLICY_VERSION,
+                "ranges": config.get("editing", {}).get("reviewed_include_ranges", []),
+            },
             "project": config["project"]["name"],
             "clips": [
                 (
@@ -1022,22 +1051,101 @@ def _candidate_exclusion_reason(
     end: float,
     rules: list[dict[str, Any]],
 ) -> str | None:
-    relative = clip.relative_path
-    basename = Path(relative).name
     for rule in rules:
-        pattern = str(rule.get("match", "")).strip()
-        root_pattern = pattern[3:] if pattern.startswith("**/") else pattern
-        if not pattern or not (
-            fnmatch(relative, pattern)
-            or fnmatch(basename, pattern)
-            or (root_pattern != pattern and fnmatch(relative, root_pattern))
-        ):
+        if not _range_rule_matches_clip(clip, rule):
             continue
-        rule_start = float(rule.get("start", 0.0))
-        rule_end = float(rule["end"]) if rule.get("end") is not None else clip.duration
+        rule_start, rule_end = _range_rule_bounds(clip, rule)
         if min(end, rule_end) - max(start, rule_start) > 0.001:
             return str(rule.get("reason", "사용자 제외 구간")).strip()
     return None
+
+
+def _candidate_reviewed_inclusion_reason(
+    clip: Clip,
+    start: float,
+    end: float,
+    rules: list[dict[str, Any]],
+) -> str | None:
+    """Return the human review reason when a candidate overlaps a kept range."""
+    for rule in rules:
+        if not _range_rule_matches_clip(clip, rule):
+            continue
+        rule_start, rule_end = _range_rule_bounds(clip, rule)
+        if min(end, rule_end) - max(start, rule_start) > 0.001:
+            return str(rule.get("reason", "검수 후 포함할 장면")).strip()
+    return None
+
+
+def _range_rule_matches_clip(clip: Clip, rule: dict[str, Any]) -> bool:
+    relative = clip.relative_path
+    basename = Path(relative).name
+    pattern = str(rule.get("match", "")).strip()
+    root_pattern = pattern[3:] if pattern.startswith("**/") else pattern
+    return bool(
+        pattern
+        and (
+            fnmatch(relative, pattern)
+            or fnmatch(basename, pattern)
+            or (root_pattern != pattern and fnmatch(relative, root_pattern))
+        )
+    )
+
+
+def _range_rule_bounds(clip: Clip, rule: dict[str, Any]) -> tuple[float, float]:
+    return (
+        float(rule.get("start", 0.0)),
+        float(rule["end"]) if rule.get("end") is not None else clip.duration,
+    )
+
+
+def _reviewed_inclusion_windows(
+    clip: Clip,
+    rules: list[dict[str, Any]],
+) -> list[tuple[float, float, str]]:
+    return [
+        (*_range_rule_bounds(clip, rule), "reviewed")
+        for rule in rules
+        if _range_rule_matches_clip(clip, rule)
+    ]
+
+
+def _validate_reviewed_inclusion_rules(
+    clips: list[Clip],
+    reviewed_rules: list[dict[str, Any]],
+    exclusion_rules: list[dict[str, Any]],
+) -> None:
+    """Fail before analysis when a human-reviewed keep contract cannot be met."""
+    for index, rule in enumerate(reviewed_rules, start=1):
+        matched = [clip for clip in clips if _range_rule_matches_clip(clip, rule)]
+        if not matched:
+            raise VideoSummaryError(
+                f"reviewed_include_ranges[{index}]에 일치하는 원본 파일이 없습니다."
+            )
+        for clip in matched:
+            start, end = _range_rule_bounds(clip, rule)
+            if (
+                end - start <= 0.001
+                or start >= clip.duration - 0.001
+                or end > clip.duration + 0.001
+            ):
+                raise VideoSummaryError(
+                    f"reviewed_include_ranges[{index}] 범위가 원본 길이를 벗어났습니다: "
+                    f"{clip.relative_path} ({clip.duration:.3f}s)"
+                )
+            if clip.capture_time_basis == "unplaced":
+                raise VideoSummaryError(
+                    f"reviewed_include_ranges[{index}] 원본은 촬영시각을 배치할 수 없습니다: "
+                    f"{clip.relative_path}. date_overrides.captured_at을 명시하세요."
+                )
+            for excluded in exclusion_rules:
+                if not _range_rule_matches_clip(clip, excluded):
+                    continue
+                excluded_start, excluded_end = _range_rule_bounds(clip, excluded)
+                if min(end, excluded_end) - max(start, excluded_start) > 0.001:
+                    raise VideoSummaryError(
+                        f"reviewed_include_ranges[{index}]가 exclude_ranges와 겹칩니다: "
+                        f"{clip.relative_path}"
+                    )
 
 
 def _assign_story_event_metadata(candidates: list[Candidate]) -> None:
@@ -1569,7 +1677,7 @@ def _candidate_story_stage(candidate: Candidate, index: int, count: int) -> str:
 def _candidate_importance(candidate: Candidate, event_is_core: bool) -> str:
     if candidate.exclusion_reason:
         return "discard"
-    if event_is_core or candidate.required_event_ids:
+    if event_is_core or candidate.required_event_ids or candidate.reviewed_inclusion_reason:
         return "core"
     if set(candidate.roles) & {"food", "fun", "dialogue", "scenery"}:
         return "supporting"
@@ -1591,6 +1699,7 @@ def _candidate_speed_policy(candidate: Candidate) -> str:
         candidate.required_event_ids
         or candidate.required_meal_event_ids
         or candidate.required_meal_context_ids
+        or candidate.reviewed_inclusion_reason
         or set(candidate.roles) & protected_roles
         or candidate.speech_ratio > 0.08
         or candidate.story_stage == "outcome"
@@ -3463,6 +3572,7 @@ def _candidate_windows(
     required_events: list[_InterviewEvent] | None = None,
     transition_windows: list[tuple[float, float, str]] | None = None,
     meal_windows: list[tuple[float, float, str]] | None = None,
+    reviewed_windows: list[tuple[float, float, str]] | None = None,
 ) -> list[tuple[float, float, str]]:
     windows: list[tuple[float, float, str]] = []
     for group in _group_cues(cues):
@@ -3515,6 +3625,10 @@ def _candidate_windows(
     # Meal bodies and their detected setup/closure beats are semantic options,
     # added after the ordinary per-clip cap so the full micro-story survives.
     selected.extend(meal_windows or [])
+    # Human-reviewed visual ranges are semantic boundaries too. Keeping their
+    # exact edges prevents a short requested beat from expanding to an entire
+    # neighboring coverage partition.
+    selected.extend(reviewed_windows or [])
     return _partition_full_clip_coverage(
         _merge_overlapping_windows(selected),
         clip.duration,
@@ -3574,7 +3688,13 @@ def _merge_overlapping_windows(
         components[-1].append((start, end, origin))
 
     merged: list[tuple[float, float, str]] = []
-    semantic_origins = {"transition", "meal", "meal_setup", "meal_closure"}
+    semantic_origins = {
+        "transition",
+        "meal",
+        "meal_setup",
+        "meal_closure",
+        "reviewed",
+    }
     for component in components:
         component_start = min(item[0] for item in component)
         component_end = max(item[1] for item in component)
@@ -3631,6 +3751,9 @@ def _merge_overlapping_windows(
                 if range_index + 1 < len(coalesced_ranges)
                 else frozenset()
             )
+            if "reviewed" in previous_semantic or "reviewed" in next_semantic:
+                range_index += 1
+                continue
             if previous_semantic and next_semantic:
                 previous_start = coalesced_ranges[range_index - 1][0]
                 next_end = coalesced_ranges[range_index + 1][1]
@@ -3688,6 +3811,8 @@ def _merged_window_origin(
         return "meal_setup"
     if "meal_closure" in overlapping_origins:
         return "meal_closure"
+    if "reviewed" in overlapping_origins:
+        return "reviewed"
     if part_index == 0 and "opener" in overlapping_origins:
         return "opener"
     if part_index == part_count - 1 and "closer" in overlapping_origins:
@@ -3698,6 +3823,7 @@ def _merged_window_origin(
         "meal": 4,
         "meal_setup": 4,
         "meal_closure": 4,
+        "reviewed": 4,
         "speech": 3,
         "visual": 2,
         "opener": 1,
@@ -3834,7 +3960,9 @@ def _roles(text: str, clip: Clip, start: float, end: float, origin: str) -> list
         roles.append("fun")
     if any(word in normalized for word in FOOD_WORDS):
         roles.append("food")
-    if any(word in normalized for word in SCENERY_WORDS) or (not text and origin == "visual"):
+    if any(word in normalized for word in SCENERY_WORDS) or (
+        not text and origin in {"visual", "reviewed"}
+    ):
         roles.append("scenery")
     if text:
         roles.append("dialogue")
@@ -3857,7 +3985,7 @@ def _promote_meaningful_phone_visual(
     """Treat a strong silent phone shot as content, even without a person."""
     if (
         clip.source_kind == "phone"
-        and origin in {"visual", "opener", "closer", "coverage"}
+        and origin in {"visual", "opener", "closer", "coverage", "reviewed"}
         and speech_ratio <= 0.08
         and (
             quality >= 0.55

@@ -498,6 +498,23 @@ class PlannerTests(unittest.TestCase):
             },
             {"meal-1", "meal-2"},
         )
+
+    def test_multicamera_compaction_never_removes_reviewed_visual(self) -> None:
+        reviewed = candidate("reviewed", "2026-11-01T12:00:00-05:00")
+        stronger = candidate("stronger", "2026-11-01T12:00:00-05:00")
+        reviewed.angle_group_id = stronger.angle_group_id = "same-view"
+        reviewed.reviewed_inclusion_reason = "사람이 확인한 돌고래 장면"
+        reviewed.score = reviewed.visual_quality = 0.1
+        stronger.score = stronger.visual_quality = 0.99
+
+        selected = _suppress_repeated_angle_groups(
+            [reviewed, stronger],
+            {reviewed.candidate_id},
+            {},
+            tone_profile="playful",
+        )
+
+        self.assertEqual([item.candidate_id for item in selected], ["reviewed"])
     def setUp(self) -> None:
         self.config = copy.deepcopy(DEFAULT_CONFIG)
         self.config["project"]["name"] = "Test Trip"
@@ -958,7 +975,7 @@ class PlannerTests(unittest.TestCase):
         item.source_kind = "phone"
         payload = _planner_candidates_payload([item], "hash")
         exported = payload["candidates"][0]
-        self.assertEqual(payload["version"], 5)
+        self.assertEqual(payload["version"], 6)
         self.assertEqual(
             payload["story_selection_contract"]["strategy"],
             "coverage_first_event_flow",
@@ -2102,6 +2119,41 @@ class PlannerTests(unittest.TestCase):
             [item.candidate_id for item in plan.episodes[0].segments],
             ["c1"],
         )
+
+    def test_reviewed_visual_is_mandatory_and_must_stay_at_normal_speed(self) -> None:
+        self.candidates[1].roles = ["scenery"]
+        self.candidates[1].reviewed_inclusion_reason = "고래상어가 보이는 핵심 장면"
+        request = build_planner_request(
+            ProjectPaths(Path("/tmp"), "project"),
+            self.config,
+            "여행",
+            self.candidates,
+            "hash",
+        )
+        self.assertIn("mandatory human-reviewed visual candidates", request)
+        self.assertIn("reviewed_inclusion=고래상어가 보이는 핵심 장면", request)
+
+        missing = self.valid_payload()
+        missing["episodes"][0]["segments"] = [missing["episodes"][0]["segments"][0]]
+        with self.assertRaisesRegex(VideoSummaryError, "검수 후 포함할 후보"):
+            validate_and_normalize_plan(
+                missing, self.config, "x", self.candidates, "hash", "file"
+            )
+
+        accelerated = self.valid_payload()
+        accelerated["episodes"][0]["segments"][1]["speed"] = 2.0
+        with self.assertRaisesRegex(VideoSummaryError, "검수 후 포함한 후보.*speed=1.0"):
+            validate_and_normalize_plan(
+                accelerated, self.config, "x", self.candidates, "hash", "file"
+            )
+
+        plan = local_plan(self.config, "여행", self.candidates, "hash")
+        selected = {
+            segment.candidate_id: segment
+            for segment in plan.episodes[0].segments
+        }
+        self.assertIn("c2", selected)
+        self.assertEqual(selected["c2"].speed, 1.0)
 
     def test_broad_food_role_without_a_meal_event_tag_is_not_mandatory(self) -> None:
         self.candidates[1].roles = ["food"]

@@ -607,6 +607,33 @@ class CoreTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(VideoSummaryError, message):
                 _validate_config(config)
 
+    def test_config_validates_reviewed_include_ranges(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["editing"]["reviewed_include_ranges"] = [
+            {
+                "match": "iphone/IMG_5754.MOV",
+                "start": 0,
+                "end": 7.267,
+                "reason": "돌고래가 수족관 사건의 핵심을 보여 주는 장면",
+            }
+        ]
+        _validate_config(config)
+        for rule in (
+            {"match": "", "reason": "핵심"},
+            {"match": "iphone/*.MOV", "start": -1, "reason": "핵심"},
+            {"match": "iphone/*.MOV", "start": 5, "end": 4, "reason": "핵심"},
+            {"match": "iphone/*.MOV", "start": 5, "end": 5.0005, "reason": "핵심"},
+            {"match": "iphone/*.MOV", "reason": ""},
+            {"match": "iphone/*.MOV", "reason": "핵심", "unknown": True},
+        ):
+            invalid = copy.deepcopy(DEFAULT_CONFIG)
+            invalid["editing"]["reviewed_include_ranges"] = [rule]
+            with self.subTest(rule=rule), self.assertRaisesRegex(
+                VideoSummaryError,
+                "reviewed_include_ranges",
+            ):
+                _validate_config(invalid)
+
     def test_legacy_config_without_soft_maximum_loads_with_the_new_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = project_paths(tmpdir, "legacy")

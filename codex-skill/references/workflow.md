@@ -60,6 +60,8 @@ A simple question, generic movement language without a concrete journey connecti
 
 Use `editing.exclude_ranges` to keep private, unsafe, or explicitly forbidden footage out of planning and rendering. Each entry requires a relative-path or basename glob in `match` and a 1–160 character `reason`; `start` defaults to clip-relative 0 seconds and omitted `end` means the clip end. A candidate overlapping that interval stays auditable with an exclusion reason and omit policy but must never enter a plan or render. Typical uses include changing clothes, medical/hygiene footage, and exposed sensitive information.
 
+After contact-sheet/source review, use `editing.reviewed_include_ranges` for silent or person-free footage whose semantic value a human confirmed but automatic scoring cannot reliably distinguish. It uses the same relative-path/basename `match`, clip-relative `start`/`end`, and required `reason` shape. Exact range boundaries become semantic candidate boundaries, and every overlapping eligible candidate is mandatory at normal speed for local, external, and file plans. Analysis fails instead of silently losing the contract when no file matches, the range exceeds the source, the source remains `unplaced`, or the range conflicts with `exclude_ranges`.
+
 The combined trip sequence is: global mosaic intro (or a classic title-card fallback) → DAY date card → all chronological source segments for that DAY, including the optional earliest hook → repeat for later DAYs → global outro.
 
 For readable pacing, keep these recommended defaults unless the user asks otherwise:
@@ -78,6 +80,10 @@ editing:
       start: 12.4
       end: 28.0
       reason: "private changing-clothes footage"
+  reviewed_include_ranges:
+    - match: "iphone/IMG_5754.MOV"
+      start: 0
+      reason: "dolphin movement is a key aquarium beat"
 
 render:
   portrait_layout: blur           # blur, pillarbox, or crop

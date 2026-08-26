@@ -138,6 +138,10 @@ editing:
       start: 12.4                   # 클립 기준 초; 생략 시 0
       end: 28.0                     # 생략 시 클립 끝
       reason: "옷 갈아입는 사적 장면"
+  reviewed_include_ranges:
+    - match: "iphone/IMG_5754.MOV" # 사람이 의미를 확인한 무전사/무인물 장면
+      start: 0
+      reason: "돌고래 움직임이 수족관 사건의 핵심을 보여 줌"
   preserve_family_interviews: true  # 탐지된 가족 회고 인터뷰는 반드시 원속도로 포함
   preserve_meal_events: true        # 탐지된 식사마다 setup/body/closure 서사를 원속도로 보존
   episode_mode: trip
@@ -155,6 +159,8 @@ render:
 ```
 
 `target_minutes_per_day`와 `soft_max_minutes_per_day`는 모두 0.1~180 사이의 유한한 숫자여야 합니다. `max_fast_forward_speed`는 1~4배이며, 이 값이 크더라도 `protected_1x`로 표시된 식사·놀이·인터뷰·만남·대화·핵심 반응은 배속하지 않습니다. `exclude_ranges`의 각 규칙은 `match`와 1~160자 `reason`이 필수이며, 지정 시간과 겹치는 후보는 plan·render에 들어가지 않고 event accounting에 “명시적 제외”로 남습니다.
+
+`reviewed_include_ranges`는 contact sheet나 원본 검수에서 의미가 확인됐지만 자동 분류가 어려운 무전사·무인물 장면을 정상 배속 필수 선택으로 고정합니다. 같은 `match`/`start`/`end`/`reason` 형식을 쓰며 정확한 범위 경계를 후보에 반영합니다. 일치 파일이 없거나 범위가 원본 길이를 벗어나거나 촬영시각이 `unplaced`이거나 `exclude_ranges`와 겹치면 조용히 무시하지 않고 분석을 중단합니다.
 
 ```yaml
 project:

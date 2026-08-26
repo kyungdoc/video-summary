@@ -86,6 +86,7 @@ class Candidate:
     required_event_ids: list[str] = field(default_factory=list)
     required_meal_event_ids: list[str] = field(default_factory=list)
     required_meal_context_ids: list[str] = field(default_factory=list)
+    reviewed_inclusion_reason: str | None = None
     origin: str = "legacy"
     story_event_id: str | None = None
     story_stage: str = "body"

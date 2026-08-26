@@ -15,12 +15,14 @@ from video_summary.candidates import (
     MEAL_EVENT_POLICY_VERSION,
     MULTICAMERA_ANGLE_POLICY_VERSION,
     PARTY_TRANSITION_CONTEXT_POLICY_VERSION,
+    REVIEWED_INCLUSION_POLICY_VERSION,
     STORY_EVENT_CATALOG_POLICY_VERSION,
     VISUAL_SIGNAL_POLICY_VERSION,
     _InterviewEvent,
     _assign_story_event_metadata,
     _assign_multicamera_angle_groups,
     _candidate_exclusion_reason,
+    _candidate_reviewed_inclusion_reason,
     _candidate_frame_needs_extraction,
     _detect_family_interview_events,
     _detect_interview_events,
@@ -38,10 +40,12 @@ from video_summary.candidates import (
     _meal_subtype,
     _promote_meaningful_phone_visual,
     _partition_full_clip_coverage,
+    _validate_reviewed_inclusion_rules,
     build_candidates,
 )
 from video_summary.models import Candidate, Clip, TranscriptCue
 from video_summary.project import DEFAULT_CONFIG, ProjectPaths
+from video_summary.utils import VideoSummaryError
 
 
 def _clip(
@@ -567,6 +571,7 @@ class CandidateCoverageTests(unittest.TestCase):
         self.assertEqual(candidate.required_event_ids, [])
         self.assertEqual(candidate.required_meal_event_ids, [])
         self.assertEqual(candidate.required_meal_context_ids, [])
+        self.assertIsNone(candidate.reviewed_inclusion_reason)
         self.assertEqual(candidate.origin, "legacy")
         self.assertIsNone(candidate.story_event_id)
         self.assertEqual(candidate.story_stage, "body")
@@ -699,6 +704,16 @@ class CandidateCoverageTests(unittest.TestCase):
                 }
             ]
             excluded = _candidate_cache_key(paths, [clip], excluded_config)
+            included_config = copy.deepcopy(config)
+            included_config["editing"]["reviewed_include_ranges"] = [
+                {
+                    "match": "clip.mp4",
+                    "start": 2.0,
+                    "end": 4.0,
+                    "reason": "검수한 핵심 장면",
+                }
+            ]
+            included = _candidate_cache_key(paths, [clip], included_config)
             with patch(
                 "video_summary.candidates.FULL_COVERAGE_PARTITION_POLICY_VERSION",
                 FULL_COVERAGE_PARTITION_POLICY_VERSION + 1,
@@ -709,10 +724,17 @@ class CandidateCoverageTests(unittest.TestCase):
                 STORY_EVENT_CATALOG_POLICY_VERSION + 1,
             ):
                 changed_event_catalog = _candidate_cache_key(paths, [clip], config)
+            with patch(
+                "video_summary.candidates.REVIEWED_INCLUSION_POLICY_VERSION",
+                REVIEWED_INCLUSION_POLICY_VERSION + 1,
+            ):
+                changed_reviewed_inclusion = _candidate_cache_key(paths, [clip], config)
 
         self.assertNotEqual(current, excluded)
+        self.assertNotEqual(current, included)
         self.assertNotEqual(current, changed_partition)
         self.assertNotEqual(current, changed_event_catalog)
+        self.assertNotEqual(current, changed_reviewed_inclusion)
 
     def test_meal_direct_signal_requires_filmed_present_food_evidence(self) -> None:
         positives = [
@@ -1444,7 +1466,7 @@ class CandidateCoverageTests(unittest.TestCase):
         meal_events = [
             event for event in payload["required_events"] if event["kind"] == "meal"
         ]
-        self.assertEqual(payload["version"], 6)
+        self.assertEqual(payload["version"], 7)
         self.assertEqual(payload["policy_versions"]["meal_event"], MEAL_EVENT_POLICY_VERSION)
         self.assertEqual(
             payload["policy_versions"]["full_coverage_partition"],
@@ -2127,7 +2149,7 @@ class CandidateCoverageTests(unittest.TestCase):
             ):
                 payload = build_candidates(paths, [clip], config)
 
-        self.assertEqual(payload["version"], 6)
+        self.assertEqual(payload["version"], 7)
         self.assertEqual(len(payload["required_events"]), 1)
         event = payload["required_events"][0]
         tagged = [
@@ -2640,6 +2662,81 @@ class CandidateCoverageTests(unittest.TestCase):
         self.assertEqual(
             _candidate_exclusion_reason(root_clip, 6.0, 8.0, rules),
             "옷을 갈아입는 사적 장면",
+        )
+
+    def test_reviewed_include_ranges_match_only_overlapping_candidates(self) -> None:
+        clip = _clip("dolphin", duration=10.0)
+        clip.relative_path = "iphone/IMG_5754.MOV"
+        rules = [
+            {
+                "match": "**/IMG_5754.MOV",
+                "start": 1.0,
+                "end": 8.0,
+                "reason": "인물 없이도 의미 있는 돌고래 장면",
+            }
+        ]
+
+        self.assertEqual(
+            _candidate_reviewed_inclusion_reason(clip, 2.0, 7.0, rules),
+            "인물 없이도 의미 있는 돌고래 장면",
+        )
+        self.assertIsNone(
+            _candidate_reviewed_inclusion_reason(clip, 8.001, 10.0, rules)
+        )
+
+    def test_reviewed_include_contract_rejects_unusable_rules(self) -> None:
+        clip = _clip("dolphin", duration=10.0)
+        clip.relative_path = "iphone/IMG_5754.MOV"
+        valid = [{"match": "iphone/IMG_5754.MOV", "reason": "돌고래"}]
+        _validate_reviewed_inclusion_rules([clip], valid, [])
+
+        invalid_cases = (
+            ([{"match": "missing.mov", "reason": "핵심"}], [], "일치하는 원본"),
+            ([{"match": "iphone/IMG_5754.MOV", "start": 10, "reason": "핵심"}], [], "원본 길이"),
+            ([{"match": "iphone/IMG_5754.MOV", "end": 11, "reason": "핵심"}], [], "원본 길이"),
+            (
+                [{"match": "iphone/IMG_5754.MOV", "start": 1, "end": 1.0005, "reason": "핵심"}],
+                [],
+                "원본 길이",
+            ),
+            (
+                valid,
+                [{"match": "iphone/IMG_5754.MOV", "reason": "사적 장면"}],
+                "exclude_ranges",
+            ),
+        )
+        for reviewed, excluded, message in invalid_cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                VideoSummaryError,
+                message,
+            ):
+                _validate_reviewed_inclusion_rules([clip], reviewed, excluded)
+
+        clip.capture_time_basis = "unplaced"
+        with self.assertRaisesRegex(VideoSummaryError, "date_overrides.captured_at"):
+            _validate_reviewed_inclusion_rules([clip], valid, [])
+
+    def test_reviewed_window_keeps_exact_semantic_boundaries(self) -> None:
+        clip = _clip("aquarium", duration=30.0)
+        windows = _candidate_windows(
+            clip,
+            [],
+            [],
+            max_per_clip=1,
+            reviewed_windows=[(10.0, 12.0, "reviewed")],
+        )
+
+        self.assertIn((10.0, 12.0, "reviewed"), windows)
+        overlapping = _merge_overlapping_windows(
+            [
+                (9.5, 13.0, "visual"),
+                (9.7, 12.3, "speech"),
+                (10.0, 12.0, "reviewed"),
+            ]
+        )
+        self.assertEqual(
+            [value for value in overlapping if value[2] == "reviewed"],
+            [(10.0, 12.0, "reviewed")],
         )
 
     def test_story_event_metadata_protects_body_and_allows_only_silent_coverage_to_speed(self) -> None:

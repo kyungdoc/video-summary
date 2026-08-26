@@ -32,6 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "adaptive_fast_forward": True,
         "max_fast_forward_speed": 3.0,
         "exclude_ranges": [],
+        "reviewed_include_ranges": [],
         "cold_open": True,
         "preserve_family_interviews": True,
         "preserve_meal_events": True,
@@ -241,7 +242,28 @@ def _validate_config(config: dict[str, Any]) -> None:
         start = _finite_number(rule.get("start", 0.0), f"{field}.start")
         end_value = rule.get("end")
         end = _finite_number(end_value, f"{field}.end") if end_value is not None else None
-        if start < 0 or (end is not None and end <= start):
+        if start < 0 or (end is not None and end - start <= 0.001):
+            raise VideoSummaryError(f"{field}의 start/end 범위가 잘못되었습니다.")
+    reviewed_include_ranges = editing.get("reviewed_include_ranges", [])
+    if not isinstance(reviewed_include_ranges, list):
+        raise VideoSummaryError("reviewed_include_ranges는 list여야 합니다.")
+    for index, rule in enumerate(reviewed_include_ranges, start=1):
+        field = f"reviewed_include_ranges[{index}]"
+        if not isinstance(rule, dict):
+            raise VideoSummaryError(f"{field}는 object여야 합니다.")
+        unknown = set(rule) - {"match", "start", "end", "reason"}
+        if unknown:
+            raise VideoSummaryError(f"{field}에 허용되지 않은 필드가 있습니다: {sorted(unknown)}")
+        match = rule.get("match")
+        if not isinstance(match, str) or not match.strip():
+            raise VideoSummaryError(f"{field}.match는 비어 있지 않은 문자열이어야 합니다.")
+        reason = rule.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 160:
+            raise VideoSummaryError(f"{field}.reason은 1~160자 문자열이어야 합니다.")
+        start = _finite_number(rule.get("start", 0.0), f"{field}.start")
+        end_value = rule.get("end")
+        end = _finite_number(end_value, f"{field}.end") if end_value is not None else None
+        if start < 0 or (end is not None and end - start <= 0.001):
             raise VideoSummaryError(f"{field}의 start/end 범위가 잘못되었습니다.")
     if editing.get("episode_mode") not in {"daily", "trip"}:
         raise VideoSummaryError("episode_mode는 daily 또는 trip이어야 합니다.")

@@ -775,9 +775,9 @@ class RendererTests(unittest.TestCase):
             moment_coverage=coverage,
         )
 
-        self.assertEqual(RENDER_POLICY_VERSION, 24)
+        self.assertEqual(RENDER_POLICY_VERSION, 25)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
-        self.assertEqual(RENDER_REPORT_VERSION, 9)
+        self.assertEqual(RENDER_REPORT_VERSION, 10)
         self.assertNotEqual(previous, current)
 
     def test_story_flow_report_accounts_for_full_source_speedup_exclusions_and_review_status(self) -> None:
@@ -789,6 +789,7 @@ class RendererTests(unittest.TestCase):
         meal.story_event_id = "event_meal"
         private.story_event_id = "event_private"
         setup.importance = meal.importance = "core"
+        meal.reviewed_inclusion_reason = "검수한 식사 본편"
         bridge.importance = "bridge"
         bridge.speed_policy = "allow_fast"
         private.importance = "discard"
@@ -853,6 +854,11 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(report["compression_saved_seconds"], 2.5)
         self.assertEqual(report["fast_forward_candidate_count"], 1)
         self.assertEqual(report["explicitly_excluded_candidate_count"], 1)
+        self.assertEqual(report["reviewed_inclusion_candidate_ids"], ["meal"])
+        self.assertEqual(
+            report["selected_reviewed_inclusion_candidate_ids"], ["meal"]
+        )
+        self.assertEqual(report["missing_reviewed_inclusion_candidate_ids"], [])
         self.assertEqual(report["days"][0]["status"], "review")
         self.assertEqual(
             [(event["event_id"], event["treatment"]) for event in report["events"]],
@@ -865,6 +871,7 @@ class RendererTests(unittest.TestCase):
         setup.story_event_id = action.story_event_id = "event_gacha"
         setup.story_stage = "setup"
         action.story_stage = "action"
+        action.reviewed_inclusion_reason = "가챠 결과를 보여 주는 검수 장면"
         setup.importance = action.importance = "core"
         plan = EditPlan(
             "Trip",
@@ -913,6 +920,9 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(report["omitted_core_event_ids"], [])
         self.assertEqual(
             report["incomplete_represented_event_ids"], ["event_gacha"]
+        )
+        self.assertEqual(
+            report["missing_reviewed_inclusion_candidate_ids"], ["action"]
         )
         self.assertEqual(report["events"][0]["activity_stage_status"], "missing")
 
