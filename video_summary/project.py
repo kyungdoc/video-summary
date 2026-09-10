@@ -33,6 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_fast_forward_speed": 3.0,
         "exclude_ranges": [],
         "reviewed_include_ranges": [],
+        "reviewed_evidence": [],
         "cold_open": True,
         "preserve_family_interviews": True,
         "preserve_meal_events": True,
@@ -230,12 +231,13 @@ def _validate_config(config: dict[str, Any]) -> None:
         field = f"exclude_ranges[{index}]"
         if not isinstance(rule, dict):
             raise VideoSummaryError(f"{field}는 object여야 합니다.")
-        unknown = set(rule) - {"match", "start", "end", "reason"}
+        unknown = set(rule) - {"match", "match_type", "source_fingerprint", "start", "end", "reason"}
         if unknown:
             raise VideoSummaryError(f"{field}에 허용되지 않은 필드가 있습니다: {sorted(unknown)}")
         match = rule.get("match")
         if not isinstance(match, str) or not match.strip():
             raise VideoSummaryError(f"{field}.match는 비어 있지 않은 문자열이어야 합니다.")
+        _validate_range_source_binding(rule, field)
         reason = rule.get("reason")
         if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 160:
             raise VideoSummaryError(f"{field}.reason은 1~160자 문자열이어야 합니다.")
@@ -251,12 +253,13 @@ def _validate_config(config: dict[str, Any]) -> None:
         field = f"reviewed_include_ranges[{index}]"
         if not isinstance(rule, dict):
             raise VideoSummaryError(f"{field}는 object여야 합니다.")
-        unknown = set(rule) - {"match", "start", "end", "reason"}
+        unknown = set(rule) - {"match", "match_type", "source_fingerprint", "start", "end", "reason"}
         if unknown:
             raise VideoSummaryError(f"{field}에 허용되지 않은 필드가 있습니다: {sorted(unknown)}")
         match = rule.get("match")
         if not isinstance(match, str) or not match.strip():
             raise VideoSummaryError(f"{field}.match는 비어 있지 않은 문자열이어야 합니다.")
+        _validate_range_source_binding(rule, field)
         reason = rule.get("reason")
         if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 160:
             raise VideoSummaryError(f"{field}.reason은 1~160자 문자열이어야 합니다.")
@@ -265,6 +268,9 @@ def _validate_config(config: dict[str, Any]) -> None:
         end = _finite_number(end_value, f"{field}.end") if end_value is not None else None
         if start < 0 or (end is not None and end - start <= 0.001):
             raise VideoSummaryError(f"{field}의 start/end 범위가 잘못되었습니다.")
+    evidence = editing.get("reviewed_evidence", [])
+    if not isinstance(evidence, list) or any(not isinstance(record, dict) for record in evidence):
+        raise VideoSummaryError("reviewed_evidence는 검수 근거 object의 list여야 합니다.")
     if editing.get("episode_mode") not in {"daily", "trip"}:
         raise VideoSummaryError("episode_mode는 daily 또는 trip이어야 합니다.")
     if type(editing.get("preserve_family_interviews", True)) is not bool:
@@ -361,6 +367,22 @@ def _validate_config(config: dict[str, Any]) -> None:
             raise VideoSummaryError(f"{key}는 0.1~30 사이여야 합니다.")
     if not isinstance(render.get("font_file"), str):
         raise VideoSummaryError("font_file은 문자열 경로여야 합니다.")
+
+
+def _validate_range_source_binding(rule: dict[str, Any], field: str) -> None:
+    match_type = rule.get("match_type", "glob")
+    if not isinstance(match_type, str) or match_type not in {"glob", "exact"}:
+        raise VideoSummaryError(f"{field}.match_type은 glob 또는 exact여야 합니다.")
+    if match_type == "exact":
+        match = rule["match"]
+        if Path(match).is_absolute() or ".." in Path(match).parts:
+            raise VideoSummaryError(f"{field}.match는 원본 폴더 기준 상대 경로여야 합니다.")
+    if "source_fingerprint" in rule:
+        fingerprint = rule["source_fingerprint"]
+        if not isinstance(fingerprint, str) or not fingerprint.strip() or len(fingerprint) > 256:
+            raise VideoSummaryError(f"{field}.source_fingerprint는 비어 있지 않은 문자열이어야 합니다.")
+        if match_type != "exact":
+            raise VideoSummaryError(f"{field}.source_fingerprint에는 match_type: exact가 필요합니다.")
 
 
 def _finite_number(value: Any, field: str) -> float:

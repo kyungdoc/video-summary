@@ -717,8 +717,16 @@ def build_candidates(
     cache_key = _candidate_cache_key(paths, clips, config)
     state = StateStore(paths.state)
     if not force and paths.candidates.exists() and state.is_complete("candidates", cache_key):
-        print_status("candidates: 캐시 사용")
-        return read_json(paths.candidates)
+        cached = read_json(paths.candidates)
+        if cached.get("cache_key") == cache_key:
+            # Backfill review provenance only after proving this cache was
+            # generated from the current source fingerprints/settings. This
+            # avoids rerunning visual analysis just to expose a review UI.
+            if "source_fingerprints" not in cached:
+                cached["source_fingerprints"] = {clip.clip_id: clip.fingerprint for clip in clips}
+                write_json(paths.candidates, cached)
+            print_status("candidates: 캐시 사용")
+            return cached
 
     state.mark_running("candidates", cache_key)
     try:
@@ -801,6 +809,9 @@ def build_candidates(
                     clip,
                     reviewed_include_rules,
                 ),
+            )
+            windows = _split_exact_exclusion_windows(
+                windows, clip, config["editing"].get("exclude_ranges", [])
             )
             for start, end, origin in windows:
                 text = _window_transcript(cues, start, end)
@@ -929,6 +940,7 @@ def build_candidates(
             "version": 7,
             "project": config["project"]["name"],
             "cache_key": cache_key,
+            "source_fingerprints": {clip.clip_id: clip.fingerprint for clip in clips},
             "policy_versions": {
                 "journey_transition": JOURNEY_TRANSITION_POLICY_VERSION,
                 "meal_event": MEAL_EVENT_POLICY_VERSION,
@@ -968,6 +980,8 @@ def load_candidates(paths: ProjectPaths, config: dict[str, Any] | None = None) -
     payload = read_json(paths.candidates)
     if config is not None:
         clips = load_clips(paths, config)
+        _validate_range_source_bindings(clips, config.get("editing", {}).get("reviewed_include_ranges", []))
+        _validate_range_source_bindings(clips, config.get("editing", {}).get("exclude_ranges", []))
         if payload.get("cache_key") != _candidate_cache_key(paths, clips, config):
             raise VideoSummaryError("분석 설정이나 전사가 변경되었습니다. analyze를 다시 실행하세요.")
     return [Candidate.from_dict(item) for item in payload.get("candidates", [])]
@@ -1078,6 +1092,8 @@ def _candidate_reviewed_inclusion_reason(
 
 def _range_rule_matches_clip(clip: Clip, rule: dict[str, Any]) -> bool:
     relative = clip.relative_path
+    if rule.get("match_type") == "exact":
+        return relative == rule.get("match")
     basename = Path(relative).name
     pattern = str(rule.get("match", "")).strip()
     root_pattern = pattern[3:] if pattern.startswith("**/") else pattern
@@ -1098,6 +1114,36 @@ def _range_rule_bounds(clip: Clip, rule: dict[str, Any]) -> tuple[float, float]:
     )
 
 
+def _split_exact_exclusion_windows(
+    windows: list[tuple[float, float, str]],
+    clip: Clip,
+    rules: list[dict[str, Any]],
+) -> list[tuple[float, float, str]]:
+    """UI range exclusions should not discard the rest of a broad candidate.
+
+    Legacy glob exclusions retain their conservative overlapping-window
+    behavior. Exact source decisions create boundaries without changing the
+    origin/roles of their neighboring source intervals.
+    """
+    boundaries = sorted({
+        bound
+        for rule in rules
+        if rule.get("match_type") == "exact" and _range_rule_matches_clip(clip, rule)
+        for bound in _range_rule_bounds(clip, rule)
+    })
+    if not boundaries:
+        return windows
+    result = []
+    for start, end, origin in windows:
+        cuts = [start, *(point for point in boundaries if start < point < end), end]
+        result.extend(
+            (left, right, origin)
+            for left, right in zip(cuts, cuts[1:])
+            if right - left > 0.001
+        )
+    return result
+
+
 def _reviewed_inclusion_windows(
     clip: Clip,
     rules: list[dict[str, Any]],
@@ -1109,12 +1155,28 @@ def _reviewed_inclusion_windows(
     ]
 
 
+def _validate_range_source_bindings(clips: list[Clip], rules: list[dict[str, Any]]) -> None:
+    """Never transfer a human decision to new bytes at the same source path."""
+    for rule in rules:
+        fingerprint = rule.get("source_fingerprint")
+        if fingerprint is None:
+            continue
+        matched = [clip for clip in clips if _range_rule_matches_clip(clip, rule)]
+        if not matched or any(clip.fingerprint != fingerprint for clip in matched):
+            raise VideoSummaryError(
+                f"검수한 원본이 변경되었거나 없습니다: {rule.get('match')}. "
+                "원본을 다시 확인하고 해당 검수 규칙을 갱신하세요."
+            )
+
+
 def _validate_reviewed_inclusion_rules(
     clips: list[Clip],
     reviewed_rules: list[dict[str, Any]],
     exclusion_rules: list[dict[str, Any]],
 ) -> None:
     """Fail before analysis when a human-reviewed keep contract cannot be met."""
+    _validate_range_source_bindings(clips, reviewed_rules)
+    _validate_range_source_bindings(clips, exclusion_rules)
     for index, rule in enumerate(reviewed_rules, start=1):
         matched = [clip for clip in clips if _range_rule_matches_clip(clip, rule)]
         if not matched:

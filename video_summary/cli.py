@@ -32,6 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--whisper-cpp-model", help="점검할 whisper.cpp 모델 경로")
     doctor_parser.add_argument("--whisper-cpp-vad-model", help="점검할 Silero VAD 모델 경로")
 
+    review_parser = subparsers.add_parser("review", help="이벤트·원본·편집 근거를 로컬 브라우저에서 검토")
+    review_parser.add_argument("--project", required=True, help="프로젝트 이름")
+    review_parser.add_argument("--workspace", "--project-dir", dest="workspace", help="기존 프로젝트 workspace")
+    review_parser.add_argument("--port", type=_review_port, default=8765, help="127.0.0.1 포트 (0: 자동 할당)")
+    review_parser.add_argument("--json", action="store_true", help="서버 없이 검토 카탈로그 JSON만 출력")
+
     for command in ("init", "scan", "analyze", "plan", "render", "run", "status"):
         item = subparsers.add_parser(command, help=_command_help(command))
         item.add_argument("--project", required=True, help="프로젝트 이름")
@@ -63,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
         if command not in {"init", "status"}:
             item.add_argument("--force", action="store_true", help="해당 단계 캐시를 무시하고 다시 실행")
     return parser
+
+
+def _review_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("포트는 0~65535 사이 정수여야 합니다.") from exc
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("포트는 0~65535 사이 정수여야 합니다.")
+    return port
 
 
 def _command_help(command: str) -> str:
@@ -153,6 +169,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     paths = project_paths(workspace, args.project)
     if args.command == "status":
         return project_status(paths)
+    if args.command == "review":
+        # Review reads existing artifacts, including stale plans. It must not
+        # create/overwrite config or monopolize the pipeline lock while idle.
+        from .review import build_review_catalog, serve_review
+
+        if args.json:
+            return build_review_catalog(paths)
+        return serve_review(paths, port=args.port)
 
     with project_lock(paths.root / ".pipeline.lock"):
         return execute_project_command(args, paths)

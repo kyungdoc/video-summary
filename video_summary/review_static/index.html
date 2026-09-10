@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>이벤트 검토 · Video Summary</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">검토 영역으로 건너뛰기</a>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">▥</span><span>VIDEO SUMMARY <span class="brand-divider">/</span> 이벤트 검토</span></div>
+      <div class="header-actions"><span class="local-badge">내 컴퓨터에서만</span><button id="refresh" class="button quiet" type="button">새로고침</button></div>
+    </header>
+    <main>
+      <section class="intro" aria-labelledby="page-title">
+        <div><p class="eyebrow">STORY BEFORE THE CUT</p><h1 id="page-title">여행의 흐름을 확인하세요.</h1><p id="project-name" class="subtitle">프로젝트를 불러오는 중입니다.</p></div>
+        <dl class="overview" aria-label="프로젝트 요약"><div><dt>이벤트</dt><dd id="event-count">—</dd></div><div><dt>편집안 채택</dt><dd id="selected-count">—</dd></div><div><dt>확인 필요</dt><dd id="warning-count">—</dd></div></dl>
+      </section>
+      <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+      <div id="pipeline-note" class="pipeline-note">검토 내용을 저장해도 영상은 자동으로 렌더되지 않습니다. 원본과 현재 편집안은 그대로 두고, 다음 분석·계획에 적용할 규칙을 저장합니다.</div>
+      <div id="catalog-warnings" class="catalog-warnings" hidden></div>
+      <div class="workspace" id="workspace" tabindex="-1">
+        <aside class="sidebar" aria-labelledby="events-title">
+          <div class="sidebar-heading"><h2 id="events-title">이벤트 흐름</h2><span id="visible-count" class="muted"></span></div>
+          <label class="field-label" for="search">장면 찾기</label><input id="search" type="search" placeholder="대사, 파일명, 장소 검색" autocomplete="off">
+          <div class="filter-row"><div><label class="field-label" for="day-filter">날짜</label><select id="day-filter"><option value="">모든 날짜</option></select></div><div><label class="field-label" for="status-filter">표시</label><select id="status-filter"><option value="all">모든 이벤트</option><option value="attention">확인 필요</option><option value="omitted">미채택 포함</option><option value="selected">채택 포함</option></select></div></div>
+          <nav id="event-list" class="event-list" aria-label="날짜별 이벤트"></nav>
+        </aside>
+        <section class="review-area" aria-labelledby="event-title">
+          <div id="empty-state" class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h2>이벤트를 불러오는 중입니다.</h2><p>기존 분석 결과에서 원본 구간과 편집안을 연결합니다.</p></div>
+          <div id="event-workspace" hidden>
+            <div class="event-heading"><div><p id="event-kicker" class="eyebrow"></p><h2 id="event-title"></h2></div><span id="event-summary" class="muted"></span></div>
+            <div class="review-grid">
+              <section class="viewer" aria-label="원본 구간 미리보기">
+                <div class="video-stage"><video id="source-video" controls preload="metadata" playsinline></video><div id="video-placeholder" class="video-placeholder">아래에서 확인할 장면을 선택하세요.</div></div>
+                <div id="playback-error" class="playback-error" role="alert" hidden></div>
+                <div class="playback-toolbar"><div class="playback-buttons"><button id="play-candidate" class="button primary" type="button">선택 구간 재생</button><button id="play-context" class="button secondary" type="button">앞뒤 맥락 보기</button></div><span id="playback-range" class="timecode"></span></div>
+                <p class="viewer-note">원본의 지정 구간만 재생합니다. 앞뒤 맥락은 같은 파일 안에서 확인하며, 편집 영상의 연속 재생은 아닙니다.</p>
+                <div class="source-heading"><h3 id="clip-name"></h3><span id="source-badge" class="badge neutral"></span></div>
+                <dl id="source-meta" class="source-meta"></dl>
+                <details class="transcript-details"><summary>대사와 선택 근거</summary><p id="transcript" class="transcript"></p><p id="selection-reason" class="muted"></p></details>
+              </section>
+              <aside class="inspector" aria-labelledby="inspector-title">
+                <div class="inspector-heading"><h3 id="inspector-title">이 장면의 핵심</h3><span id="evidence-status" class="badge neutral">미검토</span></div>
+                <p class="inspector-note">태그와 전사는 추정 단서입니다. 실제 행동을 원본에서 확인한 뒤 기록하세요.</p>
+                <div id="evidence-list" class="evidence-list"></div>
+                <form id="review-form">
+                  <fieldset><legend>저장할 원본 구간 <span class="muted">(초)</span></legend><div class="range-fields"><div><label for="range-start">시작</label><input id="range-start" type="number" min="0" step="any" required><button id="set-start" type="button" class="text-button">현재 재생 위치로</button></div><div><label for="range-end">끝</label><input id="range-end" type="number" min="0" step="any" required><button id="set-end" type="button" class="text-button">현재 재생 위치로</button></div></div><p id="range-duration" class="range-duration"></p></fieldset>
+                  <label class="field-label" for="review-reason">선택 이유 / 확인한 내용 <span class="required">필수 · 160자 이내</span></label><textarea id="review-reason" rows="3" maxlength="160" placeholder="예: 음식이 나오고 가족이 함께 먹는 장면" required></textarea>
+                  <div class="filter-row observation-fields"><div><label class="field-label" for="observation-kind">관찰한 내용</label><select id="observation-kind"></select></div><div><label class="field-label" for="observation-basis">근거</label><select id="observation-basis"></select></div></div>
+                  <div id="speech-cues" class="speech-cues" hidden><p class="field-label">근거로 사용한 발화 선택</p><div id="speech-cue-list"></div></div>
+                  <label class="checkbox-label"><input id="record-observation" type="checkbox"> 포함·제외 규칙과 함께 관찰 내용도 기록</label>
+                  <div class="save-actions"><button id="save-include" class="button primary" type="submit" value="include">필수 포함</button><button id="save-exclude" class="button danger" type="submit" value="exclude">제외</button><button id="save-evidence" class="button secondary" type="submit" value="evidence">관찰만 기록</button></div>
+                  <p class="save-note">‘관찰만 기록’은 채택을 강제하지 않습니다. 개인정보·옷 갈아입는 장면 등은 ‘제외’로 지정하세요.</p>
+                </form>
+              </aside>
+            </div>
+            <section class="candidate-section" aria-labelledby="candidates-title"><div class="section-heading"><h3 id="candidates-title">이벤트 안의 모든 후보</h3><span class="muted">미채택 구간도 함께 확인</span></div><div id="candidate-list" class="candidate-list"></div></section>
+          </div>
+        </section>
+      </div>
+      <section class="history-section" aria-labelledby="history-title"><div class="section-heading"><div><p class="eyebrow">REVIEW HISTORY</p><h2 id="history-title">저장한 검토 기록</h2></div><span id="revision-label" class="muted"></span></div><p class="history-note">검토 규칙의 변경 기록입니다. 렌더된 영상의 버전 기록은 아닙니다.</p><ol id="history-list" class="history-list"></ol></section>
+    </main>
+    <footer>로컬 검토 · 원본 미디어는 변경하지 않습니다 · 외부 서비스로 전송하지 않습니다</footer>
+    <noscript><p class="status error">이 검토 화면에는 JavaScript가 필요합니다.</p></noscript>
+  </body>
+</html>
