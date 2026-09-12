@@ -25,8 +25,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "editing": {
         "prompt": "날짜 순서를 지키고 여정, 재미있는 대화, 음식과 풍경이 균형 있게 드러나는 여행 브이로그",
         "target_minutes_per_day": 4.0,
+        "soft_max_minutes_per_day": 10.0,
+        "pacing_profile": "gentle",
+        "tone_profile": "playful",
+        "selection_strategy": "event_flow",
+        "adaptive_fast_forward": True,
+        "max_fast_forward_speed": 3.0,
+        "exclude_ranges": [],
+        "reviewed_include_ranges": [],
+        "reviewed_evidence": [],
         "cold_open": True,
         "preserve_family_interviews": True,
+        "preserve_meal_events": True,
         "episode_mode": "daily",
     },
     "analysis": {
@@ -47,6 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "trip_intro_grid_size": 7,
         "trip_intro_animation": "flow",
         "trip_intro_candidate_ids": [],
+        "portrait_layout": "blur",
         "transition_seconds": 0.18,
         "intro_seconds": 4.0,
         "date_card_seconds": 3.0,
@@ -191,10 +202,81 @@ def _validate_config(config: dict[str, Any]) -> None:
     target = _finite_number(editing.get("target_minutes_per_day"), "target_minutes_per_day")
     if not 0.1 <= target <= 180:
         raise VideoSummaryError("target_minutes_per_day는 0.1~180 사이여야 합니다.")
+    soft_max = _finite_number(
+        editing.get("soft_max_minutes_per_day", 10.0),
+        "soft_max_minutes_per_day",
+    )
+    if not 0.1 <= soft_max <= 180:
+        raise VideoSummaryError("soft_max_minutes_per_day는 0.1~180 사이여야 합니다.")
+    pacing_profile = editing.get("pacing_profile", "gentle")
+    if not isinstance(pacing_profile, str) or pacing_profile not in {"gentle", "balanced"}:
+        raise VideoSummaryError("pacing_profile은 gentle 또는 balanced여야 합니다.")
+    tone_profile = editing.get("tone_profile", "playful")
+    if not isinstance(tone_profile, str) or tone_profile not in {"calm", "playful"}:
+        raise VideoSummaryError("tone_profile은 calm 또는 playful이어야 합니다.")
+    if editing.get("selection_strategy", "event_flow") != "event_flow":
+        raise VideoSummaryError("selection_strategy는 event_flow여야 합니다.")
+    if type(editing.get("adaptive_fast_forward", True)) is not bool:
+        raise VideoSummaryError("adaptive_fast_forward는 true 또는 false여야 합니다.")
+    max_fast_forward = _finite_number(
+        editing.get("max_fast_forward_speed", 3.0),
+        "max_fast_forward_speed",
+    )
+    if not 1.0 <= max_fast_forward <= 4.0:
+        raise VideoSummaryError("max_fast_forward_speed는 1~4 사이여야 합니다.")
+    exclude_ranges = editing.get("exclude_ranges", [])
+    if not isinstance(exclude_ranges, list):
+        raise VideoSummaryError("exclude_ranges는 list여야 합니다.")
+    for index, rule in enumerate(exclude_ranges, start=1):
+        field = f"exclude_ranges[{index}]"
+        if not isinstance(rule, dict):
+            raise VideoSummaryError(f"{field}는 object여야 합니다.")
+        unknown = set(rule) - {"match", "match_type", "source_fingerprint", "start", "end", "reason"}
+        if unknown:
+            raise VideoSummaryError(f"{field}에 허용되지 않은 필드가 있습니다: {sorted(unknown)}")
+        match = rule.get("match")
+        if not isinstance(match, str) or not match.strip():
+            raise VideoSummaryError(f"{field}.match는 비어 있지 않은 문자열이어야 합니다.")
+        _validate_range_source_binding(rule, field)
+        reason = rule.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 160:
+            raise VideoSummaryError(f"{field}.reason은 1~160자 문자열이어야 합니다.")
+        start = _finite_number(rule.get("start", 0.0), f"{field}.start")
+        end_value = rule.get("end")
+        end = _finite_number(end_value, f"{field}.end") if end_value is not None else None
+        if start < 0 or (end is not None and end - start <= 0.001):
+            raise VideoSummaryError(f"{field}의 start/end 범위가 잘못되었습니다.")
+    reviewed_include_ranges = editing.get("reviewed_include_ranges", [])
+    if not isinstance(reviewed_include_ranges, list):
+        raise VideoSummaryError("reviewed_include_ranges는 list여야 합니다.")
+    for index, rule in enumerate(reviewed_include_ranges, start=1):
+        field = f"reviewed_include_ranges[{index}]"
+        if not isinstance(rule, dict):
+            raise VideoSummaryError(f"{field}는 object여야 합니다.")
+        unknown = set(rule) - {"match", "match_type", "source_fingerprint", "start", "end", "reason"}
+        if unknown:
+            raise VideoSummaryError(f"{field}에 허용되지 않은 필드가 있습니다: {sorted(unknown)}")
+        match = rule.get("match")
+        if not isinstance(match, str) or not match.strip():
+            raise VideoSummaryError(f"{field}.match는 비어 있지 않은 문자열이어야 합니다.")
+        _validate_range_source_binding(rule, field)
+        reason = rule.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 160:
+            raise VideoSummaryError(f"{field}.reason은 1~160자 문자열이어야 합니다.")
+        start = _finite_number(rule.get("start", 0.0), f"{field}.start")
+        end_value = rule.get("end")
+        end = _finite_number(end_value, f"{field}.end") if end_value is not None else None
+        if start < 0 or (end is not None and end - start <= 0.001):
+            raise VideoSummaryError(f"{field}의 start/end 범위가 잘못되었습니다.")
+    evidence = editing.get("reviewed_evidence", [])
+    if not isinstance(evidence, list) or any(not isinstance(record, dict) for record in evidence):
+        raise VideoSummaryError("reviewed_evidence는 검수 근거 object의 list여야 합니다.")
     if editing.get("episode_mode") not in {"daily", "trip"}:
         raise VideoSummaryError("episode_mode는 daily 또는 trip이어야 합니다.")
     if type(editing.get("preserve_family_interviews", True)) is not bool:
         raise VideoSummaryError("preserve_family_interviews는 true 또는 false여야 합니다.")
+    if type(editing.get("preserve_meal_events", True)) is not bool:
+        raise VideoSummaryError("preserve_meal_events는 true 또는 false여야 합니다.")
     if render.get("resolution") not in {"720p", "1080p", "2160p"}:
         raise VideoSummaryError("resolution은 720p, 1080p, 2160p 중 하나여야 합니다.")
     if render.get("trip_intro_style") not in {"card", "mosaic"}:
@@ -204,6 +286,8 @@ def _validate_config(config: dict[str, Any]) -> None:
         raise VideoSummaryError("trip_intro_grid_size는 6, 7, 8 중 하나여야 합니다.")
     if render.get("trip_intro_animation", "flow") not in {"static", "flow"}:
         raise VideoSummaryError("trip_intro_animation은 static 또는 flow여야 합니다.")
+    if render.get("portrait_layout", "blur") not in {"blur", "pillarbox", "crop"}:
+        raise VideoSummaryError("portrait_layout은 blur, pillarbox, crop 중 하나여야 합니다.")
     intro_candidate_ids = render.get("trip_intro_candidate_ids", [])
     if (
         not isinstance(intro_candidate_ids, list)
@@ -264,12 +348,41 @@ def _validate_config(config: dict[str, Any]) -> None:
                 ZoneInfo(rule_timezone)
             except ZoneInfoNotFoundError as exc:
                 raise VideoSummaryError(f"알 수 없는 timezone입니다: {rule_timezone}") from exc
+        confidence = rule.get("confidence")
+        if confidence is not None and confidence not in {"high", "medium", "low"}:
+            raise VideoSummaryError(
+                f"{field}.confidence는 high, medium, low 중 하나여야 합니다."
+            )
+        clock_offset = _finite_number(
+            rule.get("clock_offset_seconds", 0.0),
+            f"{field}.clock_offset_seconds",
+        )
+        if not -12 * 3600 <= clock_offset <= 12 * 3600:
+            raise VideoSummaryError(
+                f"{field}.clock_offset_seconds는 -43200~43200 사이여야 합니다."
+            )
     for key in ("intro_seconds", "date_card_seconds", "outro_seconds"):
         duration = _finite_number(render.get(key), key)
         if not 0.1 <= duration <= 30:
             raise VideoSummaryError(f"{key}는 0.1~30 사이여야 합니다.")
     if not isinstance(render.get("font_file"), str):
         raise VideoSummaryError("font_file은 문자열 경로여야 합니다.")
+
+
+def _validate_range_source_binding(rule: dict[str, Any], field: str) -> None:
+    match_type = rule.get("match_type", "glob")
+    if not isinstance(match_type, str) or match_type not in {"glob", "exact"}:
+        raise VideoSummaryError(f"{field}.match_type은 glob 또는 exact여야 합니다.")
+    if match_type == "exact":
+        match = rule["match"]
+        if Path(match).is_absolute() or ".." in Path(match).parts:
+            raise VideoSummaryError(f"{field}.match는 원본 폴더 기준 상대 경로여야 합니다.")
+    if "source_fingerprint" in rule:
+        fingerprint = rule["source_fingerprint"]
+        if not isinstance(fingerprint, str) or not fingerprint.strip() or len(fingerprint) > 256:
+            raise VideoSummaryError(f"{field}.source_fingerprint는 비어 있지 않은 문자열이어야 합니다.")
+        if match_type != "exact":
+            raise VideoSummaryError(f"{field}.source_fingerprint에는 match_type: exact가 필요합니다.")
 
 
 def _finite_number(value: Any, field: str) -> float:

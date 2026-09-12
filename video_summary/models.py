@@ -28,6 +28,20 @@ class Clip:
     audio_sample_rate: int | None = None
     location: str | None = None
     warnings: list[str] = field(default_factory=list)
+    pix_fmt: str | None = None
+    color_space: str | None = None
+    color_transfer: str | None = None
+    color_primaries: str | None = None
+    color_range: str | None = None
+    dolby_vision_profile: int | None = None
+    camera_make: str | None = None
+    camera_model: str | None = None
+    source_kind: str = "unknown"
+    source_stream_id: str | None = None
+    capture_time_confidence: str = "medium"
+    sequence_at: str | None = None
+    sequence_source: str = "capture_time"
+    capture_time_basis: str = "absolute"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -70,6 +84,22 @@ class Candidate:
     location: str | None
     frame_path: str
     required_event_ids: list[str] = field(default_factory=list)
+    required_meal_event_ids: list[str] = field(default_factory=list)
+    required_meal_context_ids: list[str] = field(default_factory=list)
+    reviewed_inclusion_reason: str | None = None
+    origin: str = "legacy"
+    story_event_id: str | None = None
+    story_stage: str = "body"
+    importance: str = "supporting"
+    speed_policy: str = "protected_1x"
+    exclusion_reason: str | None = None
+    source_kind: str = "unknown"
+    source_stream_id: str | None = None
+    capture_time_confidence: str = "medium"
+    angle_group_id: str | None = None
+    sequence_at: str | None = None
+    sequence_source: str = "capture_time"
+    capture_time_basis: str = "absolute"
 
     @property
     def duration(self) -> float:
@@ -124,9 +154,11 @@ class EditPlan:
     candidate_set_hash: str
     episodes: list[Episode]
     version: int = SCHEMA_VERSION
+    pacing_profile: str | None = None
+    tone_profile: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "version": self.version,
             "project": self.project,
             "prompt": self.prompt,
@@ -134,3 +166,8 @@ class EditPlan:
             "candidate_set_hash": self.candidate_set_hash,
             "episodes": [episode.to_dict() for episode in self.episodes],
         }
+        if self.pacing_profile:
+            payload["pacing_profile"] = self.pacing_profile
+        if self.tone_profile:
+            payload["tone_profile"] = self.tone_profile
+        return payload

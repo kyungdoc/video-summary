@@ -19,11 +19,17 @@ from .utils import VideoSummaryError, file_fingerprint, print_status, read_json,
 
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mts", ".m2ts", ".avi", ".mkv"}
-_CAPTURE_TIME_POLICY_VERSION = 3
+_CAPTURE_TIME_POLICY_VERSION = 9
 VISUAL_SIGNAL_POLICY_VERSION = 2
+_UNPLACED_DAY_KEY = "unplaced"
+_GLOBALLY_PLACED_BASES = frozenset({"absolute", "estimated"})
 _FILENAME_PATTERNS = (
     re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])[_-]?([0-2]\d)([0-5]\d)([0-5]\d)(?!\d)"),
     re.compile(r"(?<!\d)(20\d{2})[-_](0[1-9]|1[0-2])[-_]([0-2]\d|3[01])[ T_-]([0-2]\d)[-_:]?([0-5]\d)[-_:]?([0-5]\d)(?!\d)"),
+)
+_DJI_MIMO_TIMESTAMP_PATTERN = re.compile(
+    r"^dji_mimo_\d{8}_\d{6}_(20\d{12})(?:_|\.)",
+    re.IGNORECASE,
 )
 
 
@@ -55,7 +61,7 @@ def scan_project(
     project_config = config["project"]
     cache_key = stable_hash(
         {
-            "version": 2,
+            "version": 3,
             "capture_time_policy": _CAPTURE_TIME_POLICY_VERSION,
             "project": config["project"]["name"],
             "source": str(source),
@@ -82,11 +88,29 @@ def scan_project(
     state.mark_running("scan", cache_key, {"source_dir": str(source), "clip_count": len(files)})
     try:
         timezone = _timezone(str(project_config["timezone"]))
-        probed: list[tuple[Path, dict[str, Any], datetime, str, list[str]]] = []
+        probed: list[
+            tuple[
+                Path,
+                dict[str, Any],
+                datetime,
+                str,
+                datetime,
+                str,
+                str,
+                str,
+                str | None,
+                str | None,
+                list[str],
+            ]
+        ] = []
         for index, path in enumerate(files, start=1):
             print_status(f"scan {index}/{len(files)}: {path.name}")
             probe = probe_media(path)
             relative = path.relative_to(source)
+            camera_make = _metadata_tag(probe, "com.apple.quicktime.make", "make")
+            camera_model = _metadata_tag(probe, "com.apple.quicktime.model", "model")
+            source_kind = _source_kind(relative, camera_make, camera_model)
+            override = _date_override(relative, config.get("date_overrides", []))
             captured, capture_source, warnings = infer_capture_time(
                 path,
                 relative,
@@ -94,18 +118,89 @@ def scan_project(
                 timezone,
                 config.get("date_overrides", []),
             )
-            probed.append((path, probe, captured, capture_source, warnings))
+            sequence_at, sequence_source, sequence_warnings = infer_sequence_time(
+                path,
+                captured,
+                capture_source,
+                timezone,
+                override,
+                source_kind=source_kind,
+            )
+            warnings.extend(sequence_warnings)
+            capture_time_basis = _capture_time_basis(
+                capture_source,
+                override,
+                source_kind=source_kind,
+                sequence_source=sequence_source,
+            )
+            capture_time_confidence = _capture_time_confidence(
+                capture_source,
+                override,
+                source_kind=source_kind,
+                sequence_source=sequence_source,
+            )
+            probed.append(
+                (
+                    path,
+                    probe,
+                    captured,
+                    capture_source,
+                    sequence_at,
+                    sequence_source,
+                    capture_time_basis,
+                    capture_time_confidence,
+                    camera_make,
+                    camera_model,
+                    warnings,
+                )
+            )
 
-        probed.sort(key=lambda item: (item[2].timestamp(), str(item[0]).casefold()))
+        probed.sort(
+            key=lambda item: (
+                item[6] not in _GLOBALLY_PLACED_BASES,
+                item[4].timestamp() if item[6] in _GLOBALLY_PLACED_BASES else 0.0,
+                str(item[0]).casefold(),
+            )
+        )
         day_start_hour = int(project_config["day_start_hour"])
-        day_keys = sorted({_day_key(captured, day_start_hour) for _, _, captured, _, _ in probed})
+        day_keys = sorted(
+            {
+                _day_key(item[4], day_start_hour)
+                for item in probed
+                if item[6] in _GLOBALLY_PLACED_BASES
+            }
+        )
         day_number = {key: index + 1 for index, key in enumerate(day_keys)}
         clips: list[Clip] = []
-        for path, probe, captured, capture_source, warnings in probed:
+        for (
+            path,
+            probe,
+            captured,
+            capture_source,
+            sequence_at,
+            sequence_source,
+            capture_time_basis,
+            capture_time_confidence,
+            camera_make,
+            camera_model,
+            warnings,
+        ) in probed:
             relative = path.relative_to(source)
-            day_key = _day_key(captured, day_start_hour)
+            if capture_time_basis in _GLOBALLY_PLACED_BASES:
+                day_key = _day_key(sequence_at, day_start_hour)
+                travel_day = day_number[day_key]
+            else:
+                day_key = _UNPLACED_DAY_KEY
+                travel_day = 0
             video = _video_stream(probe)
             audio = _audio_stream(probe)
+            source_kind = _source_kind(relative, camera_make, camera_model)
+            source_stream_id = _source_stream_id(
+                relative,
+                source_kind=source_kind,
+                camera_make=camera_make,
+                camera_model=camera_model,
+            )
             duration = _duration(probe, video)
             if duration <= 0:
                 warnings.append("영상 길이를 확인할 수 없습니다.")
@@ -122,7 +217,7 @@ def scan_project(
                     captured_at=captured.isoformat(),
                     capture_source=capture_source,
                     day_key=day_key,
-                    travel_day=day_number[day_key],
+                    travel_day=travel_day,
                     width=int(video.get("width", 0) or 0),
                     height=int(video.get("height", 0) or 0),
                     fps=round(_fps(video), 4),
@@ -132,11 +227,25 @@ def scan_project(
                     audio_sample_rate=int(audio.get("sample_rate", 0) or 0) if audio else None,
                     location=location,
                     warnings=warnings,
+                    pix_fmt=_optional_probe_text(video.get("pix_fmt")),
+                    color_space=_optional_probe_text(video.get("color_space")),
+                    color_transfer=_optional_probe_text(video.get("color_transfer")),
+                    color_primaries=_optional_probe_text(video.get("color_primaries")),
+                    color_range=_optional_probe_text(video.get("color_range")),
+                    dolby_vision_profile=_dolby_vision_profile(video),
+                    camera_make=camera_make,
+                    camera_model=camera_model,
+                    source_kind=source_kind,
+                    source_stream_id=source_stream_id,
+                    capture_time_confidence=capture_time_confidence,
+                    sequence_at=sequence_at.isoformat(),
+                    sequence_source=sequence_source,
+                    capture_time_basis=capture_time_basis,
                 )
             )
 
         manifest = {
-            "version": 1,
+            "version": 2,
             "project": config["project"]["name"],
             "source_dir": str(source),
             "timezone": str(project_config["timezone"]),
@@ -243,6 +352,102 @@ def infer_capture_time(
 
     warnings.append("촬영 시각이 없어 파일 수정 시각을 사용했습니다.")
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone), "mtime", warnings
+
+
+def infer_sequence_time(
+    path: Path,
+    captured_at: datetime,
+    capture_source: str,
+    timezone: ZoneInfo,
+    override: dict[str, Any] | None,
+    *,
+    source_kind: str,
+) -> tuple[datetime, str, list[str]]:
+    """Return the auditable time used to order clips without rewriting capture metadata.
+
+    Native phone timestamps remain fixed anchors.  A project may calibrate a
+    reset camera clock with ``clock_offset_seconds``.  DJI Mimo exports have a
+    second filename timestamp that represents the actual recording time.  Use
+    that value consistently for sequencing, even when generic container
+    metadata differs by only a second or two, while keeping the original
+    ``captured_at`` available for audit.
+    """
+    warnings: list[str] = []
+    override = override or None
+
+    # Messenger exports may retain an arbitrary container timestamp or only the
+    # local filesystem mtime.  Neither is a recording-time anchor.  Keep the
+    # value for audit, but require an explicit per-file captured_at before this
+    # source can contribute a trip day or be interleaved with native cameras.
+    if source_kind == "shared" and capture_source != "override":
+        warnings.append(
+            "공유받은 영상의 촬영 시각 근거가 없어 자동 날짜/카메라 간 순서에서 제외했습니다."
+        )
+        return captured_at, "shared_unplaced", warnings
+
+    # DJI Mimo's second datetime token is the recording clock, while the first
+    # token and generic container creation time can describe an export.  A
+    # date-only override must therefore rebase this second clock to the reviewed
+    # local date instead of silently falling back to the container clock.
+    sequence_base = captured_at
+    sequence_base_source = capture_source
+    if source_kind == "action_camera" and capture_source != "override":
+        sequence_timezone = timezone
+        if override and override.get("timezone"):
+            sequence_timezone = _timezone(str(override["timezone"]))
+        filename_time = _dji_mimo_capture_datetime(path.name, sequence_timezone)
+        if filename_time is not None:
+            if override and override.get("date"):
+                filename_time = _replace_wall_date(
+                    filename_time,
+                    _parse_override_date(str(override["date"])),
+                    sequence_timezone,
+                )
+                sequence_base_source = "date_override:dji_mimo_filename"
+            else:
+                sequence_base_source = "dji_mimo_filename"
+            sequence_base = filename_time
+            if abs((captured_at - filename_time).total_seconds()) > 60.0:
+                warnings.append(
+                    "DJI Mimo 파일명의 두 번째 촬영 시각과 컨테이너 시각이 달라 "
+                    "파일명 시각을 영상 순서에 사용했습니다."
+                )
+
+    # The presence of the key is itself an auditable manual review decision.
+    # An explicit zero offset means the relative camera clock was checked and
+    # accepted, while omission means it must not be placed across streams.
+    has_clock_offset = bool(override and "clock_offset_seconds" in override)
+    offset_seconds = float((override or {}).get("clock_offset_seconds", 0.0))
+    if has_clock_offset:
+        warnings.append(
+            f"카메라 시계 보정값 {offset_seconds:+g}초를 영상 순서에 적용했습니다."
+        )
+        return (
+            sequence_base + timedelta(seconds=offset_seconds),
+            (
+                "manual_clock_offset:dji_mimo_filename"
+                if sequence_base_source.endswith("dji_mimo_filename")
+                else "manual_clock_offset"
+            ),
+            warnings,
+        )
+
+    if sequence_base_source != capture_source:
+        return sequence_base, sequence_base_source, warnings
+
+    if (
+        source_kind == "action_camera"
+        and override
+        and override.get("date")
+        and capture_source.startswith("date_override:")
+    ):
+        warnings.append(
+            "날짜만 보정된 액션캠 시계는 카메라 내부 순서만 신뢰할 수 있어 "
+            "자동 카메라 간 배치에서 제외했습니다."
+        )
+        return captured_at, "relative_clock_unplaced", warnings
+
+    return captured_at, capture_source, warnings
 
 
 def resolve_location(
@@ -446,6 +651,12 @@ def _decode_visual_signal_frames(
 def extract_frame(clip: Clip, at: float, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
+    temporary.unlink(missing_ok=True)
+    frame_interval = 1.0 / max(1.0, float(clip.fps or 0.0))
+    safe_at = min(
+        max(0.0, at),
+        max(0.0, clip.duration - max(0.1, frame_interval * 2.0)),
+    )
     run_command(
         [
             "ffmpeg",
@@ -453,19 +664,53 @@ def extract_frame(clip: Clip, at: float, output: Path) -> None:
             "-loglevel",
             "error",
             "-ss",
-            f"{max(0.0, at):.3f}",
+            f"{safe_at:.3f}",
             "-i",
             clip.path,
             "-frames:v",
             "1",
             "-vf",
             "scale=640:-2:force_original_aspect_ratio=decrease",
+            "-pix_fmt",
+            "yuvj420p",
             "-q:v",
             "4",
             "-y",
             str(temporary),
         ]
     )
+    if not temporary.exists() or temporary.stat().st_size == 0:
+        # Some iPhone MOV edit lists let a fast input seek return success while
+        # producing no packet. Retry with an accurate output seek before
+        # treating the representative frame as unavailable.
+        temporary.unlink(missing_ok=True)
+        run_command(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                clip.path,
+                "-ss",
+                f"{safe_at:.3f}",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=640:-2:force_original_aspect_ratio=decrease",
+                "-pix_fmt",
+                "yuvj420p",
+                "-q:v",
+                "4",
+                "-y",
+                str(temporary),
+            ]
+        )
+    if not temporary.exists() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        raise VideoSummaryError(
+            f"대표 프레임을 추출하지 못했습니다 ({Path(clip.path).name} @ {safe_at:.3f}s)"
+        )
     os.replace(temporary, output)
 
 
@@ -489,21 +734,136 @@ def _date_override(relative_path: Path, overrides: Any) -> dict[str, Any] | None
     return None
 
 
-def _creation_time(probe: dict[str, Any]) -> str | None:
+def _metadata_tag(probe: dict[str, Any], *keys: str) -> str | None:
     containers: list[dict[str, Any]] = []
     format_data = probe.get("format")
     if isinstance(format_data, dict):
         containers.append(format_data)
     containers.extend(stream for stream in probe.get("streams", []) if isinstance(stream, dict))
+    lowered_containers: list[dict[str, Any]] = []
     for container in containers:
         tags = container.get("tags", {})
         if not isinstance(tags, dict):
             continue
-        lowered = {str(key).casefold(): value for key, value in tags.items()}
-        for key in ("creation_time", "com.apple.quicktime.creationdate", "date"):
+        lowered_containers.append(
+            {str(key).casefold(): value for key, value in tags.items()}
+        )
+    # Honor tag priority across all containers. A generic format creation_time
+    # must never beat an original QuickTime creation date stored on a stream.
+    for key in keys:
+        for lowered in lowered_containers:
             if lowered.get(key):
                 return str(lowered[key])
     return None
+
+
+def _creation_time(probe: dict[str, Any]) -> str | None:
+    # Photos exports can stamp the export time into generic creation_time while
+    # preserving the original capture time in the QuickTime tag.
+    return _metadata_tag(
+        probe,
+        "com.apple.quicktime.creationdate",
+        "creation_time",
+        "date",
+    )
+
+
+def _source_kind(
+    relative_path: Path,
+    camera_make: str | None,
+    camera_model: str | None,
+) -> str:
+    name = relative_path.name.casefold()
+    make = (camera_make or "").casefold()
+    model = (camera_model or "").casefold()
+    if name.startswith("_talkv_"):
+        return "shared"
+    if "iphone" in model or make == "apple":
+        return "phone"
+    if "dji" in make or "dji" in model or name.startswith("dji_"):
+        return "action_camera"
+    return "unknown"
+
+
+def _source_stream_id(
+    relative_path: Path,
+    *,
+    source_kind: str,
+    camera_make: str | None,
+    camera_model: str | None,
+) -> str:
+    if camera_model:
+        identity = {
+            "kind": source_kind,
+            "make": (camera_make or "").strip().casefold(),
+            "model": camera_model.strip().casefold(),
+        }
+    elif source_kind == "shared":
+        identity = {"kind": "shared", "channel": "talkv"}
+    else:
+        parents = [part.casefold() for part in relative_path.parts[:-1]]
+        identity = {
+            "kind": source_kind,
+            "folder": parents[-1] if parents else "root",
+        }
+    return "stream_" + stable_hash(identity, length=12)
+
+
+def _capture_time_confidence(
+    capture_source: str,
+    override: dict[str, Any] | None,
+    *,
+    source_kind: str = "unknown",
+    sequence_source: str | None = None,
+) -> str:
+    configured = str((override or {}).get("confidence", "")).strip().casefold()
+    if configured in {"high", "medium", "low"}:
+        return configured
+    if source_kind == "shared":
+        return "low"
+    if sequence_source in {"shared_unplaced", "relative_clock_unplaced"}:
+        return "low"
+    if sequence_source and (
+        sequence_source.startswith("manual_clock_offset")
+        or sequence_source in {
+            "dji_mimo_filename",
+            "date_override:dji_mimo_filename",
+        }
+    ):
+        return "medium"
+    if source_kind == "action_camera" and capture_source == "date_override:metadata":
+        return "medium"
+    if capture_source in {"metadata", "date_override:metadata", "override"}:
+        return "high"
+    if capture_source in {"filename", "date_override:filename"}:
+        return "medium"
+    return "low"
+
+
+def _capture_time_basis(
+    capture_source: str,
+    override: dict[str, Any] | None,
+    *,
+    source_kind: str,
+    sequence_source: str,
+) -> str:
+    """Classify whether wall-clock time can order clips across cameras."""
+    if sequence_source in {"shared_unplaced", "relative_clock_unplaced"}:
+        return "unplaced"
+    if source_kind == "shared" and capture_source != "override":
+        return "unplaced"
+    if sequence_source.startswith("manual_clock_offset") or sequence_source in {
+        "dji_mimo_filename",
+        "date_override:dji_mimo_filename",
+    }:
+        return "estimated"
+    if source_kind == "action_camera" and capture_source.startswith("date_override:"):
+        return "unplaced"
+    if capture_source in {"mtime", "date_override:mtime"}:
+        return "unplaced"
+    if capture_source in {"filename", "date_override:filename"}:
+        return "estimated"
+    return "absolute"
 
 
 def _parse_datetime(value: str, timezone: ZoneInfo) -> datetime:
@@ -517,6 +877,11 @@ def _parse_datetime_raw(value: str) -> datetime:
     text = value.strip()
     if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
+    # Apple QuickTime commonly writes local offsets as ``-1000`` instead of
+    # the colonized ISO 8601 form ``-10:00``.  Python 3.11+ accepts both, but
+    # normalize explicitly so capture ordering stays stable on every supported
+    # runtime and in tools that reuse this parser.
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)
     try:
         return datetime.fromisoformat(text)
     except ValueError as exc:
@@ -612,6 +977,19 @@ def _filename_datetime(name: str, timezone: ZoneInfo) -> datetime | None:
     return None
 
 
+def _dji_mimo_capture_datetime(name: str, timezone: ZoneInfo) -> datetime | None:
+    """Read the recording timestamp from DJI Mimo's second datetime token."""
+    if not name.casefold().startswith("dji_mimo_"):
+        return None
+    match = _DJI_MIMO_TIMESTAMP_PATTERN.search(name)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone)
+    except ValueError:
+        return None
+
+
 def _video_stream(probe: dict[str, Any]) -> dict[str, Any]:
     for stream in probe.get("streams", []):
         if stream.get("codec_type") == "video":
@@ -661,6 +1039,27 @@ def _rotation(video: dict[str, Any]) -> int:
             except (TypeError, ValueError):
                 continue
     return 0
+
+
+def _optional_probe_text(value: Any) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _dolby_vision_profile(video: dict[str, Any]) -> int | None:
+    for side_data in video.get("side_data_list", []):
+        if not isinstance(side_data, dict):
+            continue
+        if str(side_data.get("side_data_type", "")).casefold() != "dovi configuration record":
+            continue
+        value = side_data.get("dv_profile")
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _scan_config_signature(config: dict[str, Any]) -> str:

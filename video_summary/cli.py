@@ -32,6 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--whisper-cpp-model", help="점검할 whisper.cpp 모델 경로")
     doctor_parser.add_argument("--whisper-cpp-vad-model", help="점검할 Silero VAD 모델 경로")
 
+    review_parser = subparsers.add_parser("review", help="이벤트·원본·편집 근거를 로컬 브라우저에서 검토")
+    review_parser.add_argument("--project", required=True, help="프로젝트 이름")
+    review_parser.add_argument("--workspace", "--project-dir", dest="workspace", help="기존 프로젝트 workspace")
+    review_parser.add_argument("--port", type=_review_port, default=8765, help="127.0.0.1 포트 (0: 자동 할당)")
+    review_parser.add_argument("--json", action="store_true", help="서버 없이 검토 카탈로그 JSON만 출력")
+
     for command in ("init", "scan", "analyze", "plan", "render", "run", "status"):
         item = subparsers.add_parser(command, help=_command_help(command))
         item.add_argument("--project", required=True, help="프로젝트 이름")
@@ -51,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
             item.add_argument("--destination", help="인트로에 표시할 여행지 이름; 생략하면 자동 추론")
             item.add_argument("--episode-mode", choices=["daily", "trip"])
             item.add_argument("--resolution", choices=["720p", "1080p", "2160p"])
+            item.add_argument("--day-key", help="전체 plan 검증 후 이 날짜(YYYY-MM-DD)만 daily로 렌더")
+            item.add_argument("--plan-file", help="기본 edit-plan 대신 검증해 사용할 variant JSON plan")
+            item.add_argument("--output-tag", help="비교 출력 이름에 붙일 영문/숫자 태그")
         if command in {"analyze", "plan", "run"}:
             item.add_argument("--skip-transcribe", action="store_true", help="음성 전사를 건너뛰고 영상 신호만 사용")
         if command in {"plan", "run"}:
@@ -60,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
         if command not in {"init", "status"}:
             item.add_argument("--force", action="store_true", help="해당 단계 캐시를 무시하고 다시 실행")
     return parser
+
+
+def _review_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("포트는 0~65535 사이 정수여야 합니다.") from exc
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("포트는 0~65535 사이 정수여야 합니다.")
+    return port
 
 
 def _command_help(command: str) -> str:
@@ -82,6 +101,16 @@ def _add_project_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--day-start-hour", type=int, help="이 시각 전 클립은 전날 여행일로 분류")
     parser.add_argument("--language", help="전사 언어 예: ko, en, auto")
     parser.add_argument("--target-minutes", type=float, help="날짜별 목표 길이(분)")
+    parser.add_argument(
+        "--pacing-profile",
+        choices=["gentle", "balanced"],
+        help="사건은 유지하면서 사건 내부 source 길이를 조절하는 편집 호흡",
+    )
+    parser.add_argument(
+        "--tone-profile",
+        choices=["calm", "playful"],
+        help="같은 사건 안에서 차분한 맥락 또는 행동·결과·리액션을 우선하는 편집 톤",
+    )
     parser.add_argument("--asr-backend", choices=["auto", "whisper.cpp", "faster-whisper"])
     parser.add_argument("--asr-model", help="faster-whisper 모델명 또는 로컬 경로")
     parser.add_argument("--whisper-cpp-model", help="whisper.cpp GGML/GGUF 모델 경로")
@@ -140,6 +169,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     paths = project_paths(workspace, args.project)
     if args.command == "status":
         return project_status(paths)
+    if args.command == "review":
+        # Review reads existing artifacts, including stale plans. It must not
+        # create/overwrite config or monopolize the pipeline lock while idle.
+        from .review import build_review_catalog, serve_review
+
+        if args.json:
+            return build_review_catalog(paths)
+        return serve_review(paths, port=args.port)
 
     with project_lock(paths.root / ".pipeline.lock"):
         return execute_project_command(args, paths)
@@ -176,7 +213,15 @@ def execute_project_command(args: argparse.Namespace, paths: ProjectPaths) -> di
             force=args.force,
         )
     if args.command == "render":
-        return render_project(paths, config, draft=args.draft, force=args.force)
+        return render_project(
+            paths,
+            config,
+            draft=args.draft,
+            force=args.force,
+            day_key=args.day_key,
+            plan_file=args.plan_file,
+            output_tag=args.output_tag,
+        )
     if args.command == "run":
         return run_pipeline(
             paths,
@@ -219,6 +264,8 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
         "day_start_hour": ("project", "day_start_hour"),
         "language": ("project", "language"),
         "target_minutes": ("editing", "target_minutes_per_day"),
+        "pacing_profile": ("editing", "pacing_profile"),
+        "tone_profile": ("editing", "tone_profile"),
         "episode_mode": ("editing", "episode_mode"),
         "asr_backend": ("analysis", "asr_backend"),
         "asr_model": ("analysis", "asr_model"),

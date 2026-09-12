@@ -20,15 +20,20 @@ from video_summary.render_assets import MOSAIC_CAPACITY
 from video_summary.renderer import (
     Piece,
     RENDER_POLICY_VERSION,
+    RENDER_REPORT_VERSION,
     SOURCE_RENDER_POLICY_VERSION,
     SourceMember,
     SourceSelection,
+    _scoped_render_plan,
+    _validated_output_tag,
+    atempo_filter_chain,
     assemble_output,
     cached_piece_is_usable,
     card_fade_seconds,
     coalesce_source_selections,
     episode_pieces,
     family_interview_coverage,
+    meal_event_coverage,
     legacy_segment_directories,
     render_cache_key,
     render_card_piece,
@@ -38,6 +43,8 @@ from video_summary.renderer import (
     render_source_piece,
     source_output_timing,
     source_cache_namespace,
+    story_flow_coverage,
+    videotoolbox_download_pixel_format,
     write_chapters,
     write_timeline,
     write_trip_day_chapters,
@@ -150,7 +157,7 @@ class RendererTests(unittest.TestCase):
                     False,
                 )
 
-    def test_episode_cards_precede_all_sources_and_sources_are_chronological(self) -> None:
+    def test_episode_cards_precede_all_sources_and_preserve_validated_plan_order(self) -> None:
         early = candidate("early", "2026-08-19T08:00:00+09:00", 0.0)
         late_hook = candidate("late", "2026-08-19T18:00:00+09:00", 6.0)
         episode = Episode(
@@ -161,8 +168,8 @@ class RendererTests(unittest.TestCase):
             summary="첫날",
             target_duration=10.0,
             segments=[
-                PlanSegment(late_hook.candidate_id, "hook", "재미있는 장면"),
-                PlanSegment(early.candidate_id, "journey", "출발"),
+                PlanSegment(early.candidate_id, "hook", "출발"),
+                PlanSegment(late_hook.candidate_id, "journey", "재미있는 장면"),
             ],
         )
         plan = EditPlan("Trip", "", "local", "hash", [episode])
@@ -195,6 +202,106 @@ class RendererTests(unittest.TestCase):
             "intro-day-1", "date-day-1", "early", "late", "outro-day-1",
         ])
         self.assertEqual(pieces[1].day_chapter, "DAY 1 · 2026-08-19 · 서울")
+
+    def test_episode_preserves_plan_order_for_equal_sequence_times(self) -> None:
+        first = candidate("z-first", "2026-08-19T08:00:00+09:00", 0.0)
+        second = candidate("a-second", "2026-08-19T08:00:00+09:00", 0.0)
+        first.clip_id = "clip-z"
+        second.clip_id = "clip-a"
+        first.sequence_at = second.sequence_at = "2026-08-19T08:00:00+09:00"
+        episode = Episode(
+            day_key="2026-08-19",
+            travel_day=1,
+            title="DAY 1",
+            subtitle="2026-08-19",
+            summary="첫날",
+            target_duration=10.0,
+            segments=[
+                PlanSegment(first.candidate_id, "hook", "첫 번째"),
+                PlanSegment(second.candidate_id, "journey", "두 번째"),
+            ],
+        )
+        plan = EditPlan("Trip", "", "local", "hash", [episode])
+
+        def clip_for(item: Candidate) -> Clip:
+            return Clip(
+                clip_id=item.clip_id,
+                path=f"/tmp/{item.clip_id}.mp4",
+                relative_path=f"{item.clip_id}.mp4",
+                fingerprint=item.clip_id,
+                size_bytes=1,
+                duration=20.0,
+                captured_at=item.captured_at,
+                capture_source="metadata",
+                day_key=episode.day_key,
+                travel_day=1,
+                width=1920,
+                height=1080,
+                fps=30.0,
+                codec="h264",
+                rotation=0,
+                has_audio=True,
+            )
+
+        def fake_card(_directory: Path, card_id: str, *_args, **_kwargs) -> Piece:
+            return Piece(Path(f"/{card_id}.mp4"), 2.0, card_id)
+
+        def fake_source(segment: PlanSegment, item: Candidate, *_args, **_kwargs) -> Piece:
+            return Piece(
+                Path(f"/{item.candidate_id}.mp4"),
+                item.duration,
+                item.candidate_id,
+                item,
+                segment,
+            )
+
+        with (
+            patch("video_summary.renderer.render_card_piece", side_effect=fake_card),
+            patch("video_summary.renderer.render_source_piece", side_effect=fake_source),
+        ):
+            pieces = episode_pieces(
+                episode,
+                plan,
+                {item.candidate_id: item for item in (first, second)},
+                {item.clip_id: clip_for(item) for item in (first, second)},
+                copy.deepcopy(DEFAULT_CONFIG),
+                Path("/segments"),
+                Path("/cards"),
+                Path("/overlays"),
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                True,
+                include_intro=False,
+                include_outro=False,
+                force=False,
+            )
+
+        self.assertEqual([piece.label for piece in pieces[1:]], ["z-first", "a-second"])
+
+    def test_scoped_render_plan_preserves_pacing_profile(self) -> None:
+        episode = Episode("2026-08-19", 1, "DAY 1", "", "", 10.0, [])
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [episode],
+            pacing_profile="gentle",
+            tone_profile="playful",
+        )
+
+        scoped = _scoped_render_plan(plan, episode.day_key)
+
+        self.assertEqual(scoped.pacing_profile, "gentle")
+        self.assertEqual(scoped.tone_profile, "playful")
+
+    def test_variant_output_tag_rejects_path_components(self) -> None:
+        for value in ("../gentle", "gentle/../../escape", "/tmp/gentle"):
+            with self.subTest(value=value), self.assertRaises(VideoSummaryError):
+                _validated_output_tag(value)
 
     def test_daily_intro_uses_destination_and_day_while_date_card_stays_unchanged(self) -> None:
         episode = Episode(
@@ -315,6 +422,154 @@ class RendererTests(unittest.TestCase):
             [(True, True), (True, True)],
         )
         self.assertEqual([member.label for member in pieces[1].source_members], ["Pier 39", "scenery"])
+
+    def test_episode_omits_black_fades_inside_one_story_event_even_across_speed_changes(self) -> None:
+        first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
+        second = candidate("second", "2026-08-19T08:00:00+09:00", 5.0)
+        third = candidate("third", "2026-08-19T08:00:00+09:00", 10.0)
+        first.story_event_id = second.story_event_id = "event_pool"
+        third.story_event_id = "event_dinner"
+        segments = [
+            PlanSegment(first.candidate_id, "scenery", "수영장 도착", speed=1.0),
+            PlanSegment(second.candidate_id, "journey", "긴 이동 압축", speed=2.0),
+            PlanSegment(third.candidate_id, "food", "저녁 식사", speed=1.0),
+        ]
+        episode = Episode("2026-08-19", 1, "DAY 1", "", "", 15.0, segments)
+        plan = EditPlan("Trip", "", "local", "hash", [episode])
+        clip = Clip(
+            clip_id="clip",
+            path="/tmp/clip.mp4",
+            relative_path="clip.mp4",
+            fingerprint="fp",
+            size_bytes=1,
+            duration=20.0,
+            captured_at=first.captured_at,
+            capture_source="filename",
+            day_key=episode.day_key,
+            travel_day=1,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            codec="h264",
+            rotation=0,
+            has_audio=True,
+        )
+        render_calls: list[dict[str, object]] = []
+
+        def fake_card(_directory: Path, card_id: str, *_args, **_kwargs) -> Piece:
+            return Piece(Path(f"/{card_id}.mp4"), 2.0, card_id)
+
+        def fake_source(segment: PlanSegment, item: Candidate, *_args, **kwargs) -> Piece:
+            render_calls.append(kwargs)
+            return Piece(Path(f"/{item.candidate_id}.mp4"), item.duration / segment.speed, segment.role, item, segment)
+
+        with (
+            patch("video_summary.renderer.render_card_piece", side_effect=fake_card),
+            patch("video_summary.renderer.render_source_piece", side_effect=fake_source),
+        ):
+            episode_pieces(
+                episode,
+                plan,
+                {item.candidate_id: item for item in (first, second, third)},
+                {clip.clip_id: clip},
+                copy.deepcopy(DEFAULT_CONFIG),
+                Path("/segments"),
+                Path("/cards"),
+                Path("/overlays"),
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                True,
+                include_intro=False,
+                include_outro=False,
+                force=False,
+            )
+
+        self.assertEqual(len(render_calls), 3)
+        self.assertEqual(
+            [(call["fade_in"], call["fade_out"]) for call in render_calls],
+            [(True, False), (False, True), (True, True)],
+        )
+
+    def test_episode_restores_fades_when_same_story_event_has_large_time_gap(self) -> None:
+        first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
+        second = candidate("second", "2026-08-19T08:05:00+09:00", 0.0)
+        first.clip_id = "clip-a"
+        second.clip_id = "clip-b"
+        first.story_event_id = second.story_event_id = "event_pool"
+        episode = Episode(
+            first.day_key,
+            1,
+            "DAY 1",
+            "",
+            "",
+            10.0,
+            [
+                PlanSegment(first.candidate_id, "scenery", "수영장 시작"),
+                PlanSegment(second.candidate_id, "scenery", "수영장 마무리"),
+            ],
+        )
+        plan = EditPlan("Trip", "", "local", "hash", [episode])
+
+        def make_clip(item: Candidate) -> Clip:
+            return Clip(
+                clip_id=item.clip_id,
+                path=f"/tmp/{item.clip_id}.mp4",
+                relative_path=f"{item.clip_id}.mp4",
+                fingerprint=item.clip_id,
+                size_bytes=1,
+                duration=20.0,
+                captured_at=item.captured_at,
+                capture_source="filename",
+                day_key=item.day_key,
+                travel_day=1,
+                width=1920,
+                height=1080,
+                fps=30.0,
+                codec="h264",
+                rotation=0,
+                has_audio=True,
+            )
+
+        render_calls: list[dict[str, object]] = []
+
+        def fake_card(_directory: Path, card_id: str, *_args, **_kwargs) -> Piece:
+            return Piece(Path(f"/{card_id}.mp4"), 2.0, card_id)
+
+        def fake_source(segment: PlanSegment, item: Candidate, *_args, **kwargs) -> Piece:
+            render_calls.append(kwargs)
+            return Piece(Path(f"/{item.candidate_id}.mp4"), item.duration, segment.role, item, segment)
+
+        with (
+            patch("video_summary.renderer.render_card_piece", side_effect=fake_card),
+            patch("video_summary.renderer.render_source_piece", side_effect=fake_source),
+        ):
+            episode_pieces(
+                episode,
+                plan,
+                {item.candidate_id: item for item in (first, second)},
+                {item.clip_id: make_clip(item) for item in (first, second)},
+                copy.deepcopy(DEFAULT_CONFIG),
+                Path("/segments"),
+                Path("/cards"),
+                Path("/overlays"),
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                True,
+                include_intro=False,
+                include_outro=False,
+                force=False,
+            )
+
+        self.assertEqual(
+            [(call["fade_in"], call["fade_out"]) for call in render_calls],
+            [(True, True), (True, True)],
+        )
 
     def test_episode_coalesces_required_interview_without_internal_fades_or_metadata(self) -> None:
         first = candidate("first", "2026-08-19T08:00:00+09:00", 0.0)
@@ -498,9 +753,178 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(card_fade_seconds("date-day-1", 3.0), 0.5)
         self.assertEqual(card_fade_seconds("trip-outro", 0.4), 0.1)
 
-    def test_audio_assembly_policy_invalidates_completed_render_but_reuses_sources(self) -> None:
-        self.assertEqual(RENDER_POLICY_VERSION, 18)
+    def test_meal_story_policy_invalidates_completed_render_but_reuses_sources(self) -> None:
+        plan = EditPlan("Trip", "", "local", "hash", [])
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        coverage = {
+            "meals": {
+                "status": "satisfied",
+                "events": [{"event_id": "meal_1", "context_groups": []}],
+            }
+        }
+        previous = render_cache_key(
+            plan, [], config["render"], "trip", False,
+            1280, 720, 30, "libx264", "4M",
+            version=19,
+            moment_coverage=coverage,
+        )
+        current = render_cache_key(
+            plan, [], config["render"], "trip", False,
+            1280, 720, 30, "libx264", "4M",
+            version=RENDER_POLICY_VERSION,
+            moment_coverage=coverage,
+        )
+
+        self.assertEqual(RENDER_POLICY_VERSION, 25)
         self.assertEqual(SOURCE_RENDER_POLICY_VERSION, 8)
+        self.assertEqual(RENDER_REPORT_VERSION, 10)
+        self.assertNotEqual(previous, current)
+
+    def test_story_flow_report_accounts_for_full_source_speedup_exclusions_and_review_status(self) -> None:
+        setup = candidate("setup", "2026-08-19T08:00:00+09:00", 0.0)
+        bridge = candidate("bridge", "2026-08-19T08:00:00+09:00", 5.0)
+        meal = candidate("meal", "2026-08-19T08:00:00+09:00", 10.0)
+        private = candidate("private", "2026-08-19T08:00:00+09:00", 15.0)
+        setup.story_event_id = bridge.story_event_id = "event_pool"
+        meal.story_event_id = "event_meal"
+        private.story_event_id = "event_private"
+        setup.importance = meal.importance = "core"
+        meal.reviewed_inclusion_reason = "검수한 식사 본편"
+        bridge.importance = "bridge"
+        bridge.speed_policy = "allow_fast"
+        private.importance = "discard"
+        private.speed_policy = "omit"
+        private.exclusion_reason = "옷을 갈아입는 사적 장면"
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [
+                Episode(
+                    setup.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    30.0,
+                    [
+                        PlanSegment("setup", "scenery", "수영장 시작", speed=1.0),
+                        PlanSegment("bridge", "journey", "연결 구간 압축", speed=2.0),
+                        PlanSegment("meal", "food", "식사 본편", speed=1.0),
+                    ],
+                )
+            ],
+        )
+        clip = Clip(
+            clip_id="clip",
+            path="/tmp/clip.mp4",
+            relative_path="clip.mp4",
+            fingerprint="fp",
+            size_bytes=1,
+            duration=20.0,
+            captured_at=setup.captured_at,
+            capture_source="filename",
+            day_key=setup.day_key,
+            travel_day=1,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            codec="h264",
+            rotation=0,
+            has_audio=True,
+        )
+
+        report = story_flow_coverage(
+            [setup, bridge, meal, private],
+            [clip],
+            plan,
+            review_guard_seconds=10.0,
+        )
+
+        self.assertEqual(report["status"], "satisfied")
+        self.assertEqual(report["raw_source_seconds"], 20.0)
+        self.assertEqual(report["accounted_candidate_seconds"], 20.0)
+        self.assertEqual(report["unassigned_source_seconds"], 0.0)
+        self.assertEqual(report["event_count"], 2)
+        self.assertEqual(report["represented_event_count"], 2)
+        self.assertEqual(report["omitted_core_event_ids"], [])
+        self.assertEqual(report["selected_source_seconds"], 15.0)
+        self.assertEqual(report["selected_output_seconds"], 12.5)
+        self.assertEqual(report["compression_saved_seconds"], 2.5)
+        self.assertEqual(report["fast_forward_candidate_count"], 1)
+        self.assertEqual(report["explicitly_excluded_candidate_count"], 1)
+        self.assertEqual(report["reviewed_inclusion_candidate_ids"], ["meal"])
+        self.assertEqual(
+            report["selected_reviewed_inclusion_candidate_ids"], ["meal"]
+        )
+        self.assertEqual(report["missing_reviewed_inclusion_candidate_ids"], [])
+        self.assertEqual(report["days"][0]["status"], "review")
+        self.assertEqual(
+            [(event["event_id"], event["treatment"]) for event in report["events"]],
+            [("event_pool", "full_speed_up"), ("event_meal", "full")],
+        )
+
+    def test_story_flow_report_rejects_setup_only_for_a_filmed_activity(self) -> None:
+        setup = candidate("setup", "2026-08-19T08:00:00+09:00", 0.0)
+        action = candidate("action", "2026-08-19T08:00:00+09:00", 5.0)
+        setup.story_event_id = action.story_event_id = "event_gacha"
+        setup.story_stage = "setup"
+        action.story_stage = "action"
+        action.reviewed_inclusion_reason = "가챠 결과를 보여 주는 검수 장면"
+        setup.importance = action.importance = "core"
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [
+                Episode(
+                    setup.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    10.0,
+                    [PlanSegment(setup.candidate_id, "journey", "가챠 도착")],
+                )
+            ],
+        )
+        clip = Clip(
+            clip_id="clip",
+            path="/tmp/clip.mp4",
+            relative_path="clip.mp4",
+            fingerprint="fp",
+            size_bytes=1,
+            duration=10.0,
+            captured_at=setup.captured_at,
+            capture_source="filename",
+            day_key=setup.day_key,
+            travel_day=1,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            codec="h264",
+            rotation=0,
+            has_audio=True,
+        )
+
+        report = story_flow_coverage(
+            [setup, action],
+            [clip],
+            plan,
+            review_guard_seconds=60.0,
+        )
+
+        self.assertEqual(report["status"], "unsatisfied")
+        self.assertEqual(report["omitted_core_event_ids"], [])
+        self.assertEqual(
+            report["incomplete_represented_event_ids"], ["event_gacha"]
+        )
+        self.assertEqual(
+            report["missing_reviewed_inclusion_candidate_ids"], ["action"]
+        )
+        self.assertEqual(report["events"][0]["activity_stage_status"], "missing")
 
     def test_family_interview_coverage_is_satisfied_or_not_detected(self) -> None:
         interview = candidate("interview", "2026-08-19T10:00:00+09:00", 0.0)
@@ -559,6 +983,260 @@ class RendererTests(unittest.TestCase):
                 plan,
                 enabled=True,
             )
+
+    def test_family_interview_coverage_does_not_resurrect_an_excluded_candidate(self) -> None:
+        interview = candidate("interview", "2026-08-19T10:00:00+09:00", 0.0)
+        interview.required_event_ids = ["interview_1"]
+        interview.exclusion_reason = "사적 장면"
+        coverage = family_interview_coverage(
+            {
+                "required_events": [
+                    {
+                        "event_id": "interview_1",
+                        "candidate_ids": ["interview"],
+                    }
+                ]
+            },
+            [interview],
+            EditPlan("Trip", "", "local", "hash", []),
+            enabled=True,
+        )
+
+        self.assertEqual(coverage["status"], "not_detected")
+        self.assertEqual(coverage["required_candidate_count"], 0)
+
+    def test_meal_event_coverage_accepts_one_selected_option(self) -> None:
+        setup = candidate("meal-setup", "2026-08-19T11:55:00+09:00", 0.0)
+        first = candidate("meal-a", "2026-08-19T12:00:00+09:00", 0.0)
+        second = candidate("meal-b", "2026-08-19T12:05:00+09:00", 0.0)
+        closure = candidate("meal-closure", "2026-08-19T12:10:00+09:00", 0.0)
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [
+                Episode(
+                    first.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    30.0,
+                    [
+                        PlanSegment("meal-setup", "food", "점심 먹으러 가는 장면"),
+                        PlanSegment("meal-b", "food", "실제 점심 장면"),
+                        PlanSegment("meal-closure", "food", "점심 후 반응"),
+                    ],
+                )
+            ],
+        )
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "day_key": first.day_key,
+                    "subtype": "lunch",
+                    "confidence": 0.93,
+                    "signals": ["meal_setup", "inferred_meal_body"],
+                    "candidate_ids": ["meal-a", "meal-b"],
+                    "context_groups": [
+                        {
+                            "context_id": "meal_1:setup",
+                            "stage": "setup",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-setup"],
+                        },
+                        {
+                            "context_id": "meal_1:closure",
+                            "stage": "closure",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-closure"],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        coverage = meal_event_coverage(
+            payload,
+            [setup, first, second, closure],
+            plan,
+            enabled=True,
+        )
+
+        self.assertEqual(coverage["status"], "satisfied")
+        self.assertEqual(coverage["detected_event_count"], 1)
+        self.assertEqual(coverage["option_candidate_count"], 2)
+        self.assertEqual(coverage["selected_event_count"], 1)
+        self.assertEqual(coverage["selected_candidate_count"], 1)
+        self.assertEqual(coverage["context_group_count"], 2)
+        self.assertEqual(coverage["selected_context_group_count"], 2)
+        self.assertEqual(coverage["context_candidate_count"], 2)
+        self.assertEqual(coverage["selected_context_candidate_count"], 2)
+        self.assertEqual(coverage["events"][0]["selected_candidate_ids"], ["meal-b"])
+        self.assertEqual(
+            coverage["events"][0]["context_groups"],
+            [
+                {
+                    "context_id": "meal_1:setup",
+                    "stage": "setup",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal-setup"],
+                    "selected_candidate_ids": ["meal-setup"],
+                },
+                {
+                    "context_id": "meal_1:closure",
+                    "stage": "closure",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal-closure"],
+                    "selected_candidate_ids": ["meal-closure"],
+                },
+            ],
+        )
+        self.assertNotIn("transcript", coverage["events"][0])
+
+    def test_meal_event_coverage_rejects_a_missing_context_group(self) -> None:
+        setup = candidate("meal-setup", "2026-08-19T11:55:00+09:00", 0.0)
+        meal = candidate("meal", "2026-08-19T12:00:00+09:00", 0.0)
+        closure = candidate("meal-closure", "2026-08-19T12:10:00+09:00", 0.0)
+        plan = EditPlan(
+            "Trip",
+            "",
+            "file",
+            "hash",
+            [
+                Episode(
+                    meal.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    30.0,
+                    [
+                        PlanSegment("meal-setup", "food", "식사 전 서사"),
+                        PlanSegment("meal", "food", "실제 식사"),
+                    ],
+                )
+            ],
+        )
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal"],
+                    "context_groups": [
+                        {
+                            "context_id": "meal_1:setup",
+                            "stage": "setup",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-setup"],
+                        },
+                        {
+                            "context_id": "meal_1:closure",
+                            "stage": "closure",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["meal-closure"],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(VideoSummaryError, "meal_1:closure"):
+            meal_event_coverage(payload, [setup, meal, closure], plan, enabled=True)
+
+    def test_meal_event_coverage_rejects_an_unselected_event(self) -> None:
+        meal = candidate("meal", "2026-08-19T12:00:00+09:00", 0.0)
+        plan = EditPlan("Trip", "", "file", "hash", [])
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal"],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(VideoSummaryError, "필수 식사 이벤트"):
+            meal_event_coverage(payload, [meal], plan, enabled=True)
+
+        disabled = meal_event_coverage(payload, [meal], plan, enabled=False)
+        self.assertEqual(disabled["status"], "disabled")
+
+    def test_meal_event_coverage_ignores_an_excluded_context_candidate(self) -> None:
+        meal = candidate("meal", "2026-08-19T12:00:00+09:00", 0.0)
+        private_setup = candidate(
+            "private-setup", "2026-08-19T11:55:00+09:00", 0.0
+        )
+        private_setup.exclusion_reason = "사적 장면"
+        plan = EditPlan(
+            "Trip",
+            "",
+            "local",
+            "hash",
+            [
+                Episode(
+                    meal.day_key,
+                    1,
+                    "DAY 1",
+                    "",
+                    "",
+                    30.0,
+                    [PlanSegment(meal.candidate_id, "food", "실제 식사")],
+                )
+            ],
+        )
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal"],
+                    "context_groups": [
+                        {
+                            "context_id": "meal_1:setup",
+                            "stage": "setup",
+                            "selection_mode": "one_of",
+                            "candidate_ids": ["private-setup"],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        coverage = meal_event_coverage(
+            payload,
+            [meal, private_setup],
+            plan,
+            enabled=True,
+        )
+
+        self.assertEqual(coverage["status"], "satisfied")
+        self.assertEqual(coverage["context_group_count"], 0)
+
+    def test_family_interview_coverage_ignores_meal_events(self) -> None:
+        plan = EditPlan("Trip", "", "local", "hash", [])
+        payload = {
+            "required_events": [
+                {
+                    "event_id": "meal_1",
+                    "kind": "meal",
+                    "selection_mode": "one_of",
+                    "candidate_ids": ["meal"],
+                }
+            ]
+        }
+
+        coverage = family_interview_coverage(payload, [], plan, enabled=True)
+        self.assertEqual(coverage["status"], "not_detected")
 
     def test_moment_coverage_changes_render_cache_but_not_source_namespace(self) -> None:
         plan = EditPlan("Trip", "", "local", "hash", [])
@@ -719,6 +1397,47 @@ class RendererTests(unittest.TestCase):
         report = self.assemble_with_probe(self.media_probe())
         self.assertEqual(report["duration"], 6.021)
 
+    def test_assembled_output_uses_effective_variant_episode_mode_for_chapters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = ProjectPaths(root, "trip")
+            paths.ensure()
+            source = root / "piece.mp4"
+            source.write_bytes(b"x" * 2048)
+            pieces = [Piece(source, 4.0, "one"), Piece(source, 2.0, "two")]
+            output = paths.exports / "summary.mp4"
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config["editing"]["episode_mode"] = "trip"
+
+            def fake_run(args: list[str], *, cwd: Path | None = None):
+                destination = Path(args[-1])
+                if not destination.is_absolute() and cwd is not None:
+                    destination = cwd / destination
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"o" * 2048)
+
+            with (
+                patch("video_summary.renderer.run_command", side_effect=fake_run),
+                patch("video_summary.renderer.probe_media", return_value=self.media_probe()),
+                patch("video_summary.renderer.write_chapters", return_value=[]) as daily,
+                patch("video_summary.renderer.write_trip_day_chapters", return_value=[]) as trip,
+            ):
+                assemble_output(
+                    pieces,
+                    output,
+                    Episode("2026-08-19", 1, "DAY 1", "", "", 6.0, []),
+                    paths,
+                    config,
+                    paths.render / "assembly",
+                    1280,
+                    720,
+                    False,
+                    episode_mode="daily",
+                )
+
+            daily.assert_called_once()
+            trip.assert_not_called()
+
     def test_assembled_output_uses_timestamp_fallbacks_for_na_durations(self) -> None:
         probe = self.media_probe(video_duration="N/A", audio_duration="N/A", format_duration="N/A")
         video, audio = probe["streams"]
@@ -827,6 +1546,30 @@ class RendererTests(unittest.TestCase):
                 90,
                 False,
             )
+            rendered_probe = json.loads(
+                subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_streams",
+                        "-of",
+                        "json",
+                        str(output),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            )
+            rendered_video = next(
+                stream
+                for stream in rendered_probe["streams"]
+                if stream["codec_type"] == "video"
+            )
+            self.assertEqual(rendered_video.get("color_space"), "bt709")
+            self.assertEqual(rendered_video.get("color_transfer"), "bt709")
+            self.assertEqual(rendered_video.get("color_primaries"), "bt709")
             decoded = subprocess.run(
                 [
                     "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(output),
@@ -1004,6 +1747,191 @@ class RendererTests(unittest.TestCase):
         )
         self.assertIn("iw*sar", filters)
         self.assertIn("setsar=1", filters)
+
+    def test_source_piece_retries_sdr_without_hardware_decode(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        item = candidate("hardware-fallback", "2026-08-19T08:00:00+09:00", 0.0)
+        item.end = 5.0
+        segment = PlanSegment(item.candidate_id, "journey", "")
+        clip = Clip(
+            clip_id="clip",
+            path="/hardware-fallback-source.mp4",
+            relative_path="hardware-fallback-source.mp4",
+            fingerprint="hardware-fallback-fp",
+            size_bytes=1,
+            duration=10.0,
+            captured_at=item.captured_at,
+            capture_source="filename",
+            day_key=item.day_key,
+            travel_day=1,
+            width=3840,
+            height=2160,
+            fps=60.0,
+            codec="hevc",
+            rotation=0,
+            has_audio=True,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("video_summary.renderer.cached_piece_is_usable", side_effect=[False, True]),
+            patch(
+                "video_summary.renderer.run_command",
+                side_effect=[VideoSummaryError("hardware failed"), None],
+            ) as run,
+            patch("video_summary.renderer.os.replace"),
+        ):
+            render_source_piece(
+                segment,
+                item,
+                clip,
+                Path(tmpdir),
+                Path(tmpdir),
+                1280,
+                720,
+                30,
+                "h264_videotoolbox",
+                "4M",
+                config,
+                location_overlay=None,
+                fade_in=False,
+                fade_out=False,
+                force=False,
+            )
+
+        hardware_args = run.call_args_list[0].args[0]
+        software_args = run.call_args_list[1].args[0]
+        self.assertEqual(
+            hardware_args[hardware_args.index("-hwaccel") + 1],
+            "videotoolbox",
+        )
+        self.assertNotIn("-hwaccel", software_args)
+
+    def test_source_piece_uses_matching_videotoolbox_download_format_for_hdr(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        item = candidate("hdr-eight-bit", "2026-08-19T08:00:00+09:00", 0.0)
+        item.end = 5.0
+        segment = PlanSegment(item.candidate_id, "journey", "")
+        clip = Clip(
+            clip_id="clip",
+            path="/hdr-eight-bit.mp4",
+            relative_path="hdr-eight-bit.mp4",
+            fingerprint="hdr-eight-bit-fp",
+            size_bytes=1,
+            duration=10.0,
+            captured_at=item.captured_at,
+            capture_source="metadata",
+            day_key=item.day_key,
+            travel_day=1,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            codec="hevc",
+            rotation=270,
+            has_audio=True,
+            pix_fmt="yuv420p",
+            color_space="bt2020nc",
+            color_transfer="arib-std-b67",
+            color_primaries="bt2020",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("video_summary.renderer.ffmpeg_filter_available", return_value=True),
+            patch("video_summary.renderer.cached_piece_is_usable", side_effect=[False, True]),
+            patch("video_summary.renderer.run_command") as run,
+            patch("video_summary.renderer.os.replace"),
+        ):
+            render_source_piece(
+                segment,
+                item,
+                clip,
+                Path(tmpdir),
+                Path(tmpdir),
+                1280,
+                720,
+                30,
+                "h264_videotoolbox",
+                "4M",
+                config,
+                location_overlay=None,
+                fade_in=False,
+                fade_out=False,
+                force=False,
+            )
+
+        args = run.call_args.args[0]
+        filters = args[args.index("-filter_complex") + 1]
+        self.assertIn("hwdownload,format=nv12,format=yuv420p", filters)
+        self.assertEqual(videotoolbox_download_pixel_format(clip), "nv12")
+        clip.pix_fmt = "yuv420p10le"
+        self.assertEqual(videotoolbox_download_pixel_format(clip), "p010le")
+
+    def test_atempo_filter_chain_supports_three_and_four_times_speed(self) -> None:
+        self.assertEqual(atempo_filter_chain(1.0), "atempo=1.000000")
+        self.assertEqual(atempo_filter_chain(2.0), "atempo=2.000000")
+        self.assertEqual(
+            atempo_filter_chain(3.0),
+            "atempo=2.000000,atempo=1.500000",
+        )
+        self.assertEqual(
+            atempo_filter_chain(4.0),
+            "atempo=2.000000,atempo=2.000000",
+        )
+        with self.assertRaisesRegex(VideoSummaryError, "audio speed"):
+            atempo_filter_chain(0.0)
+
+    def test_source_piece_applies_portable_audio_chain_above_two_times_speed(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        item = candidate("speed-three", "2026-08-19T08:00:00+09:00", 0.0)
+        item.end = 6.0
+        segment = PlanSegment(item.candidate_id, "journey", "", speed=3.0)
+        clip = Clip(
+            clip_id="clip",
+            path="/speed-three-source.mp4",
+            relative_path="speed-three-source.mp4",
+            fingerprint="speed-three-fp",
+            size_bytes=1,
+            duration=20.0,
+            captured_at=item.captured_at,
+            capture_source="filename",
+            day_key=item.day_key,
+            travel_day=1,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            codec="h264",
+            rotation=0,
+            has_audio=True,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("video_summary.renderer.cached_piece_is_usable", side_effect=[False, True]),
+            patch("video_summary.renderer.run_command") as run,
+            patch("video_summary.renderer.os.replace"),
+        ):
+            piece = render_source_piece(
+                segment,
+                item,
+                clip,
+                Path(tmpdir),
+                Path(tmpdir),
+                1280,
+                720,
+                30,
+                "libx264",
+                "4M",
+                config,
+                location_overlay=None,
+                fade_in=False,
+                fade_out=False,
+                force=False,
+            )
+
+        args = run.call_args.args[0]
+        filters = args[args.index("-filter_complex") + 1]
+        self.assertEqual(source_output_timing(2.0, 30), (60, 2.0))
+        self.assertEqual(piece.duration, 2.0)
+        self.assertIn("setpts=(PTS-STARTPTS)/3.000000", filters)
+        self.assertIn("atempo=2.000000,atempo=1.500000", filters)
 
     @unittest.skipUnless(FFMPEG_AVAILABLE, "FFmpeg/FFprobe are required")
     def test_source_piece_renders_exact_silence_without_non_finite_aac_input(self) -> None:
